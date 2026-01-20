@@ -71,8 +71,13 @@ public class ConsistentHash {
             physicalNodes.add(node);
 
             for (int i = 0; i < virtualNodesPerNode; i++) {
-                String hashKey = node.getId() + "#" + i;
+                String hashKey = node.getHashKey() + "#" + i;
                 long hash = MurmurHash3.hash64(hashKey);
+                int collisionCount = 0;
+                while (ring.containsKey(hash)) {
+                    collisionCount++;
+                    hash = MurmurHash3.hash64(hashKey + "#c" + collisionCount);
+                }
                 VirtualNode vnode = new VirtualNode(node, i, hash);
                 ring.put(hash, vnode);
             }
@@ -96,10 +101,12 @@ public class ConsistentHash {
                 return;
             }
 
-            for (int i = 0; i < virtualNodesPerNode; i++) {
-                String hashKey = node.getId() + "#" + i;
-                long hash = MurmurHash3.hash64(hashKey);
-                ring.remove(hash);
+            Iterator<Map.Entry<Long, VirtualNode>> it = ring.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<Long, VirtualNode> entry = it.next();
+                if (entry.getValue().belongsTo(node)) {
+                    it.remove();
+                }
             }
 
             logger.info("Removed node {} from ring", node.getId());

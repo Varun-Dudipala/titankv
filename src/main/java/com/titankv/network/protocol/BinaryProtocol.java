@@ -1,7 +1,5 @@
 package com.titankv.network.protocol;
 
-import com.titankv.util.ByteBufferPool;
-
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
@@ -9,10 +7,10 @@ import java.nio.charset.StandardCharsets;
  * Binary wire protocol encoder/decoder for TitanKV.
  *
  * Protocol format:
- * Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][KEY:N][VALUE:M]
- * Response: [MAGIC:4][STATUS:1][VAL_LEN:4][VALUE:N]
+ * Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY:N][VALUE:M]
+ * Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE:N]
  *
- * Header size: 13 bytes (request), 9 bytes (response)
+ * Header size: 29 bytes (request), 25 bytes (response)
  */
 public final class BinaryProtocol {
 
@@ -20,8 +18,8 @@ public final class BinaryProtocol {
     public static final int MAGIC = 0x5449544B;
 
     // Header sizes
-    public static final int REQUEST_HEADER_SIZE = 13;  // magic(4) + cmd(1) + keyLen(4) + valLen(4)
-    public static final int RESPONSE_HEADER_SIZE = 9;  // magic(4) + status(1) + valLen(4)
+    public static final int REQUEST_HEADER_SIZE = 29;  // magic(4) + cmd(1) + keyLen(4) + valLen(4) + timestamp(8) + expires(8)
+    public static final int RESPONSE_HEADER_SIZE = 25;  // magic(4) + status(1) + valLen(4) + timestamp(8) + expires(8)
 
     // Maximum sizes
     public static final int MAX_KEY_LENGTH = 64 * 1024;      // 64KB max key
@@ -35,6 +33,7 @@ public final class BinaryProtocol {
 
     /**
      * Encode a command into a ByteBuffer.
+     * Uses -1 for value length when value is null (distinguishes null from empty array).
      *
      * @param command the command to encode
      * @return ByteBuffer positioned at start, ready to read
@@ -44,15 +43,18 @@ public final class BinaryProtocol {
             ? command.getKey().getBytes(StandardCharsets.UTF_8)
             : new byte[0];
         byte[] valueBytes = command.getValueUnsafe();
-        int valueLen = valueBytes != null ? valueBytes.length : 0;
+        int valueLen = valueBytes != null ? valueBytes.length : -1;  // -1 = null
+        int actualValueLen = valueBytes != null ? valueBytes.length : 0;
 
-        int totalSize = REQUEST_HEADER_SIZE + keyBytes.length + valueLen;
+        int totalSize = REQUEST_HEADER_SIZE + keyBytes.length + actualValueLen;
         ByteBuffer buffer = ByteBuffer.allocate(totalSize);
 
         buffer.putInt(MAGIC);
         buffer.put(command.getType());
         buffer.putInt(keyBytes.length);
         buffer.putInt(valueLen);
+        buffer.putLong(command.getTimestamp());
+        buffer.putLong(command.getExpiresAt());
         buffer.put(keyBytes);
         if (valueBytes != null) {
             buffer.put(valueBytes);
@@ -64,6 +66,7 @@ public final class BinaryProtocol {
 
     /**
      * Encode a command into an existing ByteBuffer.
+     * Uses -1 for value length when value is null (distinguishes null from empty array).
      *
      * @param command the command to encode
      * @param buffer  the buffer to write to (must have sufficient capacity)
@@ -73,12 +76,14 @@ public final class BinaryProtocol {
             ? command.getKey().getBytes(StandardCharsets.UTF_8)
             : new byte[0];
         byte[] valueBytes = command.getValueUnsafe();
-        int valueLen = valueBytes != null ? valueBytes.length : 0;
+        int valueLen = valueBytes != null ? valueBytes.length : -1;  // -1 = null
 
         buffer.putInt(MAGIC);
         buffer.put(command.getType());
         buffer.putInt(keyBytes.length);
         buffer.putInt(valueLen);
+        buffer.putLong(command.getTimestamp());
+        buffer.putLong(command.getExpiresAt());
         buffer.put(keyBytes);
         if (valueBytes != null) {
             buffer.put(valueBytes);
@@ -87,20 +92,24 @@ public final class BinaryProtocol {
 
     /**
      * Encode a response into a ByteBuffer.
+     * Uses -1 for value length when value is null (distinguishes null from empty array).
      *
      * @param response the response to encode
      * @return ByteBuffer positioned at start, ready to read
      */
     public static ByteBuffer encode(Response response) {
         byte[] valueBytes = response.getValueUnsafe();
-        int valueLen = valueBytes != null ? valueBytes.length : 0;
+        int valueLen = valueBytes != null ? valueBytes.length : -1;  // -1 = null
+        int actualValueLen = valueBytes != null ? valueBytes.length : 0;
 
-        int totalSize = RESPONSE_HEADER_SIZE + valueLen;
+        int totalSize = RESPONSE_HEADER_SIZE + actualValueLen;
         ByteBuffer buffer = ByteBuffer.allocate(totalSize);
 
         buffer.putInt(MAGIC);
         buffer.put(response.getStatus());
         buffer.putInt(valueLen);
+        buffer.putLong(response.getTimestamp());
+        buffer.putLong(response.getExpiresAt());
         if (valueBytes != null) {
             buffer.put(valueBytes);
         }
@@ -111,17 +120,20 @@ public final class BinaryProtocol {
 
     /**
      * Encode a response into an existing ByteBuffer.
+     * Uses -1 for value length when value is null (distinguishes null from empty array).
      *
      * @param response the response to encode
      * @param buffer   the buffer to write to
      */
     public static void encode(Response response, ByteBuffer buffer) {
         byte[] valueBytes = response.getValueUnsafe();
-        int valueLen = valueBytes != null ? valueBytes.length : 0;
+        int valueLen = valueBytes != null ? valueBytes.length : -1;  // -1 = null
 
         buffer.putInt(MAGIC);
         buffer.put(response.getStatus());
         buffer.putInt(valueLen);
+        buffer.putLong(response.getTimestamp());
+        buffer.putLong(response.getExpiresAt());
         if (valueBytes != null) {
             buffer.put(valueBytes);
         }
@@ -131,6 +143,7 @@ public final class BinaryProtocol {
 
     /**
      * Decode a command from a ByteBuffer.
+     * Handles -1 value length as null (distinguishes null from empty array).
      *
      * @param buffer the buffer to decode from
      * @return the decoded command
@@ -151,11 +164,14 @@ public final class BinaryProtocol {
         byte cmdType = buffer.get();
         int keyLength = buffer.getInt();
         int valueLength = buffer.getInt();
+        long timestamp = buffer.getLong();
+        long expiresAt = buffer.getLong();
 
         validateLengths(keyLength, valueLength);
 
-        if (buffer.remaining() < keyLength + valueLength) {
-            throw new ProtocolException("Incomplete payload: need " + (keyLength + valueLength) +
+        int actualValueLength = valueLength >= 0 ? valueLength : 0;  // -1 means null
+        if (buffer.remaining() < keyLength + actualValueLength) {
+            throw new ProtocolException("Incomplete payload: need " + (keyLength + actualValueLength) +
                 " bytes, got " + buffer.remaining());
         }
 
@@ -167,16 +183,19 @@ public final class BinaryProtocol {
         }
 
         byte[] value = null;
-        if (valueLength > 0) {
+        if (valueLength >= 0) {  // -1 = null, 0 = empty array
             value = new byte[valueLength];
-            buffer.get(value);
+            if (valueLength > 0) {
+                buffer.get(value);
+            }
         }
 
-        return new Command(cmdType, key, value);
+        return new Command(cmdType, key, value, timestamp, expiresAt);
     }
 
     /**
      * Decode a response from a ByteBuffer.
+     * Handles -1 value length as null (distinguishes null from empty array).
      *
      * @param buffer the buffer to decode from
      * @return the decoded response
@@ -196,66 +215,132 @@ public final class BinaryProtocol {
 
         byte status = buffer.get();
         int valueLength = buffer.getInt();
+        long timestamp = buffer.getLong();
+        long expiresAt = buffer.getLong();
 
-        if (valueLength < 0 || valueLength > MAX_VALUE_LENGTH) {
+        // -1 = null, 0+ = actual length
+        if (valueLength < -1 || valueLength > MAX_VALUE_LENGTH) {
             throw new ProtocolException("Invalid value length: " + valueLength);
         }
 
-        if (buffer.remaining() < valueLength) {
-            throw new ProtocolException("Incomplete payload: need " + valueLength +
+        int actualValueLength = valueLength >= 0 ? valueLength : 0;
+        if (buffer.remaining() < actualValueLength) {
+            throw new ProtocolException("Incomplete payload: need " + actualValueLength +
                 " bytes, got " + buffer.remaining());
         }
 
         byte[] value = null;
-        if (valueLength > 0) {
+        if (valueLength >= 0) {  // -1 = null, 0 = empty array
             value = new byte[valueLength];
-            buffer.get(value);
+            if (valueLength > 0) {
+                buffer.get(value);
+            }
         }
 
-        return new Response(status, value);
+        return new Response(status, value, timestamp, expiresAt);
     }
 
     // ==================== Helpers ====================
 
     /**
      * Check if a buffer has a complete request.
+     * Handles -1 value length as null (0 bytes in payload).
+     * Validates magic bytes and length bounds.
+     *
+     * SECURITY: Throws ProtocolException on invalid magic bytes (once we have >= 4 bytes)
+     * to prevent memory DoS from junk data that never forms a valid request.
      *
      * @param buffer the buffer to check
-     * @return true if a complete request is available
+     * @return true if a complete request is available, false if more bytes needed
+     * @throws ProtocolException if magic bytes are invalid or lengths are out of bounds
      */
     public static boolean hasCompleteRequest(ByteBuffer buffer) {
-        if (buffer.remaining() < REQUEST_HEADER_SIZE) {
+        int remaining = buffer.remaining();
+        if (remaining < 4) {
+            // Not enough bytes to read magic yet
             return false;
         }
 
         int pos = buffer.position();
-        buffer.getInt(); // magic
-        buffer.get();    // cmd
-        int keyLen = buffer.getInt();
-        int valLen = buffer.getInt();
-        buffer.position(pos); // restore position
 
-        return buffer.remaining() >= REQUEST_HEADER_SIZE + keyLen + valLen;
+        // Check magic bytes - throw on mismatch to prevent DoS
+        int magic = buffer.getInt(pos);
+        if (magic != MAGIC) {
+            throw new ProtocolException(String.format(
+                "Invalid magic bytes: expected 0x%08X, got 0x%08X. " +
+                "This may indicate a protocol mismatch or attack.",
+                MAGIC, magic));
+        }
+
+        if (remaining < REQUEST_HEADER_SIZE) {
+            // Valid magic but need more bytes for full header
+            return false;
+        }
+
+        // cmd at pos+4, keyLen at pos+5, valLen at pos+9
+        int keyLen = buffer.getInt(pos + 5);
+        int valLen = buffer.getInt(pos + 9);
+
+        // Validate lengths - throw on invalid to prevent DoS
+        if (keyLen < 0 || keyLen > MAX_KEY_LENGTH) {
+            throw new ProtocolException("Invalid key length: " + keyLen +
+                " (must be 0-" + MAX_KEY_LENGTH + ")");
+        }
+        if (valLen < -1 || valLen > MAX_VALUE_LENGTH) {
+            throw new ProtocolException("Invalid value length: " + valLen +
+                " (must be -1 to " + MAX_VALUE_LENGTH + ")");
+        }
+
+        int actualValLen = valLen >= 0 ? valLen : 0;  // -1 means null
+        return remaining >= REQUEST_HEADER_SIZE + keyLen + actualValLen;
     }
 
     /**
      * Check if a buffer has a complete response.
+     * Handles -1 value length as null (0 bytes in payload).
+     * Validates magic bytes and length bounds.
+     *
+     * SECURITY: Throws ProtocolException on invalid magic bytes (once we have >= 4 bytes)
+     * to prevent memory DoS from junk data that never forms a valid response.
      *
      * @param buffer the buffer to check
-     * @return true if a complete response is available
+     * @return true if a complete response is available, false if more bytes needed
+     * @throws ProtocolException if magic bytes are invalid or value length is out of bounds
      */
     public static boolean hasCompleteResponse(ByteBuffer buffer) {
-        if (buffer.remaining() < RESPONSE_HEADER_SIZE) {
+        int remaining = buffer.remaining();
+        if (remaining < 4) {
+            // Not enough bytes to read magic yet
             return false;
         }
 
         int pos = buffer.position();
-        buffer.getInt(); // magic
-        buffer.get();    // status
-        int valLen = buffer.getInt();
-        buffer.position(pos); // restore position
 
-        return buffer.remaining() >= RESPONSE_HEADER_SIZE + valLen;
+        // Check magic bytes - throw on mismatch to prevent DoS
+        int magic = buffer.getInt(pos);
+        if (magic != MAGIC) {
+            throw new ProtocolException(String.format(
+                "Invalid magic bytes: expected 0x%08X, got 0x%08X. " +
+                "This may indicate a protocol mismatch or attack.",
+                MAGIC, magic));
+        }
+
+        if (remaining < RESPONSE_HEADER_SIZE) {
+            // Valid magic but need more bytes for full header
+            return false;
+        }
+
+        // status at pos+4, valLen at pos+5
+        int valLen = buffer.getInt(pos + 5);
+
+        // Validate value length - throw on invalid to prevent DoS
+        if (valLen < -1 || valLen > MAX_VALUE_LENGTH) {
+            throw new ProtocolException("Invalid value length: " + valLen +
+                " (must be -1 to " + MAX_VALUE_LENGTH + ")");
+        }
+
+        int actualValLen = valLen >= 0 ? valLen : 0;  // -1 means null
+        return remaining >= RESPONSE_HEADER_SIZE + actualValLen;
     }
 
     /**
@@ -287,7 +372,8 @@ public final class BinaryProtocol {
         if (keyLength < 0 || keyLength > MAX_KEY_LENGTH) {
             throw new ProtocolException("Invalid key length: " + keyLength);
         }
-        if (valueLength < 0 || valueLength > MAX_VALUE_LENGTH) {
+        // -1 is valid (means null), otherwise must be within limits
+        if (valueLength < -1 || valueLength > MAX_VALUE_LENGTH) {
             throw new ProtocolException("Invalid value length: " + valueLength);
         }
     }

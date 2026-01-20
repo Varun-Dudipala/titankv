@@ -4,7 +4,6 @@ import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
-import com.titankv.core.KeyValuePair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,12 +47,15 @@ public class ReadRepairHandler {
     public static class RepairResult {
         private final byte[] value;
         private final long timestamp;
+        private final long expiresAt;
         private final List<Node> repairedNodes;
         private final boolean repairNeeded;
 
-        public RepairResult(byte[] value, long timestamp, List<Node> repairedNodes, boolean repairNeeded) {
+        public RepairResult(byte[] value, long timestamp, long expiresAt,
+                List<Node> repairedNodes, boolean repairNeeded) {
             this.value = value;
             this.timestamp = timestamp;
+            this.expiresAt = expiresAt;
             this.repairedNodes = repairedNodes;
             this.repairNeeded = repairNeeded;
         }
@@ -64,6 +66,10 @@ public class ReadRepairHandler {
 
         public long getTimestamp() {
             return timestamp;
+        }
+
+        public long getExpiresAt() {
+            return expiresAt;
         }
 
         public List<Node> getRepairedNodes() {
@@ -80,9 +86,11 @@ public class ReadRepairHandler {
      * Reads from all replicas, compares values, and repairs stale nodes.
      *
      * @param key the key to read
+     * @param requiredResponses minimum number of successful responses required
+     * @param timeoutMs         overall timeout in milliseconds
      * @return the repair result with the most recent value
      */
-    public CompletableFuture<RepairResult> readWithRepair(String key) {
+    public CompletableFuture<RepairResult> readWithRepair(String key, int requiredResponses, long timeoutMs) {
         List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
 
         if (replicas.isEmpty()) {
@@ -97,71 +105,85 @@ public class ReadRepairHandler {
             futures.add(readFromReplica(replica, key));
         }
 
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-            .thenApply(v -> {
-                List<NodeValue> results = new ArrayList<>();
-                for (CompletableFuture<NodeValue> future : futures) {
-                    try {
-                        NodeValue nv = future.get();
-                        if (nv != null) {
-                            results.add(nv);
-                        }
-                    } catch (Exception e) {
-                        logger.debug("Failed to get result from replica: {}", e.getMessage());
+        CompletableFuture<Void> allReads = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+
+        return allReads.handle((v, ex) -> {
+            List<NodeValue> results = new ArrayList<>();
+            for (CompletableFuture<NodeValue> future : futures) {
+                if (!future.isDone()) {
+                    continue;
+                }
+                try {
+                    NodeValue nv = future.get();
+                    if (nv != null) {
+                        results.add(nv);
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException e) {
+                    logger.debug("Failed to get result from replica: {}", e.getMessage());
                 }
+            }
 
-                if (results.isEmpty()) {
-                    return new RepairResult(null, 0, Collections.emptyList(), false);
-                }
+            if (results.size() < requiredResponses) {
+                throw new ConsistencyException("Not enough replicas responded", requiredResponses, results.size());
+            }
 
-                // Find the newest value
-                NodeValue newest = findNewest(results);
-                if (newest == null || newest.value == null) {
-                    return new RepairResult(null, 0, Collections.emptyList(), false);
-                }
+            // Find the newest value (including tombstones)
+            NodeValue newest = findNewest(results);
+            if (newest == null || newest.timestamp == 0) {
+                return new RepairResult(null, 0, 0, Collections.emptyList(), false);
+            }
 
-                // Find nodes that need repair
-                List<Node> staleNodes = findStaleNodes(results, newest);
+            // Find nodes that need repair
+            List<Node> staleNodes = findStaleNodes(results, newest);
 
-                if (!staleNodes.isEmpty()) {
-                    // Asynchronously repair stale nodes
-                    repairNodes(key, newest.value, staleNodes);
-                    logger.info("Read repair triggered for key {} on {} nodes",
-                        key, staleNodes.size());
-                }
+            if (!staleNodes.isEmpty()) {
+                // Asynchronously repair stale nodes
+                repairNodes(key, newest.value, newest.timestamp, newest.expiresAt, staleNodes);
+                logger.info("Read repair triggered for key {} on {} nodes",
+                    key, staleNodes.size());
+            }
 
-                return new RepairResult(
-                    newest.value,
-                    newest.timestamp,
-                    staleNodes,
-                    !staleNodes.isEmpty()
-                );
-            });
+            return new RepairResult(
+                newest.value,
+                newest.timestamp,
+                newest.expiresAt,
+                staleNodes,
+                !staleNodes.isEmpty()
+            );
+        });
     }
 
     /**
      * Force repair on all replicas for a key.
      *
-     * @param key   the key
-     * @param value the correct value
+     * @param key       the key
+     * @param value     the correct value
+     * @param timestamp the authoritative timestamp for conflict resolution
+     * @param expiresAt the expiration timestamp (0 = no expiration)
      * @return future that completes when repair is done
      */
-    public CompletableFuture<Integer> forceRepair(String key, byte[] value) {
+    public CompletableFuture<Integer> forceRepair(String key, byte[] value, long timestamp, long expiresAt) {
         List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
-        return repairNodesAsync(key, value, replicas);
+        return repairNodesAsync(key, value, timestamp, expiresAt, replicas);
     }
 
     private CompletableFuture<NodeValue> readFromReplica(Node node, String key) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 TitanKVClient client = getClient(node);
-                Optional<byte[]> value = client.get(key);
-                if (value.isPresent()) {
-                    // In a real implementation, would get the timestamp from the server
-                    return new NodeValue(node, value.get(), System.currentTimeMillis());
+                // Use getInternalWithMetadata to prevent read recursion and get timestamps
+                // Now that protocol includes timestamps, we have real versioning for conflict resolution
+                Optional<TitanKVClient.ValueWithMetadata> result = client.getInternalWithMetadata(key);
+
+                if (result.isPresent()) {
+                    TitanKVClient.ValueWithMetadata metadata = result.get();
+                    return new NodeValue(node, metadata.getValue(), metadata.getTimestamp(), metadata.getExpiresAt());
                 }
-                return new NodeValue(node, null, 0);
+                // Not found still counts as a response
+                return new NodeValue(node, null, 0, 0);
             } catch (IOException e) {
                 logger.debug("Read from {} failed: {}", node.getId(), e.getMessage());
                 return null;
@@ -172,8 +194,13 @@ public class ReadRepairHandler {
     private NodeValue findNewest(List<NodeValue> results) {
         NodeValue newest = null;
         for (NodeValue nv : results) {
-            if (nv != null && nv.value != null) {
-                if (newest == null || nv.timestamp > newest.timestamp) {
+            if (nv == null || nv.timestamp <= 0) {
+                continue;
+            }
+            if (newest == null || nv.timestamp > newest.timestamp) {
+                newest = nv;
+            } else if (nv.timestamp == newest.timestamp) {
+                if (compareValues(nv.value, newest.value) > 0) {
                     newest = nv;
                 }
             }
@@ -181,11 +208,25 @@ public class ReadRepairHandler {
         return newest;
     }
 
+    private int compareValues(byte[] a, byte[] b) {
+        if (a == b) {
+            return 0;
+        }
+        if (a == null) {
+            return -1;
+        }
+        if (b == null) {
+            return 1;
+        }
+        return Arrays.compare(a, b);
+    }
+
     private List<Node> findStaleNodes(List<NodeValue> results, NodeValue newest) {
         List<Node> stale = new ArrayList<>();
         for (NodeValue nv : results) {
             if (nv != null && nv.node != null && !nv.node.equals(newest.node)) {
-                if (nv.value == null || !Arrays.equals(nv.value, newest.value)) {
+                boolean valueDiffers = !Arrays.equals(nv.value, newest.value);
+                if (nv.timestamp < newest.timestamp || valueDiffers) {
                     stale.add(nv.node);
                 }
             }
@@ -193,13 +234,15 @@ public class ReadRepairHandler {
         return stale;
     }
 
-    private void repairNodes(String key, byte[] value, List<Node> nodes) {
+    private void repairNodes(String key, byte[] value, long timestamp, long expiresAt, List<Node> nodes) {
         executor.submit(() -> {
             for (Node node : nodes) {
                 try {
                     TitanKVClient client = getClient(node);
-                    client.put(key, value);
-                    logger.debug("Repaired key {} on node {}", key, node.getId());
+                    // Use putInternal to prevent replication cascade - we're repairing locally
+                    // Pass timestamp and expiresAt to maintain newest-wins semantics
+                    client.putInternal(key, value, timestamp, expiresAt);
+                    logger.debug("Repaired key {} on node {} with timestamp {}", key, node.getId(), timestamp);
                 } catch (IOException e) {
                     logger.warn("Failed to repair {} on {}: {}", key, node.getId(), e.getMessage());
                 }
@@ -207,14 +250,16 @@ public class ReadRepairHandler {
         });
     }
 
-    private CompletableFuture<Integer> repairNodesAsync(String key, byte[] value, List<Node> nodes) {
+    private CompletableFuture<Integer> repairNodesAsync(String key, byte[] value, long timestamp, long expiresAt, List<Node> nodes) {
         List<CompletableFuture<Boolean>> futures = new ArrayList<>();
 
         for (Node node : nodes) {
             futures.add(CompletableFuture.supplyAsync(() -> {
                 try {
                     TitanKVClient client = getClient(node);
-                    client.put(key, value);
+                    // Use putInternal to prevent replication cascade - we're repairing locally
+                    // Pass timestamp and expiresAt to maintain newest-wins semantics
+                    client.putInternal(key, value, timestamp, expiresAt);
                     return true;
                 } catch (IOException e) {
                     logger.warn("Failed to repair {} on {}: {}", key, node.getId(), e.getMessage());
@@ -229,8 +274,8 @@ public class ReadRepairHandler {
                 for (CompletableFuture<Boolean> f : futures) {
                     try {
                         if (f.get()) count++;
-                    } catch (Exception e) {
-                        // Ignore
+                    } catch (InterruptedException | ExecutionException e) {
+                        // Ignore - repair failure for individual node
                     }
                 }
                 return count;
@@ -275,11 +320,13 @@ public class ReadRepairHandler {
         final Node node;
         final byte[] value;
         final long timestamp;
+        final long expiresAt;
 
-        NodeValue(Node node, byte[] value, long timestamp) {
+        NodeValue(Node node, byte[] value, long timestamp, long expiresAt) {
             this.node = node;
             this.value = value;
             this.timestamp = timestamp;
+            this.expiresAt = expiresAt;
         }
     }
 }

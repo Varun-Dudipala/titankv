@@ -11,8 +11,16 @@ public class ClientConfig {
     private int maxRetries = 3;
     private long retryDelayMs = 100;
     private boolean retryOnFailure = true;
+    private String authToken = null;
 
     public ClientConfig() {
+        String token = System.getenv("TITANKV_CLIENT_TOKEN");
+        if (token == null || token.isEmpty()) {
+            token = System.getProperty("titankv.client.token");
+        }
+        if (token != null && !token.isEmpty()) {
+            this.authToken = token;
+        }
     }
 
     /**
@@ -27,6 +35,9 @@ public class ClientConfig {
     }
 
     public void setConnectTimeoutMs(int connectTimeoutMs) {
+        if (connectTimeoutMs <= 0) {
+            throw new IllegalArgumentException("connectTimeoutMs must be positive, got: " + connectTimeoutMs);
+        }
         this.connectTimeoutMs = connectTimeoutMs;
     }
 
@@ -35,6 +46,9 @@ public class ClientConfig {
     }
 
     public void setReadTimeoutMs(int readTimeoutMs) {
+        if (readTimeoutMs <= 0) {
+            throw new IllegalArgumentException("readTimeoutMs must be positive, got: " + readTimeoutMs);
+        }
         this.readTimeoutMs = readTimeoutMs;
     }
 
@@ -43,6 +57,9 @@ public class ClientConfig {
     }
 
     public void setMaxConnectionsPerHost(int maxConnectionsPerHost) {
+        if (maxConnectionsPerHost <= 0) {
+            throw new IllegalArgumentException("maxConnectionsPerHost must be positive, got: " + maxConnectionsPerHost);
+        }
         this.maxConnectionsPerHost = maxConnectionsPerHost;
     }
 
@@ -51,6 +68,9 @@ public class ClientConfig {
     }
 
     public void setMaxRetries(int maxRetries) {
+        if (maxRetries < 0) {
+            throw new IllegalArgumentException("maxRetries must be non-negative, got: " + maxRetries);
+        }
         this.maxRetries = maxRetries;
     }
 
@@ -59,6 +79,9 @@ public class ClientConfig {
     }
 
     public void setRetryDelayMs(long retryDelayMs) {
+        if (retryDelayMs < 0) {
+            throw new IllegalArgumentException("retryDelayMs must be non-negative, got: " + retryDelayMs);
+        }
         this.retryDelayMs = retryDelayMs;
     }
 
@@ -68,6 +91,14 @@ public class ClientConfig {
 
     public void setRetryOnFailure(boolean retryOnFailure) {
         this.retryOnFailure = retryOnFailure;
+    }
+
+    public String getAuthToken() {
+        return authToken;
+    }
+
+    public void setAuthToken(String authToken) {
+        this.authToken = authToken;
     }
 
     /**
@@ -103,6 +134,11 @@ public class ClientConfig {
 
         public Builder retryOnFailure(boolean retry) {
             config.setRetryOnFailure(retry);
+            return this;
+        }
+
+        public Builder authToken(String token) {
+            config.setAuthToken(token);
             return this;
         }
 

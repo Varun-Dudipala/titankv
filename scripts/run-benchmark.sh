@@ -64,12 +64,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Check if project is built
-JAR_FILE="$PROJECT_DIR/target/titankv-1.0.0.jar"
-if [ ! -f "$JAR_FILE" ]; then
+# Find JAR file dynamically (supports version changes)
+JAR_FILE=$(ls -t "$PROJECT_DIR/target/titankv-"*.jar 2>/dev/null | grep -v original | head -1)
+
+# Check if JAR exists, build if not
+if [ -z "$JAR_FILE" ] || [ ! -f "$JAR_FILE" ]; then
     echo "JAR file not found. Building project..."
     cd "$PROJECT_DIR"
     mvn package -DskipTests -q
+    JAR_FILE=$(ls -t "$PROJECT_DIR/target/titankv-"*.jar 2>/dev/null | grep -v original | head -1)
+    if [ -z "$JAR_FILE" ]; then
+        echo "Error: Failed to build JAR file"
+        exit 1
+    fi
 fi
 
 # Compile benchmark

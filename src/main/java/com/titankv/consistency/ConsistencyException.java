@@ -24,6 +24,13 @@ public class ConsistencyException extends RuntimeException {
         this.actualResponses = actual;
     }
 
+    public ConsistencyException(String message, int required, int actual) {
+        super(String.format("%s (required=%d, actual=%d)", message, required, actual));
+        this.requestedLevel = null;
+        this.requiredResponses = required;
+        this.actualResponses = actual;
+    }
+
     public ConsistencyException(String message, Throwable cause) {
         super(message, cause);
         this.requestedLevel = null;

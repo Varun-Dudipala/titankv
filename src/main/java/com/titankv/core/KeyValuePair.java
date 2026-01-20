@@ -9,7 +9,7 @@ import java.util.Objects;
  */
 public final class KeyValuePair {
 
-    private final byte[] value;
+    private final byte[] value; // null indicates tombstone
     private final long timestamp;
     private final long expiresAt; // 0 means no expiration
 
@@ -42,7 +42,7 @@ public final class KeyValuePair {
      * @param expiresAt the expiration timestamp (0 for no expiration)
      */
     public KeyValuePair(byte[] value, long timestamp, long expiresAt) {
-        this.value = value != null ? Arrays.copyOf(value, value.length) : new byte[0];
+        this.value = value != null ? Arrays.copyOf(value, value.length) : null;
         this.timestamp = timestamp;
         this.expiresAt = expiresAt;
     }
@@ -53,7 +53,7 @@ public final class KeyValuePair {
      * @return copy of the value
      */
     public byte[] getValue() {
-        return Arrays.copyOf(value, value.length);
+        return value != null ? Arrays.copyOf(value, value.length) : null;
     }
 
     /**
@@ -91,6 +91,16 @@ public final class KeyValuePair {
      */
     public boolean isExpired() {
         return expiresAt > 0 && System.currentTimeMillis() > expiresAt;
+    }
+
+    /**
+     * Check if this entry is a tombstone (deleted value marker).
+     * Tombstones are represented as entries with empty value arrays.
+     *
+     * @return true if this is a tombstone
+     */
+    public boolean isTombstone() {
+        return value == null;
     }
 
     /**
@@ -149,7 +159,7 @@ public final class KeyValuePair {
     @Override
     public String toString() {
         return "KeyValuePair{" +
-               "valueLength=" + value.length +
+               "valueLength=" + (value != null ? value.length : -1) +
                ", timestamp=" + timestamp +
                ", expiresAt=" + expiresAt +
                ", expired=" + isExpired() +

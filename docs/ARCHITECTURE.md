@@ -78,8 +78,8 @@ public interface KVStore {
 ```
 
 **Binary Protocol:**
-- 13-byte fixed header for requests
-- 9-byte fixed header for responses
+- 29-byte fixed header for requests (includes timestamp and expires)
+- 25-byte fixed header for responses (includes timestamp and expires)
 - Magic bytes for protocol validation
 - Length-prefixed variable fields
 
@@ -144,15 +144,17 @@ JOINING → ALIVE → SUSPECT → DEAD
 
 **Write Path:**
 ```
-Client → Primary Node → Parallel writes to RF replicas
-                     → Return when consistency level met
+Client → Node (may not be primary) → Ownership check (MOVED if wrong node)
+                                → Primary → Parallel writes to RF replicas
+                                → Return when consistency level met
 ```
 
 **Read Path:**
 ```
-Client → Primary Node → For ONE: return immediately
-                     → For QUORUM/ALL: read from multiple, compare
-                     → Trigger read repair if inconsistent
+Client → Node (may not be primary) → Ownership check (MOVED if wrong node)
+                                → Primary → For ONE: return immediately
+                                → For QUORUM/ALL: read from multiple, compare
+                                → Trigger read repair if inconsistent
 ```
 
 ## Data Flow
@@ -206,7 +208,7 @@ Client → Primary Node → For ONE: return immediately
 │                                                             │
 │  Replication:                                               │
 │  ┌─────────────────────────────────────────────────────┐  │
-│  │        Replicator Pool (16 threads)                  │  │
+│  │        Replicator Pool (configurable threads)        │  │
 │  │        - Parallel replica writes/reads               │  │
 │  └─────────────────────────────────────────────────────┘  │
 │                                                             │
@@ -220,6 +222,7 @@ Client → Primary Node → For ONE: return immediately
 - **ByteBufferPool**: Pre-allocated direct buffers reduce GC pressure
 - **ThreadLocal buffers**: Each thread has its own buffer
 - **Object pooling**: Connection objects reused
+- **WAL + Snapshot**: Durable write-ahead log with periodic snapshots
 
 ### Network Efficiency
 

@@ -37,6 +37,17 @@ public interface KVStore {
     Optional<KeyValuePair> get(String key);
 
     /**
+     * Retrieve the raw value for a given key without tombstone filtering.
+     * Implementations may still treat expired entries as non-existent.
+     *
+     * @param key the key to look up
+     * @return the raw entry if present, empty otherwise
+     */
+    default Optional<KeyValuePair> getRaw(String key) {
+        return get(key);
+    }
+
+    /**
      * Delete a key-value pair.
      *
      * @param key the key to delete

@@ -182,10 +182,12 @@ public class MetricsCollector {
         return total > 0 ? hits / total : 0.0;
     }
 
+    @SuppressWarnings("deprecation") // Using deprecated percentile API for simplicity
     public double getGetP99LatencyMs() {
         return getLatency.percentile(0.99, TimeUnit.MILLISECONDS);
     }
 
+    @SuppressWarnings("deprecation") // Using deprecated percentile API for simplicity
     public double getPutP99LatencyMs() {
         return putLatency.percentile(0.99, TimeUnit.MILLISECONDS);
     }

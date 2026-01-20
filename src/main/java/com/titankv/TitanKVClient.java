@@ -14,23 +14,72 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * TitanKV client library.
  * Provides a high-level API for interacting with a TitanKV cluster.
+ * Includes circuit breaker pattern to handle failing nodes gracefully.
  */
 public class TitanKVClient implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(TitanKVClient.class);
+
+    // Circuit breaker configuration
+    private static final int CIRCUIT_FAILURE_THRESHOLD = 5;
+    private static final long CIRCUIT_RESET_TIMEOUT_MS = 30_000; // 30 seconds
 
     private final String[] hosts;
     private final ClientConfig config;
     private final ConnectionPool connectionPool;
     private final ConsistentHash hashRing;
     private volatile boolean closed = false;
+
+    // Circuit breaker state per host
+    private final Map<String, CircuitBreaker> circuitBreakers = new ConcurrentHashMap<>();
+
+    /**
+     * Circuit breaker for a single host.
+     */
+    private static class CircuitBreaker {
+        private final AtomicInteger failureCount = new AtomicInteger(0);
+        private final AtomicLong lastFailureTime = new AtomicLong(0);
+        private final AtomicLong openedAt = new AtomicLong(0);
+
+        boolean isOpen() {
+            if (openedAt.get() == 0) {
+                return false;
+            }
+            // Check if cooldown period has passed
+            if (System.currentTimeMillis() - openedAt.get() > CIRCUIT_RESET_TIMEOUT_MS) {
+                reset();
+                return false;
+            }
+            return true;
+        }
+
+        void recordFailure() {
+            lastFailureTime.set(System.currentTimeMillis());
+            if (failureCount.incrementAndGet() >= CIRCUIT_FAILURE_THRESHOLD) {
+                openedAt.set(System.currentTimeMillis());
+            }
+        }
+
+        void recordSuccess() {
+            failureCount.set(0);
+            openedAt.set(0);
+        }
+
+        void reset() {
+            failureCount.set(0);
+            openedAt.set(0);
+        }
+    }
 
     /**
      * Create a client connected to the specified hosts.
@@ -55,20 +104,73 @@ public class TitanKVClient implements AutoCloseable {
         this.hosts = hosts;
         this.config = config;
         this.connectionPool = new ConnectionPool(
-            config.getMaxConnectionsPerHost(),
-            config.getConnectTimeoutMs(),
-            config.getReadTimeoutMs()
-        );
+                config.getMaxConnectionsPerHost(),
+                config.getConnectTimeoutMs(),
+                config.getReadTimeoutMs());
         this.hashRing = new ConsistentHash();
 
-        // Add all hosts to the hash ring
+        // Add all hosts to the hash ring and initialize circuit breakers
         for (String host : hosts) {
             Node node = Node.fromAddress(host);
             node.setStatus(Node.Status.ALIVE);
             hashRing.addNode(node);
+            circuitBreakers.put(node.getAddress(), new CircuitBreaker());
         }
 
         logger.info("TitanKV client initialized with {} hosts", hosts.length);
+    }
+
+    /**
+     * Value with metadata returned by getWithMetadata().
+     */
+    public static class ValueWithMetadata {
+        private final byte[] value;
+        private final long timestamp;
+        private final long expiresAt;
+
+        public ValueWithMetadata(byte[] value, long timestamp, long expiresAt) {
+            this.value = value;
+            this.timestamp = timestamp;
+            this.expiresAt = expiresAt;
+        }
+
+        public byte[] getValue() {
+            return value;
+        }
+
+        public long getTimestamp() {
+            return timestamp;
+        }
+
+        public long getExpiresAt() {
+            return expiresAt;
+        }
+    }
+
+    /**
+     * Get a value by key with metadata (timestamp, expiration).
+     *
+     * @param key the key to retrieve
+     * @return the value with metadata if found, empty otherwise
+     * @throws IOException if the request fails
+     */
+    public Optional<ValueWithMetadata> getWithMetadata(String key) throws IOException {
+        validateKey(key);
+        Response response = execute(Command.get(key), key);
+
+        if (response.isOk()) {
+            return Optional.of(new ValueWithMetadata(
+                    response.getValue(),
+                    response.getTimestamp(),
+                    response.getExpiresAt()));
+        }
+        if (response.isNotFound()) {
+            return Optional.empty();
+        }
+        if (response.isError()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        return Optional.empty();
     }
 
     /**
@@ -79,19 +181,7 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public Optional<byte[]> get(String key) throws IOException {
-        validateKey(key);
-        Response response = execute(Command.get(key), key);
-
-        if (response.isOk() && response.hasValue()) {
-            return Optional.of(response.getValue());
-        }
-        if (response.isNotFound()) {
-            return Optional.empty();
-        }
-        if (response.isError()) {
-            throw new IOException("Server error: " + response.getErrorMessage());
-        }
-        return Optional.empty();
+        return getWithMetadata(key).map(ValueWithMetadata::getValue);
     }
 
     /**
@@ -148,6 +238,88 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
+     * Store a key-value pair (internal replication, no cascade).
+     * This method is used by ReplicationManager to prevent replication loops.
+     *
+     * @param key       the key
+     * @param value     the value
+     * @param timestamp the authoritative timestamp for conflict resolution
+     * @param expiresAt the expiration timestamp (0 = no expiration)
+     * @throws IOException if the request fails
+     */
+    public void putInternal(String key, byte[] value, long timestamp, long expiresAt) throws IOException {
+        validateKey(key);
+        Command internalPut = new Command(Command.PUT_INTERNAL, key, value, timestamp, expiresAt);
+        Response response = execute(internalPut, key);
+
+        if (response.isError()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+    }
+
+    /**
+     * Delete a key (internal replication, no cascade).
+     * This method is used by ReplicationManager to prevent replication loops.
+     * Writes a tombstone (null value) with the provided timestamp to prevent
+     * resurrection.
+     *
+     * @param key       the key to delete
+     * @param timestamp the authoritative timestamp for conflict resolution
+     * @param expiresAt the expiration timestamp (0 = no expiration)
+     * @throws IOException if the request fails
+     */
+    public void deleteInternal(String key, long timestamp, long expiresAt) throws IOException {
+        validateKey(key);
+        Command internalDelete = new Command(Command.DELETE_INTERNAL, key, null, timestamp, expiresAt);
+        Response response = execute(internalDelete, key);
+
+        if (response.isError()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+    }
+
+    /**
+     * Get a value from local store only with metadata (internal replication, no
+     * cascade).
+     * This method is used by read repair to get timestamp information.
+     *
+     * @param key the key to retrieve
+     * @return the value with metadata if found, empty otherwise
+     * @throws IOException if the request fails
+     */
+    public Optional<ValueWithMetadata> getInternalWithMetadata(String key) throws IOException {
+        validateKey(key);
+        Command internalGet = new Command(Command.GET_INTERNAL, key, null);
+        Response response = execute(internalGet, key);
+
+        if (response.isOk() && response.hasValue()) {
+            return Optional.of(new ValueWithMetadata(
+                    response.getValue(),
+                    response.getTimestamp(),
+                    response.getExpiresAt()));
+        }
+        if (response.isNotFound()) {
+            return Optional.empty();
+        }
+        if (response.isError()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Get a value from local store only (internal replication, no cascade).
+     * This method is used by ReplicationManager to prevent read recursion.
+     *
+     * @param key the key to retrieve
+     * @return the value if found, empty otherwise
+     * @throws IOException if the request fails
+     */
+    public Optional<byte[]> getInternal(String key) throws IOException {
+        return getInternalWithMetadata(key).map(ValueWithMetadata::getValue);
+    }
+
+    /**
      * Check if a key exists.
      *
      * @param key the key to check
@@ -190,16 +362,28 @@ public class TitanKVClient implements AutoCloseable {
         Node node = hashRing.getNode(key);
         String host = node.getAddress();
 
-        int retries = config.isRetryOnFailure() ? config.getMaxRetries() : 1;
+        int retries = config.isRetryOnFailure() ? Math.max(1, config.getMaxRetries()) : 1;
         IOException lastException = null;
 
         for (int attempt = 0; attempt < retries; attempt++) {
             try {
-                return executeOnHost(command, host);
+                Response response = executeOnHost(command, host);
+                if (response.isError()) {
+                    String error = response.getErrorMessage();
+                    if (error != null && error.startsWith("MOVED ")) {
+                        String movedHost = error.substring("MOVED ".length()).trim();
+                        if (!movedHost.isEmpty()) {
+                            addNode(movedHost);
+                            host = movedHost;
+                            continue;
+                        }
+                    }
+                }
+                return response;
             } catch (IOException e) {
                 lastException = e;
                 logger.warn("Request failed (attempt {}/{}): {}",
-                    attempt + 1, retries, e.getMessage());
+                        attempt + 1, retries, e.getMessage());
 
                 if (attempt < retries - 1) {
                     try {
@@ -222,43 +406,39 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Execute a command on a specific host.
+     * Execute a command on a specific host with dynamic buffer growth support.
+     * Uses circuit breaker to avoid repeatedly hitting failing hosts.
      */
     private Response executeOnHost(Command command, String host) throws IOException {
+        // Check circuit breaker first
+        CircuitBreaker cb = circuitBreakers.get(host);
+        if (cb != null && cb.isOpen()) {
+            throw new IOException("Circuit breaker open for host: " + host);
+        }
+
         PooledConnection conn = null;
         try {
             conn = connectionPool.acquire(host);
+            ensureAuthenticated(conn, host);
 
-            // Send request
-            ByteBuffer writeBuffer = conn.getWriteBuffer();
-            BinaryProtocol.encode(command, writeBuffer);
-            writeBuffer.flip();
-            conn.write(writeBuffer);
+            Response response = sendCommand(conn, command);
 
-            // Read response - buffer starts in write mode (position=0, limit=capacity)
-            ByteBuffer readBuffer = conn.getReadBuffer();
-
-            // Keep reading until we have a complete response
-            while (true) {
-                int read = conn.read(readBuffer);
-                if (read == -1) {
-                    throw new IOException("Connection closed by server");
-                }
-
-                // Flip to read mode to check if complete
-                readBuffer.flip();
-
-                if (BinaryProtocol.hasCompleteResponse(readBuffer)) {
-                    break;
-                }
-
-                // Not complete - compact and continue reading
-                readBuffer.compact();
+            // Record success for circuit breaker
+            if (cb != null) {
+                cb.recordSuccess();
             }
 
-            return BinaryProtocol.decodeResponse(readBuffer);
+            return response;
 
         } catch (IOException e) {
+            // Record failure for circuit breaker
+            if (cb != null) {
+                cb.recordFailure();
+                if (cb.isOpen()) {
+                    logger.warn("Circuit breaker opened for host {} after {} failures",
+                            host, CIRCUIT_FAILURE_THRESHOLD);
+                }
+            }
             if (conn != null) {
                 connectionPool.invalidate(conn);
                 conn = null;
@@ -269,6 +449,68 @@ public class TitanKVClient implements AutoCloseable {
                 connectionPool.release(conn);
             }
         }
+    }
+
+    private void ensureAuthenticated(PooledConnection conn, String host) throws IOException {
+        String token = config.getAuthToken();
+        if (token == null || token.isEmpty()) {
+            return;
+        }
+        if (conn.isAuthenticated()) {
+            return;
+        }
+        Response response = sendCommand(conn, Command.auth(token));
+        if (!response.isOk()) {
+            throw new IOException("Authentication failed for host " + host + ": " + response.getErrorMessage());
+        }
+        conn.markAuthenticated();
+    }
+
+    private Response sendCommand(PooledConnection conn, Command command) throws IOException {
+        // Send request - grow write buffer if needed
+        ByteBuffer writeBuffer = conn.getWriteBuffer();
+        int requiredSize = BinaryProtocol.encodedSize(command);
+        while (writeBuffer.capacity() < requiredSize) {
+            conn.growWriteBuffer();
+            writeBuffer = conn.getWriteBuffer();
+        }
+        BinaryProtocol.encode(command, writeBuffer);
+        writeBuffer.flip();
+        conn.write(writeBuffer);
+
+        // Read response - buffer starts in write mode (position=0, limit=capacity)
+        ByteBuffer readBuffer = conn.getReadBuffer();
+
+        // Keep reading until we have a complete response
+        while (true) {
+            // Buffer is in write mode - read from channel with timeout enforcement
+            int read = conn.readWithTimeout(readBuffer, config.getReadTimeoutMs());
+            if (read == -1) {
+                throw new IOException("Connection closed by server");
+            }
+
+            // Flip to read mode to check if complete
+            readBuffer.flip();
+
+            if (BinaryProtocol.hasCompleteResponse(readBuffer)) {
+                // Complete response available
+                break;
+            }
+
+            // Incomplete response - need to read more
+            readBuffer.compact();
+
+            // If compact didn't free any space, buffer is full of unread bytes - must grow
+            if (readBuffer.position() == readBuffer.capacity()) {
+                // Buffer full with unread data, need bigger buffer
+                conn.growReadBuffer();
+                readBuffer = conn.peekReadBuffer(); // Get grown buffer (preserves data)
+            }
+
+            // Buffer is now in write mode, ready for next read
+        }
+
+        return BinaryProtocol.decodeResponse(readBuffer);
     }
 
     /**

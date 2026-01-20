@@ -7,14 +7,36 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-JAR_FILE="$PROJECT_DIR/target/titankv-1.0.0.jar"
 
-# Check if JAR exists
-if [ ! -f "$JAR_FILE" ]; then
+# Default to dev mode unless a cluster secret is provided
+if [ -z "$TITANKV_CLUSTER_SECRET" ] && [ -z "$TITANKV_DEV_MODE" ]; then
+    export TITANKV_DEV_MODE=true
+fi
+
+# Find JAR file dynamically (supports version changes)
+JAR_FILE=$(ls -t "$PROJECT_DIR/target/titankv-"*.jar 2>/dev/null | grep -v original | head -1)
+
+# Check if JAR exists, build if not
+if [ -z "$JAR_FILE" ] || [ ! -f "$JAR_FILE" ]; then
     echo "JAR file not found. Building project..."
     cd "$PROJECT_DIR"
     mvn package -DskipTests -q
+    JAR_FILE=$(ls -t "$PROJECT_DIR/target/titankv-"*.jar 2>/dev/null | grep -v original | head -1)
+    if [ -z "$JAR_FILE" ]; then
+        echo "Error: Failed to build JAR file"
+        exit 1
+    fi
 fi
+
+# Cleanup function
+cleanup() {
+    if [ -f "$PROJECT_DIR/logs/cluster.pids" ]; then
+        echo "Stopping cluster..."
+        kill $(cat "$PROJECT_DIR/logs/cluster.pids") 2>/dev/null || true
+        rm -f "$PROJECT_DIR/logs/cluster.pids"
+    fi
+}
+trap cleanup EXIT INT TERM
 
 # Create logs directory
 mkdir -p "$PROJECT_DIR/logs"

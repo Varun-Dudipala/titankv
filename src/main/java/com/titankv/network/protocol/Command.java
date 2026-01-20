@@ -15,22 +15,44 @@ public final class Command {
     public static final byte PING = 0x04;
     public static final byte EXISTS = 0x05;
     public static final byte KEYS = 0x06;
+    public static final byte AUTH = 0x07;
+    // Internal commands (not exposed to clients)
+    public static final byte GET_INTERNAL = 0x11;  // Get from local store only
+    public static final byte PUT_INTERNAL = 0x12;  // Put without triggering replication
+    public static final byte DELETE_INTERNAL = 0x13;  // Delete without triggering replication
 
     private final byte type;
     private final String key;
     private final byte[] value;
+    private final long timestamp;   // Server-side timestamp for versioning (0 = not set)
+    private final long expiresAt;   // Expiration timestamp (0 = no expiration)
 
     /**
-     * Create a new command.
+     * Create a new command with timestamp and expiry metadata.
+     *
+     * @param type      the command type (GET, PUT, DELETE, PING)
+     * @param key       the key (may be null for PING)
+     * @param value     the value (may be null for GET, DELETE, PING)
+     * @param timestamp server-side timestamp for versioning (0 = assign on store)
+     * @param expiresAt expiration timestamp (0 = no expiration)
+     */
+    public Command(byte type, String key, byte[] value, long timestamp, long expiresAt) {
+        this.type = type;
+        this.key = key;
+        this.value = value != null ? Arrays.copyOf(value, value.length) : null;
+        this.timestamp = timestamp;
+        this.expiresAt = expiresAt;
+    }
+
+    /**
+     * Create a new command without timestamp/expiry (for compatibility).
      *
      * @param type  the command type (GET, PUT, DELETE, PING)
      * @param key   the key (may be null for PING)
      * @param value the value (may be null for GET, DELETE, PING)
      */
     public Command(byte type, String key, byte[] value) {
-        this.type = type;
-        this.key = key;
-        this.value = value != null ? Arrays.copyOf(value, value.length) : null;
+        this(type, key, value, 0, 0);
     }
 
     /**
@@ -66,6 +88,16 @@ public final class Command {
      */
     public static Command exists(String key) {
         return new Command(EXISTS, key, null);
+    }
+
+    /**
+     * Create an AUTH command.
+     *
+     * @param token authentication token
+     */
+    public static Command auth(String token) {
+        byte[] tokenBytes = token != null ? token.getBytes(java.nio.charset.StandardCharsets.UTF_8) : null;
+        return new Command(AUTH, null, tokenBytes);
     }
 
     /**
@@ -106,9 +138,28 @@ public final class Command {
 
     /**
      * Check if this command has a value.
+     * Returns true for both non-null values and empty arrays (distinguishes null from empty).
      */
     public boolean hasValue() {
-        return value != null && value.length > 0;
+        return value != null;
+    }
+
+    /**
+     * Get the timestamp for versioning.
+     *
+     * @return timestamp in milliseconds since epoch, or 0 if not set
+     */
+    public long getTimestamp() {
+        return timestamp;
+    }
+
+    /**
+     * Get the expiration timestamp.
+     *
+     * @return expiration timestamp in milliseconds since epoch, or 0 for no expiration
+     */
+    public long getExpiresAt() {
+        return expiresAt;
     }
 
     /**
@@ -122,6 +173,7 @@ public final class Command {
             case PING: return "PING";
             case EXISTS: return "EXISTS";
             case KEYS: return "KEYS";
+            case AUTH: return "AUTH";
             default: return "UNKNOWN(" + type + ")";
         }
     }
@@ -132,13 +184,15 @@ public final class Command {
         if (o == null || getClass() != o.getClass()) return false;
         Command command = (Command) o;
         return type == command.type &&
+               timestamp == command.timestamp &&
+               expiresAt == command.expiresAt &&
                Objects.equals(key, command.key) &&
                Arrays.equals(value, command.value);
     }
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(type, key);
+        int result = Objects.hash(type, key, timestamp, expiresAt);
         result = 31 * result + Arrays.hashCode(value);
         return result;
     }

@@ -1,6 +1,5 @@
 package com.titankv.cluster;
 
-import com.titankv.core.KVStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,6 +22,7 @@ public class ClusterManager {
     private final Map<String, Node> nodes;
     private final List<Consumer<ClusterEvent>> eventListeners;
     private final ScheduledExecutorService scheduler;
+    private final String clusterSecret;
 
     private GossipProtocol gossipProtocol;
     private volatile boolean running;
@@ -33,7 +33,18 @@ public class ClusterManager {
      * @param localNode the local node
      */
     public ClusterManager(Node localNode) {
+        this(localNode, getDefaultClusterSecret());
+    }
+
+    /**
+     * Create a new cluster manager with explicit cluster secret.
+     *
+     * @param localNode     the local node
+     * @param clusterSecret optional cluster secret for gossip authentication (null to disable)
+     */
+    public ClusterManager(Node localNode, String clusterSecret) {
         this.localNode = localNode;
+        this.clusterSecret = clusterSecret;
         this.hashRing = new ConsistentHash();
         this.nodes = new ConcurrentHashMap<>();
         this.eventListeners = new CopyOnWriteArrayList<>();
@@ -48,6 +59,42 @@ public class ClusterManager {
         localNode.setStatus(Node.Status.ALIVE);
         nodes.put(localNode.getId(), localNode);
         hashRing.addNode(localNode);
+
+        if (clusterSecret != null && !clusterSecret.isEmpty()) {
+            logger.info("Gossip authentication enabled with cluster secret");
+        } else {
+            logger.warn("Gossip authentication DISABLED (dev mode) - cluster is vulnerable to spoofing attacks. " +
+                "This should NEVER be used in production!");
+        }
+    }
+
+    /**
+     * Get cluster secret from environment or system property.
+     * Priority: TITANKV_CLUSTER_SECRET env var > titankv.cluster.secret property > null
+     *
+     * In production mode (default), a secret is required unless TITANKV_DEV_MODE=true.
+     * This prevents accidentally deploying clusters without authentication.
+     */
+    private static String getDefaultClusterSecret() {
+        String secret = System.getenv("TITANKV_CLUSTER_SECRET");
+        if (secret == null || secret.isEmpty()) {
+            secret = System.getProperty("titankv.cluster.secret");
+        }
+
+        // Check if dev mode is explicitly enabled
+        boolean devMode = "true".equalsIgnoreCase(System.getenv("TITANKV_DEV_MODE"))
+            || "true".equalsIgnoreCase(System.getProperty("titankv.dev.mode"));
+
+        // In production mode, require a secret
+        if (!devMode && (secret == null || secret.isEmpty())) {
+            throw new IllegalStateException(
+                "Cluster secret is required for production deployment. " +
+                "Set TITANKV_CLUSTER_SECRET environment variable or titankv.cluster.secret property. " +
+                "To run in development mode without authentication (UNSAFE), set TITANKV_DEV_MODE=true."
+            );
+        }
+
+        return secret;
     }
 
     /**
@@ -61,17 +108,19 @@ public class ClusterManager {
         }
         running = true;
 
-        // Start gossip protocol
-        gossipProtocol = new GossipProtocol(localNode, this);
+        // Start gossip protocol with authentication
+        gossipProtocol = new GossipProtocol(localNode, this, clusterSecret);
         gossipProtocol.start();
 
         // Join cluster via seed nodes
+        // Note: Don't call addNode() here - we don't know the real node IDs yet.
+        // The seed nodes will respond with JOIN messages containing their real IDs,
+        // or send us membership lists with all known nodes.
         if (seedNodes != null && !seedNodes.isEmpty()) {
             for (String seed : seedNodes.split(",")) {
                 String trimmed = seed.trim();
                 if (!trimmed.isEmpty() && !trimmed.equals(localNode.getAddress())) {
                     Node seedNode = Node.fromAddress(trimmed);
-                    addNode(seedNode);
                     gossipProtocol.sendJoin(seedNode);
                 }
             }
@@ -122,7 +171,19 @@ public class ClusterManager {
             return;
         }
 
-        node.setStatus(Node.Status.ALIVE);
+        // Check if we already have a node at this address (prevent duplicates from seed node handling)
+        String nodeAddress = node.getAddress();
+        for (Node existing : nodes.values()) {
+            if (existing.getAddress().equals(nodeAddress)) {
+                logger.debug("Node at {} already exists with ID {}, ignoring duplicate with ID {}", 
+                    nodeAddress, existing.getId(), node.getId());
+                return;
+            }
+        }
+
+        if (node.getStatus() == Node.Status.JOINING) {
+            node.setStatus(Node.Status.ALIVE);
+        }
         node.updateHeartbeat();
         nodes.put(node.getId(), node);
         hashRing.addNode(node);
@@ -160,8 +221,11 @@ public class ClusterManager {
             Node.Status oldStatus = node.getStatus();
             node.updateHeartbeat();
 
-            if (oldStatus == Node.Status.SUSPECT) {
+            if (oldStatus == Node.Status.SUSPECT || oldStatus == Node.Status.DEAD) {
                 node.setStatus(Node.Status.ALIVE);
+                if (!hashRing.containsNode(node)) {
+                    hashRing.addNode(node);
+                }
                 fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_RECOVERED, node));
                 logger.info("Node {} recovered", nodeId);
             }

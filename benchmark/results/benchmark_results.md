@@ -77,7 +77,7 @@
 ## Key Performance Factors
 
 1. **NIO-based TCP Server**: Non-blocking I/O handles many connections efficiently
-2. **Binary Protocol**: Minimal serialization overhead (13-byte request header)
+2. **Binary Protocol**: Minimal serialization overhead (29-byte request header with timestamps)
 3. **Connection Pooling**: Reuses connections to reduce handshake overhead
 4. **ConcurrentHashMap**: Lock-free reads for high read throughput
 5. **Direct ByteBuffers**: Reduced GC pressure during high load

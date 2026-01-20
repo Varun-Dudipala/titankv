@@ -19,6 +19,8 @@ public final class Response {
     private final byte status;
     private final byte[] value;
     private final String errorMessage;
+    private final long timestamp; // Server-side timestamp for versioning (0 if not applicable)
+    private final long expiresAt;  // Expiration timestamp (0 = no expiration)
 
     /**
      * Create a new response.
@@ -27,7 +29,19 @@ public final class Response {
      * @param value  the value (may be null)
      */
     public Response(byte status, byte[] value) {
-        this(status, value, null);
+        this(status, value, null, 0, 0);
+    }
+
+    /**
+     * Create a new response with timestamp and expiration (for GET responses).
+     *
+     * @param status    the response status code
+     * @param value     the value (may be null)
+     * @param timestamp the server-side timestamp
+     * @param expiresAt expiration timestamp (0 = no expiration)
+     */
+    public Response(byte status, byte[] value, long timestamp, long expiresAt) {
+        this(status, value, null, timestamp, expiresAt);
     }
 
     /**
@@ -38,13 +52,42 @@ public final class Response {
      * @param errorMessage the error message (for ERROR status)
      */
     public Response(byte status, byte[] value, String errorMessage) {
-        this.status = status;
-        this.value = value != null ? Arrays.copyOf(value, value.length) : null;
-        this.errorMessage = errorMessage;
+        this(status, value, errorMessage, 0, 0);
     }
 
     /**
-     * Create a successful response with value.
+     * Create a new response with all fields.
+     *
+     * @param status       the response status code
+     * @param value        the value (may be null)
+     * @param errorMessage the error message (for ERROR status)
+     * @param timestamp    the server-side timestamp
+     * @param expiresAt    expiration timestamp (0 = no expiration)
+     */
+    public Response(byte status, byte[] value, String errorMessage, long timestamp, long expiresAt) {
+        this.status = status;
+        this.value = value != null ? Arrays.copyOf(value, value.length) : null;
+        this.errorMessage = errorMessage;
+        this.timestamp = timestamp;
+        this.expiresAt = expiresAt;
+    }
+
+    /**
+     * Create a successful response with value, timestamp, and expiration.
+     */
+    public static Response ok(byte[] value, long timestamp, long expiresAt) {
+        return new Response(OK, value, timestamp, expiresAt);
+    }
+
+    /**
+     * Create a successful response with value and timestamp (no expiration).
+     */
+    public static Response ok(byte[] value, long timestamp) {
+        return new Response(OK, value, timestamp, 0);
+    }
+
+    /**
+     * Create a successful response with value (no timestamp).
      */
     public static Response ok(byte[] value) {
         return new Response(OK, value);
@@ -129,6 +172,24 @@ public final class Response {
     }
 
     /**
+     * Get the server-side timestamp (for versioning/conflict resolution).
+     *
+     * @return timestamp in milliseconds since epoch, or 0 if not applicable
+     */
+    public long getTimestamp() {
+        return timestamp;
+    }
+
+    /**
+     * Get the expiration timestamp.
+     *
+     * @return expiration timestamp in milliseconds since epoch, or 0 for no expiration
+     */
+    public long getExpiresAt() {
+        return expiresAt;
+    }
+
+    /**
      * Check if this is a successful response.
      */
     public boolean isOk() {
@@ -151,9 +212,10 @@ public final class Response {
 
     /**
      * Check if this response has a value.
+     * Returns true for both non-null values and empty arrays (distinguishes null from empty).
      */
     public boolean hasValue() {
-        return value != null && value.length > 0;
+        return value != null;
     }
 
     /**

@@ -108,11 +108,13 @@ class BinaryProtocolTest {
 
     @Test
     void decode_invalidMagic_throwsException() {
-        ByteBuffer buffer = ByteBuffer.allocate(20);
+        ByteBuffer buffer = ByteBuffer.allocate(40);
         buffer.putInt(0xDEADBEEF); // Wrong magic
         buffer.put(Command.GET);
-        buffer.putInt(4);
-        buffer.putInt(0);
+        buffer.putInt(4);           // Key length
+        buffer.putInt(0);           // Value length
+        buffer.putLong(0);          // Timestamp
+        buffer.putLong(0);          // ExpiresAt
         buffer.put("test".getBytes(StandardCharsets.UTF_8));
         buffer.flip();
 
@@ -139,7 +141,9 @@ class BinaryProtocolTest {
         buffer.putInt(BinaryProtocol.MAGIC);
         buffer.put(Command.GET);
         buffer.putInt(100); // Key length of 100
-        buffer.putInt(0);
+        buffer.putInt(0);   // Value length
+        buffer.putLong(0);  // Timestamp
+        buffer.putLong(0);  // ExpiresAt
         buffer.flip();
 
         assertThatThrownBy(() -> BinaryProtocol.decodeCommand(buffer))
@@ -152,8 +156,10 @@ class BinaryProtocolTest {
         ByteBuffer buffer = ByteBuffer.allocate(BinaryProtocol.REQUEST_HEADER_SIZE);
         buffer.putInt(BinaryProtocol.MAGIC);
         buffer.put(Command.GET);
-        buffer.putInt(-1); // Invalid negative length
-        buffer.putInt(0);
+        buffer.putInt(-1);  // Invalid negative length
+        buffer.putInt(0);   // Value length
+        buffer.putLong(0);  // Timestamp
+        buffer.putLong(0);  // ExpiresAt
         buffer.flip();
 
         assertThatThrownBy(() -> BinaryProtocol.decodeCommand(buffer))
@@ -200,7 +206,7 @@ class BinaryProtocolTest {
     @Test
     void encodedSize_command_calculatesCorrectly() {
         Command cmd = Command.put("key", "value".getBytes(StandardCharsets.UTF_8));
-        int expectedSize = BinaryProtocol.REQUEST_HEADER_SIZE + 3 + 5; // 13 + key(3) + value(5)
+        int expectedSize = BinaryProtocol.REQUEST_HEADER_SIZE + 3 + 5; // 29 + key(3) + value(5)
 
         assertThat(BinaryProtocol.encodedSize(cmd)).isEqualTo(expectedSize);
     }
@@ -270,7 +276,22 @@ class BinaryProtocolTest {
         ByteBuffer buffer = BinaryProtocol.encode(original);
         Command decoded = BinaryProtocol.decodeCommand(buffer);
 
-        // Empty value encoded as length 0 is decoded as null (no value)
+        // Empty byte array should be preserved (distinct from null)
+        assertThat(decoded.hasValue()).isTrue();
+        assertThat(decoded.getValue()).isNotNull();
+        assertThat(decoded.getValue()).isEmpty();
+    }
+
+    @Test
+    void nullValue_roundTrip() {
+        // GET command has null value
+        Command original = Command.get("key");
+
+        ByteBuffer buffer = BinaryProtocol.encode(original);
+        Command decoded = BinaryProtocol.decodeCommand(buffer);
+
+        // Null value should be preserved (distinct from empty array)
         assertThat(decoded.hasValue()).isFalse();
+        assertThat(decoded.getValue()).isNull();
     }
 }

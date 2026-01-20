@@ -165,12 +165,23 @@ class InMemoryStoreTest {
     }
 
     @Test
-    void put_nullValue_storesEmptyArray() {
+    void put_nullValue_createsTombstone() {
         store.put("key1", null);
+
+        // Null values are tombstones and should not be retrievable
+        Optional<KeyValuePair> result = store.get("key1");
+        assertThat(result).isEmpty();
+        assertThat(store.exists("key1")).isFalse();
+    }
+
+    @Test
+    void put_emptyValue_isRetrievable() {
+        store.put("key1", new byte[0]);
 
         Optional<KeyValuePair> result = store.get("key1");
         assertThat(result).isPresent();
         assertThat(result.get().getValue()).isEmpty();
+        assertThat(store.exists("key1")).isTrue();
     }
 
     @Test
@@ -201,6 +212,21 @@ class InMemoryStoreTest {
         assertThat(updated).isTrue();
         assertThat(store.get("key1").get().getValue())
             .isEqualTo("newer".getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void putIfNewer_tombstone_makesKeyNonExistent() {
+        // Put initial value
+        store.put("key1", "value".getBytes(StandardCharsets.UTF_8));
+        assertThat(store.exists("key1")).isTrue();
+
+        // Write tombstone with newer timestamp
+        long timestamp = System.currentTimeMillis() + 100;
+        boolean written = store.putIfNewer("key1", null, timestamp, 0);
+
+        assertThat(written).isTrue();
+        assertThat(store.exists("key1")).isFalse();
+        assertThat(store.get("key1")).isEmpty();
     }
 
     @Test
