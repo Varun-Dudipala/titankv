@@ -70,9 +70,9 @@
 
 | Metric | Target | Achieved | Status |
 |--------|--------|----------|--------|
-| Write ops/sec | 2,000+ | 43,925 | **22x target** |
-| Read ops/sec | 5,000+ | 175,089 | **35x target** |
-| P99 Latency | < 10ms | ~0.22ms avg | **Well under** |
+| Write ops/sec | 2,000+ | 43,925 | Exceeded |
+| Read ops/sec | 5,000+ | 175,089 | Exceeded |
+| Avg Latency | < 10ms | 0.22ms | Exceeded |
 
 ## Key Performance Factors
 

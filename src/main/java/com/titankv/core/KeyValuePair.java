@@ -95,7 +95,7 @@ public final class KeyValuePair {
 
     /**
      * Check if this entry is a tombstone (deleted value marker).
-     * Tombstones are represented as entries with empty value arrays.
+     * Tombstones are represented as entries with null values.
      *
      * @return true if this is a tombstone
      */
