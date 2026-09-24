@@ -500,6 +500,16 @@ public class InMemoryStore implements KVStore {
                 .collect(Collectors.toSet());
     }
 
+    /**
+     * All unexpired keys, including deleted keys whose tombstones are still retained.
+     */
+    public Set<String> keysIncludingTombstones() {
+        return store.entrySet().stream()
+                .filter(e -> !e.getValue().isExpired())
+                .map(e -> e.getKey())
+                .collect(Collectors.toSet());
+    }
+
     @Override
     public int size() {
         return (int) store.values().stream()
