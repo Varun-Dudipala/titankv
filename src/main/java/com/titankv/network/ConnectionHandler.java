@@ -575,14 +575,18 @@ public class ConnectionHandler {
         if (command.getKey() == null) {
             return done(Response.error("Key required for PUT"));
         }
+        if (command.getExpiresAt() < 0) {
+            return done(Response.error("TTL must not be negative"));
+        }
         long timestamp = nextTimestamp();
-        long expiresAt = command.getExpiresAt();
+        // Client PUTs carry a relative TTL in the expires field
+        long expiresAt = command.getExpiresAt() > 0 ? System.currentTimeMillis() + command.getExpiresAt() : 0;
 
         if (isDistributed()) {
             return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
                     expiresAt, writeConsistency), "Write", command.getKey(), ok -> Response.ok());
         }
-        store.put(command.getKey(), command.getValueUnsafe());
+        store.putIfNewer(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt);
         return done(Response.ok());
     }
 
