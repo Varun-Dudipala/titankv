@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Any node can coordinate any key: the request is sent to the key's replicas and
  * completes once the consistency level is met.
  */
-public class ReplicationManager implements ReplicaIO {
+public final class ReplicationManager implements ReplicaIO {
 
     private static final Logger logger = LoggerFactory.getLogger(ReplicationManager.class);
 
