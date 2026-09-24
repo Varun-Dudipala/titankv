@@ -212,6 +212,23 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
+     * Store a value that expires after the given time-to-live.
+     *
+     * @param ttlMillis time-to-live in milliseconds, measured by the server (0 = never expires)
+     * @throws IOException if the request fails
+     */
+    public void put(String key, byte[] value, long ttlMillis) throws IOException {
+        validateKey(key);
+        if (ttlMillis < 0) {
+            throw new IllegalArgumentException("ttlMillis must not be negative");
+        }
+        Response response = execute(Command.put(key, value, ttlMillis), key);
+        if (response.isError()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+    }
+
+    /**
      * Store a string value.
      *
      * @param key   the key to store
