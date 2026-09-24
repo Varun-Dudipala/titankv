@@ -117,6 +117,15 @@ public class ReplicationManager implements ReplicaIO {
     }
 
     /**
+     * Number of replicas a key should have: the replication factor, capped by the number of
+     * cluster members. Members that are down still count, so losing replicas makes QUORUM and
+     * ALL fail rather than quietly requiring fewer acknowledgements.
+     */
+    int effectiveReplicationFactor() {
+        return Math.max(1, Math.min(replicationFactor, clusterManager.getNodeCount()));
+    }
+
+    /**
      * Write to replicas with the specified consistency level.
      *
      * @return future that completes when the consistency level is met
@@ -143,8 +152,8 @@ public class ReplicationManager implements ReplicaIO {
 
     private CompletableFuture<Boolean> replicate(String key, ConsistencyLevel consistency, String name,
             ReplicaOperation operation) {
+        int required = consistency.getRequired(effectiveReplicationFactor());
         List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
-        int required = consistency.getRequired(replicas.size());
         if (replicas.size() < required) {
             return CompletableFuture.failedFuture(new ConsistencyException(
                     "Not enough replicas available", consistency, required, replicas.size()));
@@ -182,7 +191,7 @@ public class ReplicationManager implements ReplicaIO {
      *         returned as a result with a null value.
      */
     public CompletableFuture<Optional<ReadResult>> read(String key, ConsistencyLevel consistency) {
-        int required = consistency.getRequired(clusterManager.getNodesForKey(key, replicationFactor).size());
+        int required = consistency.getRequired(effectiveReplicationFactor());
         return readRepairHandler.readWithRepair(key, required, timeoutMs)
                 .thenApply(result -> {
                     if (result.getTimestamp() == 0) {

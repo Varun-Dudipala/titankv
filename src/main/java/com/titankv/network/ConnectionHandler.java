@@ -496,8 +496,12 @@ public class ConnectionHandler {
         }
     }
 
+    /**
+     * Whether requests go through replication. Based on membership, not liveness, so a node
+     * whose peers are down fails QUORUM requests instead of falling back to a local-only write.
+     */
     private boolean isDistributed() {
-        return replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1;
+        return replicationManager != null && clusterManager != null && clusterManager.getNodeCount() > 1;
     }
 
     /**
