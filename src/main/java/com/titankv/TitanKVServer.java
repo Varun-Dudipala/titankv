@@ -2,7 +2,6 @@ package com.titankv;
 
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.DataRebalancer;
-import com.titankv.cluster.HintedHandoff;
 import com.titankv.cluster.Node;
 import com.titankv.consistency.ReplicationManager;
 import com.titankv.core.InMemoryStore;
@@ -40,7 +39,6 @@ public class TitanKVServer {
     private final CountDownLatch shutdownLatch;
     private final String seedNodes;
     private MetricsHttpServer metricsHttpServer;
-    private HintedHandoff hintedHandoff;
     private DataRebalancer dataRebalancer;
 
     /**
@@ -162,12 +160,6 @@ public class TitanKVServer {
                 logger.warn("Failed to start metrics HTTP server: {}", e.getMessage());
             }
 
-            // Initialize hinted handoff
-            Path dataDir = Path.of(System.getProperty("titankv.data.dir", 
-                System.getenv().getOrDefault("TITANKV_DATA_DIR", "data")));
-            hintedHandoff = new HintedHandoff(clusterManager, dataDir);
-            hintedHandoff.start();
-            logger.info("Hinted handoff started");
 
             // Initialize data rebalancer
             dataRebalancer = new DataRebalancer(clusterManager, (InMemoryStore) store, 
@@ -201,11 +193,6 @@ public class TitanKVServer {
         // Stop data rebalancer
         if (dataRebalancer != null) {
             dataRebalancer.stop();
-        }
-
-        // Stop hinted handoff
-        if (hintedHandoff != null) {
-            hintedHandoff.stop();
         }
 
         // Stop cluster manager (graceful leave)
