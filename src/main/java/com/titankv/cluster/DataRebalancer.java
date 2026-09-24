@@ -171,7 +171,8 @@ public class DataRebalancer {
         Set<String> result = new HashSet<>();
         Node localNode = clusterManager.getLocalNode();
 
-        for (String key : store.keys()) {
+        // Include tombstones so a node that missed deletes while down does not serve the old values
+        for (String key : store.keysIncludingTombstones()) {
             List<Node> owners = clusterManager.getNodesForKey(key, replicationFactor);
             
             // Check if target node should own this key
