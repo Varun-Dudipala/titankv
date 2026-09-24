@@ -10,11 +10,14 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A cluster running with a cluster secret, as required outside dev mode.
+ * A cluster in production mode: dev mode off, so a cluster secret is required, gossip is signed,
+ * internal commands need the token, and each node writes a fsynced WAL.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -25,7 +28,9 @@ class AuthenticatedClusterTest {
 
     @BeforeAll
     void startCluster() throws Exception {
+        System.setProperty("titankv.dev.mode", "false");
         System.setProperty("titankv.cluster.secret", "integration-test-secret");
+        System.setProperty("titankv.data.dir", Files.createTempDirectory("titankv-auth").toString());
         cluster = TestCluster.start(BASE_PORT, 3);
     }
 
@@ -35,6 +40,8 @@ class AuthenticatedClusterTest {
             cluster.close();
         }
         System.clearProperty("titankv.cluster.secret");
+        System.clearProperty("titankv.data.dir");
+        System.setProperty("titankv.dev.mode", "true");
     }
 
     @Test
@@ -73,5 +80,13 @@ class AuthenticatedClusterTest {
             assertThat(response.getErrorMessage()).contains("AUTH required");
         }
         assertThat(cluster.node(0).getStore().exists("forged")).isFalse();
+    }
+
+    @Test
+    void eachNodeWritesItsOwnWal() {
+        for (int i = 0; i < cluster.size(); i++) {
+            Path wal = Path.of(System.getProperty("titankv.data.dir"), "node-" + (BASE_PORT + i), "wal.log");
+            assertThat(wal).exists();
+        }
     }
 }
