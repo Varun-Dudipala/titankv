@@ -524,6 +524,7 @@ public class InMemoryStore implements KVStore {
      * @param expiresAt the expiration timestamp (0 = no expiration)
      * @return true if the value was written, false if existing value is newer
      */
+    @Override
     public boolean putIfNewer(String key, byte[] value, long timestamp, long expiresAt) {
         validateKey(key);
 

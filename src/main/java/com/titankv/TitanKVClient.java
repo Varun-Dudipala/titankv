@@ -292,7 +292,8 @@ public class TitanKVClient implements AutoCloseable {
         Command internalGet = new Command(Command.GET_INTERNAL, key, null);
         Response response = execute(internalGet, key);
 
-        if (response.isOk() && response.hasValue()) {
+        // An OK response without a value is a tombstone; its timestamp still matters for conflict resolution
+        if (response.isOk()) {
             return Optional.of(new ValueWithMetadata(
                     response.getValue(),
                     response.getTimestamp(),
@@ -367,19 +368,7 @@ public class TitanKVClient implements AutoCloseable {
 
         for (int attempt = 0; attempt < retries; attempt++) {
             try {
-                Response response = executeOnHost(command, host);
-                if (response.isError()) {
-                    String error = response.getErrorMessage();
-                    if (error != null && error.startsWith("MOVED ")) {
-                        String movedHost = error.substring("MOVED ".length()).trim();
-                        if (!movedHost.isEmpty()) {
-                            addNode(movedHost);
-                            host = movedHost;
-                            continue;
-                        }
-                    }
-                }
-                return response;
+                return executeOnHost(command, host);
             } catch (IOException e) {
                 lastException = e;
                 logger.warn("Request failed (attempt {}/{}): {}",

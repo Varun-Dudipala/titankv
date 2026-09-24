@@ -1,6 +1,5 @@
 package com.titankv.network;
 
-import com.titankv.cluster.Node;
 import com.titankv.consistency.ConsistencyLevel;
 import com.titankv.core.KVStore;
 import com.titankv.core.KeyValuePair;
@@ -24,7 +23,12 @@ import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Handles individual client connections.
@@ -41,6 +45,7 @@ public class ConnectionHandler {
             + BinaryProtocol.MAX_KEY_LENGTH + BinaryProtocol.MAX_VALUE_LENGTH;
     // Timeout for completing a request frame (30 seconds)
     private static final long INCOMPLETE_FRAME_TIMEOUT_MS = 30_000;
+    private static final long OPERATION_TIMEOUT_MS = 5_000;
 
     private final SocketChannel channel;
     private final KVStore store;
@@ -277,25 +282,6 @@ public class ConnectionHandler {
         return Response.ok();
     }
 
-    private Response maybeRedirect(String key) {
-        if (clusterManager == null || key == null) {
-            return null;
-        }
-        if (clusterManager.getNodeCount() <= 1) {
-            return null;
-        }
-        try {
-            Node primary = clusterManager.getNodeForKey(key);
-            Node local = clusterManager.getLocalNode();
-            if (primary != null && local != null && !primary.equals(local)) {
-                return Response.error("MOVED " + primary.getAddress());
-            }
-        } catch (RuntimeException e) {
-            logger.debug("Owner check failed for key {}: {}", key, e.getMessage());
-        }
-        return null;
-    }
-
     /**
      * Handle a read event from the selector.
      *
@@ -401,176 +387,167 @@ public class ConnectionHandler {
 
     /**
      * Process the next command in the queue if one is not already being processed.
-     * This ensures per-connection ordering: commands are processed one at a time.
+     * Commands on a connection run one at a time, so responses keep request order.
+     * The worker thread never waits on replicas: replicated operations complete
+     * asynchronously and the next command is scheduled from the completion callback.
      */
     private void processNextCommand(SelectionKey key) {
+        Command command;
         synchronized (pendingCommands) {
             if (commandInProgress || pendingCommands.isEmpty()) {
-                return; // Already processing or no work to do
-            }
-
-            Command command = pendingCommands.poll();
-            if (command != null) {
-                commandInProgress = true;
-                // Offload to worker pool for async processing
-                workerPool.submit(() -> {
-                    try {
-                        processCommandAsync(command);
-                    } finally {
-                        // Mark this command as complete and process next
-                        synchronized (pendingCommands) {
-                            commandInProgress = false;
-                        }
-                        processNextCommand(key);
-                    }
-                });
-            }
-        }
-    }
-
-    /**
-     * Process command on worker thread.
-     * Maintains per-connection ordering by waiting for replicated ops to finish
-     * before queuing the response.
-     */
-    private void processCommandAsync(Command command) {
-        long startTime = System.nanoTime();
-
-        try {
-            if (command.getType() == Command.AUTH) {
-                Response authResponse = handleAuth(command);
-                queueResponseAsync(authResponse);
                 return;
             }
-
-            Response authError = authorizeCommand(command);
-            if (authError != null) {
-                queueResponseAsync(authError);
-                metrics.recordError();
-                return;
-            }
-
-            switch (command.getType()) {
-                case Command.GET:
-                    Response getResponse = handleGetBlocking(command);
-                    metrics.recordGet(System.nanoTime() - startTime, getResponse.getStatus() == Response.OK);
-                    queueResponseAsync(getResponse);
-                    return;
-
-                case Command.PUT:
-                    Response putResponse = handlePutBlocking(command);
-                    metrics.recordPut(System.nanoTime() - startTime);
-                    queueResponseAsync(putResponse);
-                    return;
-
-                case Command.DELETE:
-                    Response deleteResponse = handleDeleteBlocking(command);
-                    metrics.recordDelete(System.nanoTime() - startTime);
-                    queueResponseAsync(deleteResponse);
-                    return;
-
-                // Sync handlers below - we queue the response
-                case Command.GET_INTERNAL:
-                    Response response = handleGetInternal(command);
-                    metrics.recordGet(System.nanoTime() - startTime, response.getStatus() == Response.OK);
-                    queueResponseAsync(response);
-                    return;
-
-                case Command.PUT_INTERNAL:
-                    response = handlePutInternal(command);
-                    metrics.recordPut(System.nanoTime() - startTime);
-                    queueResponseAsync(response);
-                    return;
-
-                case Command.DELETE_INTERNAL:
-                    response = handleDeleteInternal(command);
-                    metrics.recordDelete(System.nanoTime() - startTime);
-                    queueResponseAsync(response);
-                    return;
-
-                case Command.PING:
-                    queueResponseAsync(Response.pong());
-                    return;
-
-                case Command.EXISTS:
-                    response = handleExists(command);
-                    queueResponseAsync(response);
-                    return;
-
-                case Command.KEYS:
-                    logger.info("KEYS command received but is disabled in distributed mode");
-                    queueResponseAsync(
-                            Response.error("KEYS command is disabled in distributed mode for performance reasons"));
-                    return;
-
-                default:
-                    logger.warn("Unknown command type: {}", command.getType());
-                    queueResponseAsync(Response.error("Unknown command"));
-                    metrics.recordError();
-            }
-        } catch (IllegalArgumentException e) {
-            logger.warn("Invalid argument for command {}: {}", command.getTypeName(), e.getMessage());
-            queueResponseAsync(Response.error("Invalid argument: " + e.getMessage()));
-            metrics.recordError();
-        } catch (IllegalStateException e) {
-            logger.error("State error processing command {}: {}", command.getTypeName(), e.getMessage());
-            queueResponseAsync(Response.error("Internal error: " + e.getMessage()));
-            metrics.recordError();
-        } catch (RuntimeException e) {
-            logger.error("Error processing command {}: {}", command.getTypeName(), e.toString(), e);
-            queueResponseAsync(Response.error("Internal error: " + e.getMessage()));
-            metrics.recordError();
+            command = pendingCommands.poll();
+            commandInProgress = true;
         }
-    }
-
-    /**
-     * Handle GET command and return response. Blocks for replicated reads to
-     * preserve per-connection ordering.
-     */
-    private Response handleGetBlocking(Command command) {
-        if (command.getKey() == null) {
-            return Response.error("Key required for GET");
-        }
-
-        Response moved = maybeRedirect(command.getKey());
-        if (moved != null) {
-            return moved;
-        }
-
-        // Use distributed read if replication is enabled and cluster has multiple nodes
-        if (replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1) {
+        workerPool.submit(() -> {
+            long startTime = System.nanoTime();
+            CompletableFuture<Response> pending;
             try {
-                Optional<com.titankv.consistency.ReplicationManager.ReadResult> result = replicationManager
-                        .read(command.getKey(), readConsistency)
-                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
-                if (result.isPresent()) {
-                    com.titankv.consistency.ReplicationManager.ReadResult readResult = result.get();
-                    if (readResult.getValue() == null) {
-                        return Response.notFound();
-                    }
-                    return Response.ok(readResult.getValue(), readResult.getTimestamp(),
-                            readResult.getExpiresAt());
-                }
-                return Response.notFound();
-            } catch (java.util.concurrent.TimeoutException e) {
-                logger.warn("Read timeout for key {}", command.getKey());
-                return Response.error("Read timeout");
-            } catch (java.util.concurrent.ExecutionException e) {
-                logger.warn("Read failed for key {}: {}", command.getKey(), e.getMessage());
-                return Response.error("Read failed: " + e.getMessage());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return Response.error("Read interrupted");
+                pending = dispatch(command);
+            } catch (RuntimeException e) {
+                pending = CompletableFuture.completedFuture(errorResponse(command, e));
             }
-        }
+            pending.whenComplete((response, error) -> {
+                Response result = error != null ? errorResponse(command, unwrap(error)) : response;
+                recordMetrics(command, result, System.nanoTime() - startTime);
+                queueResponseAsync(result);
+                synchronized (pendingCommands) {
+                    commandInProgress = false;
+                }
+                processNextCommand(key);
+            });
+        });
+    }
 
-        // Single-node mode: local read
+    private CompletableFuture<Response> dispatch(Command command) {
+        if (command.getType() == Command.AUTH) {
+            return done(handleAuth(command));
+        }
+        Response authError = authorizeCommand(command);
+        if (authError != null) {
+            return done(authError);
+        }
+        switch (command.getType()) {
+            case Command.GET:
+                return handleGet(command);
+            case Command.PUT:
+                return handlePut(command);
+            case Command.DELETE:
+                return handleDelete(command);
+            case Command.EXISTS:
+                return handleExists(command);
+            case Command.GET_INTERNAL:
+                return done(handleGetInternal(command));
+            case Command.PUT_INTERNAL:
+                return done(handlePutInternal(command));
+            case Command.DELETE_INTERNAL:
+                return done(handleDeleteInternal(command));
+            case Command.PING:
+                return done(Response.pong());
+            case Command.KEYS:
+                return done(Response.error("KEYS command is disabled in distributed mode for performance reasons"));
+            default:
+                logger.warn("Unknown command type: {}", command.getType());
+                return done(Response.error("Unknown command"));
+        }
+    }
+
+    private static CompletableFuture<Response> done(Response response) {
+        return CompletableFuture.completedFuture(response);
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        while ((error instanceof CompletionException || error instanceof ExecutionException)
+                && error.getCause() != null) {
+            error = error.getCause();
+        }
+        return error;
+    }
+
+    private Response errorResponse(Command command, Throwable error) {
+        if (error instanceof IllegalArgumentException) {
+            logger.warn("Invalid argument for command {}: {}", command.getTypeName(), error.getMessage());
+            return Response.error("Invalid argument: " + error.getMessage());
+        }
+        logger.error("Error processing command {}: {}", command.getTypeName(), error.toString(), error);
+        return Response.error("Internal error: " + error.getMessage());
+    }
+
+    private void recordMetrics(Command command, Response response, long durationNanos) {
+        switch (command.getType()) {
+            case Command.GET:
+            case Command.GET_INTERNAL:
+                metrics.recordGet(durationNanos, response.getStatus() == Response.OK);
+                break;
+            case Command.PUT:
+            case Command.PUT_INTERNAL:
+                metrics.recordPut(durationNanos);
+                break;
+            case Command.DELETE:
+            case Command.DELETE_INTERNAL:
+                metrics.recordDelete(durationNanos);
+                break;
+            default:
+                break;
+        }
+        if (response.isError()) {
+            metrics.recordError();
+        }
+    }
+
+    private boolean isDistributed() {
+        return replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1;
+    }
+
+    /**
+     * Maps a replicated operation's outcome to a response, failing it if it runs past the timeout.
+     */
+    private <T> CompletableFuture<Response> replicated(CompletableFuture<T> operation, String name, String key,
+            java.util.function.Function<T, Response> onSuccess) {
+        return operation
+                .orTimeout(OPERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .handle((value, error) -> {
+                    if (error == null) {
+                        return onSuccess.apply(value);
+                    }
+                    Throwable cause = unwrap(error);
+                    if (cause instanceof TimeoutException) {
+                        logger.warn("{} timeout for key {}", name, key);
+                        return Response.error(name + " timeout");
+                    }
+                    logger.warn("{} failed for key {}: {}", name, key, cause.getMessage());
+                    return Response.error(name + " failed: " + cause.getMessage());
+                });
+    }
+
+    private CompletableFuture<Response> handleGet(Command command) {
+        if (command.getKey() == null) {
+            return done(Response.error("Key required for GET"));
+        }
+        if (isDistributed()) {
+            return replicated(replicationManager.read(command.getKey(), readConsistency), "Read", command.getKey(),
+                    result -> result.filter(r -> r.getValue() != null)
+                            .map(r -> Response.ok(r.getValue(), r.getTimestamp(), r.getExpiresAt()))
+                            .orElseGet(Response::notFound));
+        }
         Optional<KeyValuePair> result = store.get(command.getKey());
         if (result.isPresent()) {
             KeyValuePair kv = result.get();
-            return Response.ok(kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
+            return done(Response.ok(kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt()));
         }
-        return Response.notFound();
+        return done(Response.notFound());
+    }
+
+    private CompletableFuture<Response> handleExists(Command command) {
+        if (command.getKey() == null) {
+            return done(Response.error("Key required for EXISTS"));
+        }
+        if (isDistributed()) {
+            return replicated(replicationManager.read(command.getKey(), readConsistency), "Read", command.getKey(),
+                    result -> Response.exists(result.filter(r -> r.getValue() != null).isPresent()));
+        }
+        return done(Response.exists(store.exists(command.getKey())));
     }
 
     /**
@@ -578,11 +555,6 @@ public class ConnectionHandler {
      * SECURITY: Only authorized cluster nodes can use this command.
      */
     private Response handleGetInternal(Command command) {
-        // Validate authorization for internal commands
-        if (!isAuthorizedForInternalCommands()) {
-            return Response.error("Unauthorized: internal commands require cluster membership");
-        }
-
         if (command.getKey() == null) {
             return Response.error("Key required for GET");
         }
@@ -595,46 +567,19 @@ public class ConnectionHandler {
         return Response.notFound();
     }
 
-    /**
-     * Handle PUT command and return response. Blocks for replicated writes to
-     * preserve per-connection ordering.
-     */
-    private Response handlePutBlocking(Command command) {
+    private CompletableFuture<Response> handlePut(Command command) {
         if (command.getKey() == null) {
-            return Response.error("Key required for PUT");
+            return done(Response.error("Key required for PUT"));
         }
-
-        Response moved = maybeRedirect(command.getKey());
-        if (moved != null) {
-            return moved;
-        }
-
         long timestamp = nextTimestamp();
         long expiresAt = command.getExpiresAt();
 
-        // Use distributed write if replication is enabled and cluster has multiple
-        // nodes
-        if (replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1) {
-            try {
-                replicationManager
-                        .write(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt, writeConsistency)
-                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
-                return Response.ok();
-            } catch (java.util.concurrent.TimeoutException e) {
-                logger.warn("Write timeout for key {}", command.getKey());
-                return Response.error("Write timeout");
-            } catch (java.util.concurrent.ExecutionException e) {
-                logger.warn("Write failed for key {}: {}", command.getKey(), e.getMessage());
-                return Response.error("Write failed: " + e.getMessage());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return Response.error("Write interrupted");
-            }
+        if (isDistributed()) {
+            return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
+                    expiresAt, writeConsistency), "Write", command.getKey(), ok -> Response.ok());
         }
-
-        // Single-node mode - store locally
         store.put(command.getKey(), command.getValueUnsafe());
-        return Response.ok();
+        return done(Response.ok());
     }
 
     /**
@@ -643,90 +588,39 @@ public class ConnectionHandler {
      * SECURITY: Only authorized cluster nodes can use this command.
      */
     private Response handlePutInternal(Command command) {
-        // Validate authorization for internal commands
-        if (!isAuthorizedForInternalCommands()) {
-            return Response.error("Unauthorized: internal commands require cluster membership");
-        }
-
         if (command.getKey() == null) {
             return Response.error("Key required for PUT");
         }
-
-        // Validate timestamp is provided for internal writes
         if (command.getTimestamp() == 0) {
             return Response.error("Timestamp required for internal PUT");
         }
-
-        // Write using timestamp-aware putIfNewer to maintain newest-wins semantics
-        boolean written = ((com.titankv.core.InMemoryStore) store).putIfNewer(
+        boolean written = store.putIfNewer(
                 command.getKey(),
                 command.getValueUnsafe(),
                 command.getTimestamp(),
                 command.getExpiresAt());
-
-        if (written) {
-            logger.trace("PUT_INTERNAL accepted: key={}, timestamp={}",
-                    command.getKey(), command.getTimestamp());
-        } else {
-            logger.trace("PUT_INTERNAL rejected (stale): key={}, timestamp={}",
-                    command.getKey(), command.getTimestamp());
-        }
-
+        logger.trace("PUT_INTERNAL {}: key={}, timestamp={}",
+                written ? "accepted" : "rejected (stale)", command.getKey(), command.getTimestamp());
         return Response.ok();
     }
 
-    /**
-     * Handle DELETE command and return response. Blocks for replicated deletes to
-     * preserve per-connection ordering.
-     */
-    private Response handleDeleteBlocking(Command command) {
+    private CompletableFuture<Response> handleDelete(Command command) {
         if (command.getKey() == null) {
-            return Response.error("Key required for DELETE");
+            return done(Response.error("Key required for DELETE"));
         }
-
-        Response moved = maybeRedirect(command.getKey());
-        if (moved != null) {
-            return moved;
-        }
-
-        // Create tombstone timestamp (ensure it's newer than any existing entry)
+        // Tombstone timestamp must be newer than any existing entry
         Optional<KeyValuePair> existing = store.getRaw(command.getKey());
         long timestamp = nextTimestamp();
         if (existing.isPresent()) {
             timestamp = Math.max(timestamp, existing.get().getTimestamp() + 1);
         }
 
-        long expiresAt = 0; // Tombstones don't expire
-        // Use distributed delete if replication is enabled and cluster has multiple
-        // nodes
-        if (replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1) {
-            try {
-                replicationManager
-                        .delete(command.getKey(), timestamp, expiresAt, deleteConsistency)
-                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
-                return Response.ok();
-            } catch (java.util.concurrent.TimeoutException e) {
-                logger.warn("Delete timeout for key {}", command.getKey());
-                return Response.error("Delete timeout");
-            } catch (java.util.concurrent.ExecutionException e) {
-                logger.warn("Delete failed for key {}: {}", command.getKey(), e.getMessage());
-                return Response.error("Delete failed: " + e.getMessage());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return Response.error("Delete interrupted");
-            }
+        if (isDistributed()) {
+            return replicated(replicationManager.delete(command.getKey(), timestamp, 0, deleteConsistency),
+                    "Delete", command.getKey(), ok -> Response.ok());
         }
-
-        // Single-node mode - write tombstone locally
-        boolean written = ((com.titankv.core.InMemoryStore) store).putIfNewer(
-                command.getKey(),
-                null,
-                timestamp,
-                expiresAt);
-        if (!written) {
-            logger.warn("Failed to write tombstone for key {} (concurrent modification?)", command.getKey());
-        }
-        return Response.ok();
+        store.putIfNewer(command.getKey(), null, timestamp, 0);
+        return done(Response.ok());
     }
 
     /**
@@ -735,48 +629,21 @@ public class ConnectionHandler {
      * SECURITY: Only authorized cluster nodes can use this command.
      */
     private Response handleDeleteInternal(Command command) {
-        // Validate authorization for internal commands
-        if (!isAuthorizedForInternalCommands()) {
-            return Response.error("Unauthorized: internal commands require cluster membership");
-        }
-
         if (command.getKey() == null) {
             return Response.error("Key required for DELETE");
         }
-
-        // Validate timestamp is provided for internal deletes
         if (command.getTimestamp() == 0) {
             return Response.error("Timestamp required for internal DELETE");
         }
-
-        // Write tombstone (null value with timestamp) using putIfNewer
-        // This prevents stale replicas from resurrecting the deleted value
-        boolean written = ((com.titankv.core.InMemoryStore) store).putIfNewer(
+        // null value = tombstone, so stale replicas cannot resurrect the deleted value
+        boolean written = store.putIfNewer(
                 command.getKey(),
-                null, // null value = tombstone
+                null,
                 command.getTimestamp(),
                 command.getExpiresAt());
-
-        if (written) {
-            logger.trace("DELETE_INTERNAL tombstone written: key={}, timestamp={}",
-                    command.getKey(), command.getTimestamp());
-        } else {
-            logger.trace("DELETE_INTERNAL tombstone rejected (stale): key={}, timestamp={}",
-                    command.getKey(), command.getTimestamp());
-        }
-
+        logger.trace("DELETE_INTERNAL tombstone {}: key={}, timestamp={}",
+                written ? "written" : "rejected (stale)", command.getKey(), command.getTimestamp());
         return Response.ok();
-    }
-
-    private Response handleExists(Command command) {
-        if (command.getKey() == null) {
-            return Response.error("Key required for EXISTS");
-        }
-        Response moved = maybeRedirect(command.getKey());
-        if (moved != null) {
-            return moved;
-        }
-        return Response.exists(store.exists(command.getKey()));
     }
 
     /**
