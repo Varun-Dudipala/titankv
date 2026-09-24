@@ -4,6 +4,7 @@ import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 import com.titankv.core.InMemoryStore;
 import com.titankv.core.KeyValuePair;
+import com.titankv.util.Env;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,9 +18,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 
  * When a new node joins:
  * - Existing nodes transfer keys that now belong to the new node
- * 
- * When a node leaves (gracefully):
- * - The leaving node transfers its data to successor nodes
  * 
  * Rebalancing is done in the background without blocking normal operations.
  */
@@ -48,7 +46,7 @@ public class DataRebalancer {
         this.store = store;
         this.replicationFactor = replicationFactor;
         this.nodeClients = new ConcurrentHashMap<>();
-        this.authToken = readAuthToken();
+        this.authToken = Env.internalToken();
         this.running = false;
 
         this.transferPool = new ThreadPoolExecutor(
@@ -143,9 +141,7 @@ public class DataRebalancer {
      */
     private void handleNodeJoin(Node newNode) {
         if (newNode.equals(clusterManager.getLocalNode())) {
-            // We are the new node - request data from other nodes
-            requestDataFromCluster();
-            return;
+            return; // existing replicas push data to us
         }
 
         logger.info("Starting data transfer to new node {}", newNode.getId());
@@ -261,84 +257,6 @@ public class DataRebalancer {
         return success;
     }
 
-    /**
-     * Request data from other nodes when we join the cluster.
-     * This is called when the local node is the new node.
-     */
-    private void requestDataFromCluster() {
-        logger.info("Requesting data from cluster as new node");
-        
-        // We'll receive data via PUT_INTERNAL from other nodes
-        // Just log that we're ready to receive
-        logger.info("Ready to receive data transfers from existing nodes");
-    }
-
-    /**
-     * Prepare to leave the cluster gracefully.
-     * Transfer all local data to successor nodes.
-     */
-    public CompletableFuture<Void> prepareToLeave() {
-        logger.info("Preparing to leave cluster, transferring data to successors");
-        rebalanceInProgress = true;
-
-        return CompletableFuture.runAsync(() -> {
-            try {
-                Set<String> allKeys = store.keys();
-                logger.info("Transferring {} keys before leaving", allKeys.size());
-
-                for (String key : allKeys) {
-                    try {
-                        // Get successor nodes (excluding ourselves)
-                        List<Node> successors = clusterManager.getNodesForKey(key, replicationFactor + 1);
-                        successors.removeIf(n -> n.equals(clusterManager.getLocalNode()));
-
-                        if (successors.isEmpty()) {
-                            logger.warn("No successors found for key {}", key);
-                            continue;
-                        }
-
-                        // Transfer to first available successor
-                        Optional<KeyValuePair> entry = store.getRaw(key);
-                        if (entry.isPresent()) {
-                            KeyValuePair kv = entry.get();
-                            boolean transferred = false;
-
-                            for (Node successor : successors) {
-                                if (!successor.isAvailable()) {
-                                    continue;
-                                }
-                                try {
-                                    TitanKVClient client = getClient(successor);
-                                    if (kv.isTombstone()) {
-                                        client.deleteInternal(key, kv.getTimestamp(), kv.getExpiresAt());
-                                    } else {
-                                        client.putInternal(key, kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
-                                    }
-                                    transferred = true;
-                                    break;
-                                } catch (IOException e) {
-                                    logger.warn("Failed to transfer key {} to {}: {}", 
-                                        key, successor.getId(), e.getMessage());
-                                }
-                            }
-
-                            if (!transferred) {
-                                logger.error("Failed to transfer key {} to any successor", key);
-                            }
-                        }
-                    } catch (Exception e) {
-                        logger.error("Error transferring key {}: {}", key, e.getMessage());
-                    }
-                }
-
-                logger.info("Data transfer complete, ready to leave cluster");
-
-            } finally {
-                rebalanceInProgress = false;
-            }
-        }, transferPool);
-    }
-
     private TitanKVClient getClient(Node node) {
         return nodeClients.computeIfAbsent(node.getAddress(), addr -> {
             ClientConfig config = ClientConfig.builder()
@@ -349,20 +267,6 @@ public class DataRebalancer {
                 .build();
             return new TitanKVClient(config, addr);
         });
-    }
-
-    private static String readAuthToken() {
-        String value = System.getenv("TITANKV_INTERNAL_TOKEN");
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.internal.token");
-        }
-        if (value == null || value.isEmpty()) {
-            value = System.getenv("TITANKV_CLUSTER_SECRET");
-        }
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.cluster.secret");
-        }
-        return value;
     }
 
     /**

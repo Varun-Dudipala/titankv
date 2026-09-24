@@ -198,24 +198,6 @@ public class ConsistentHash {
     }
 
     /**
-     * Get all keys that would be assigned to a given node.
-     * Useful for data migration when nodes are added/removed.
-     *
-     * @param node the node to check
-     * @param keys the keys to check
-     * @return keys that hash to this node
-     */
-    public Set<String> getKeysForNode(Node node, Set<String> keys) {
-        Set<String> result = new HashSet<>();
-        for (String key : keys) {
-            if (getNode(key).equals(node)) {
-                result.add(key);
-            }
-        }
-        return result;
-    }
-
-    /**
      * Get the number of physical nodes in the ring.
      */
     public int getNodeCount() {
