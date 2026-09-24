@@ -33,7 +33,6 @@ public class MetricsHttpServer {
 
     private static final Logger logger = LoggerFactory.getLogger(MetricsHttpServer.class);
 
-    private static final int DEFAULT_PORT = 9091;
     private static final String CRLF = "\r\n";
 
     private final int port;
@@ -44,13 +43,6 @@ public class MetricsHttpServer {
     private final ExecutorService executor;
     private ServerSocket serverSocket;
     private Thread acceptThread;
-
-    /**
-     * Create a metrics HTTP server.
-     */
-    public MetricsHttpServer(MetricsCollector metrics, ClusterManager clusterManager, InMemoryStore store) {
-        this(getConfiguredPort(), metrics, clusterManager, store);
-    }
 
     /**
      * Create a metrics HTTP server on a specific port.
@@ -66,21 +58,6 @@ public class MetricsHttpServer {
             t.setDaemon(true);
             return t;
         });
-    }
-
-    private static int getConfiguredPort() {
-        String value = System.getenv("TITANKV_METRICS_PORT");
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.metrics.port");
-        }
-        if (value != null && !value.isEmpty()) {
-            try {
-                return Integer.parseInt(value.trim());
-            } catch (NumberFormatException e) {
-                logger.warn("Invalid metrics port {}, using default {}", value, DEFAULT_PORT);
-            }
-        }
-        return DEFAULT_PORT;
     }
 
     /**

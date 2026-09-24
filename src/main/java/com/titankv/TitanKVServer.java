@@ -7,6 +7,7 @@ import com.titankv.consistency.ReplicationManager;
 import com.titankv.core.InMemoryStore;
 import com.titankv.core.KVStore;
 import com.titankv.network.TcpServer;
+import com.titankv.util.Env;
 import com.titankv.util.MetricsCollector;
 import com.titankv.util.MetricsHttpServer;
 import org.slf4j.Logger;
@@ -49,7 +50,7 @@ public class TitanKVServer {
     public TitanKVServer(int port) {
         this.port = port;
         this.seedNodes = null;
-        this.store = new InMemoryStore();
+        this.store = new InMemoryStore(nodeDataDir(port));
         this.metrics = new MetricsCollector();
         this.shutdownLatch = new CountDownLatch(1);
         this.nodeId = generateNodeId(port);
@@ -70,7 +71,7 @@ public class TitanKVServer {
     public TitanKVServer(int port, String nodeId, String seedNodes) {
         this.port = port;
         this.seedNodes = seedNodes;
-        this.store = new InMemoryStore();
+        this.store = new InMemoryStore(nodeDataDir(port));
         this.metrics = new MetricsCollector();
         this.shutdownLatch = new CountDownLatch(1);
 
@@ -107,6 +108,30 @@ public class TitanKVServer {
         this.clusterManager = new ClusterManager(localNode);
         this.replicationManager = new ReplicationManager(clusterManager, store);
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
+    }
+
+    /**
+     * Each node keeps its WAL in its own subdirectory, so several nodes can share a machine
+     * and a base directory (TITANKV_DATA_DIR, default "data").
+     */
+    private static Path nodeDataDir(int port) {
+        String base = Env.get("TITANKV_DATA_DIR", "titankv.data.dir");
+        return Path.of(base != null ? base : "data").resolve("node-" + port);
+    }
+
+    /**
+     * TITANKV_METRICS_PORT if set, otherwise the node's port + 90 (9001 serves metrics on 9091).
+     */
+    private static int metricsPort(int port) {
+        String configured = Env.get("TITANKV_METRICS_PORT", "titankv.metrics.port");
+        if (configured != null) {
+            try {
+                return Integer.parseInt(configured.trim());
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid TITANKV_METRICS_PORT {}, using port + 90", configured);
+            }
+        }
+        return port + 90;
     }
 
     private static String generateNodeId(int port) {
@@ -152,14 +177,13 @@ public class TitanKVServer {
 
         // Initialize and start metrics HTTP server
         if (store instanceof InMemoryStore) {
-            metricsHttpServer = new MetricsHttpServer(metrics, clusterManager, (InMemoryStore) store);
+            metricsHttpServer = new MetricsHttpServer(metricsPort(port), metrics, clusterManager, (InMemoryStore) store);
             try {
                 metricsHttpServer.start();
                 logger.info("Metrics HTTP server started on port {}", metricsHttpServer.getPort());
             } catch (IOException e) {
                 logger.warn("Failed to start metrics HTTP server: {}", e.getMessage());
             }
-
 
             // Initialize data rebalancer
             dataRebalancer = new DataRebalancer(clusterManager, (InMemoryStore) store, 
