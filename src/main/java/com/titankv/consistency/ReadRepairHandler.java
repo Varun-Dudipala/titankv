@@ -4,12 +4,14 @@ import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.util.Env;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Function;
 
 /**
  * Handles read repair to fix stale data across replicas.
@@ -22,15 +24,26 @@ public class ReadRepairHandler {
     private final ClusterManager clusterManager;
     private final int replicationFactor;
     private final ExecutorService executor;
-    private final Map<String, TitanKVClient> nodeClients;
+    private final Map<String, TitanKVClient> ownedClients;
+    private final Function<Node, TitanKVClient> clientProvider;
 
     /**
-     * Create a read repair handler.
+     * Create a read repair handler that opens its own authenticated node connections.
      *
      * @param clusterManager    the cluster manager
      * @param replicationFactor the replication factor
      */
     public ReadRepairHandler(ClusterManager clusterManager, int replicationFactor) {
+        this(clusterManager, replicationFactor, null);
+    }
+
+    /**
+     * Create a read repair handler that reuses the caller's node connections.
+     *
+     * @param clientProvider supplies an authenticated client per node, or null to create our own
+     */
+    public ReadRepairHandler(ClusterManager clusterManager, int replicationFactor,
+            Function<Node, TitanKVClient> clientProvider) {
         this.clusterManager = clusterManager;
         this.replicationFactor = replicationFactor;
         this.executor = Executors.newFixedThreadPool(4, r -> {
@@ -38,7 +51,8 @@ public class ReadRepairHandler {
             t.setDaemon(true);
             return t;
         });
-        this.nodeClients = new ConcurrentHashMap<>();
+        this.ownedClients = new ConcurrentHashMap<>();
+        this.clientProvider = clientProvider != null ? clientProvider : this::createOwnedClient;
     }
 
     /**
@@ -283,11 +297,16 @@ public class ReadRepairHandler {
     }
 
     private TitanKVClient getClient(Node node) {
-        return nodeClients.computeIfAbsent(node.getAddress(), addr -> {
+        return clientProvider.apply(node);
+    }
+
+    private TitanKVClient createOwnedClient(Node node) {
+        return ownedClients.computeIfAbsent(node.getAddress(), addr -> {
             ClientConfig config = ClientConfig.builder()
                 .connectTimeoutMs(5000)
                 .readTimeoutMs(5000)
                 .retryOnFailure(false)
+                .authToken(Env.internalToken())
                 .build();
             return new TitanKVClient(config, addr);
         });
@@ -307,10 +326,10 @@ public class ReadRepairHandler {
             Thread.currentThread().interrupt();
         }
 
-        for (TitanKVClient client : nodeClients.values()) {
+        for (TitanKVClient client : ownedClients.values()) {
             client.close();
         }
-        nodeClients.clear();
+        ownedClients.clear();
     }
 
     /**
