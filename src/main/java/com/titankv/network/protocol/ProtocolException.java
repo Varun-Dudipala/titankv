@@ -5,6 +5,8 @@ package com.titankv.network.protocol;
  */
 public class ProtocolException extends RuntimeException {
 
+    private static final long serialVersionUID = 1L;
+
     public ProtocolException(String message) {
         super(message);
     }
