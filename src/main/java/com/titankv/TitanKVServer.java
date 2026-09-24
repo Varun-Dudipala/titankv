@@ -58,7 +58,7 @@ public class TitanKVServer {
 
         Node localNode = new Node(this.nodeId, "localhost", port);
         this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager);
+        this.replicationManager = new ReplicationManager(clusterManager, store);
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
@@ -86,7 +86,7 @@ public class TitanKVServer {
         // Create the local node and cluster manager
         Node localNode = new Node(this.nodeId, getHostFromId(this.nodeId), port);
         this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager);
+        this.replicationManager = new ReplicationManager(clusterManager, store);
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
@@ -107,7 +107,7 @@ public class TitanKVServer {
 
         Node localNode = new Node(this.nodeId, "localhost", port);
         this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager);
+        this.replicationManager = new ReplicationManager(clusterManager, store);
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
