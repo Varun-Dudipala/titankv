@@ -3,309 +3,227 @@ package com.titankv.benchmark;
 import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 
+import java.util.Arrays;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Multi-threaded load generator for benchmarking TitanKV.
+ * Closed-loop load generator: each thread issues one request at a time with its own client.
+ *
+ * Every thread first writes its whole key space, so reads hit existing keys, then runs an
+ * unmeasured warmup (JIT, connection pools) before the measured run. Latency is recorded per
+ * operation and reported as percentiles.
  */
 public class LoadGenerator {
 
     private final String[] hosts;
+    private final int threads;
     private final int opsPerThread;
-    private final int numThreads;
+    private final int warmupOpsPerThread;
     private final double readRatio;
     private final int valueSize;
+    private final int keysPerThread;
 
-    // Metrics
-    private final LongAdder totalOps = new LongAdder();
-    private final LongAdder readOps = new LongAdder();
-    private final LongAdder writeOps = new LongAdder();
-    private final LongAdder totalLatencyNanos = new LongAdder();
+    private final LongAdder reads = new LongAdder();
+    private final LongAdder readMisses = new LongAdder();
+    private final LongAdder writes = new LongAdder();
     private final LongAdder errors = new LongAdder();
 
-    /**
-     * Create a load generator.
-     *
-     * @param hosts        cluster hosts in host:port format
-     * @param threads      number of concurrent threads
-     * @param opsPerThread operations per thread
-     * @param readRatio    ratio of reads (0.0 to 1.0)
-     */
-    public LoadGenerator(String[] hosts, int threads, int opsPerThread, double readRatio) {
-        this(hosts, threads, opsPerThread, readRatio, 100);
-    }
-
-    /**
-     * Create a load generator with custom value size.
-     *
-     * @param hosts        cluster hosts
-     * @param threads      number of concurrent threads
-     * @param opsPerThread operations per thread
-     * @param readRatio    ratio of reads (0.0 to 1.0)
-     * @param valueSize    size of values in bytes
-     */
-    public LoadGenerator(String[] hosts, int threads, int opsPerThread, double readRatio, int valueSize) {
+    public LoadGenerator(String[] hosts, int threads, int opsPerThread, int warmupOpsPerThread,
+            double readRatio, int valueSize, int keysPerThread) {
         this.hosts = hosts;
-        this.numThreads = threads;
+        this.threads = threads;
         this.opsPerThread = opsPerThread;
+        this.warmupOpsPerThread = warmupOpsPerThread;
         this.readRatio = readRatio;
         this.valueSize = valueSize;
+        this.keysPerThread = keysPerThread;
     }
 
-    /**
-     * Run the benchmark.
-     *
-     * @return benchmark results
-     * @throws InterruptedException if interrupted
-     */
-    public BenchmarkResult run() throws InterruptedException {
-        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch endLatch = new CountDownLatch(numThreads);
+    public Result run() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CyclicBarrier start = new CyclicBarrier(threads + 1);
+        CyclicBarrier measured = new CyclicBarrier(threads + 1);
+        long[][] latencies = new long[threads][];
+        Future<?>[] futures = new Future<?>[threads];
 
-        // Pre-populate some data for reads
-        System.out.println("Pre-populating data...");
-        try (TitanKVClient client = createClient()) {
-            for (int i = 0; i < 1000; i++) {
-                client.put("preload:" + i, generateValue());
-            }
-        } catch (Exception e) {
-            System.err.println("Pre-population failed: " + e.getMessage());
-        }
-
-        // Reset counters
-        totalOps.reset();
-        readOps.reset();
-        writeOps.reset();
-        totalLatencyNanos.reset();
-        errors.reset();
-
-        System.out.println("Starting benchmark with " + numThreads + " threads...");
-
-        // Submit worker tasks
-        for (int t = 0; t < numThreads; t++) {
-            final int threadId = t;
-            executor.submit(() -> {
-                try {
-                    startLatch.await(); // Wait for signal to start
-                    runWorker(threadId);
-                } catch (Exception e) {
-                    errors.increment();
-                } finally {
-                    endLatch.countDown();
+        for (int t = 0; t < threads; t++) {
+            int thread = t;
+            futures[t] = pool.submit(() -> {
+                try (TitanKVClient client = createClient()) {
+                    for (int k = 0; k < keysPerThread; k++) {
+                        client.put(key(thread, k), randomValue());
+                    }
+                    start.await();
+                    runOps(client, thread, warmupOpsPerThread, null);
+                    measured.await();
+                    long[] samples = new long[opsPerThread];
+                    runOps(client, thread, opsPerThread, samples);
+                    latencies[thread] = samples;
                 }
+                return null;
             });
         }
 
-        // Start timing
-        long startTime = System.nanoTime();
-        startLatch.countDown(); // Signal all threads to start
+        System.out.println("Preloading " + threads * keysPerThread + " keys...");
+        start.await();
+        System.out.println("Warming up (" + threads * warmupOpsPerThread + " ops)...");
+        measured.await();
+        long startNanos = System.nanoTime();
+        for (Future<?> future : futures) {
+            future.get();
+        }
+        long elapsed = System.nanoTime() - startNanos;
+        pool.shutdown();
 
-        // Wait for completion
-        endLatch.await();
-        long endTime = System.nanoTime();
-
-        executor.shutdown();
-
-        return new BenchmarkResult(
-            totalOps.sum(),
-            readOps.sum(),
-            writeOps.sum(),
-            errors.sum(),
-            endTime - startTime,
-            totalLatencyNanos.sum()
-        );
+        long[] all = Arrays.stream(latencies).flatMapToLong(Arrays::stream).filter(v -> v > 0).sorted().toArray();
+        return new Result(reads.sum(), readMisses.sum(), writes.sum(), errors.sum(), elapsed, all);
     }
 
-    private void runWorker(int threadId) {
-        TitanKVClient client = createClient();
+    private void runOps(TitanKVClient client, int thread, int count, long[] samples) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
-
-        try {
-            for (int i = 0; i < opsPerThread; i++) {
-                String key = "key:" + threadId + ":" + (i % 1000);
-                byte[] value = generateValue();
-
-                long opStart = System.nanoTime();
-
-                try {
-                    if (random.nextDouble() < readRatio) {
-                        // Read operation
-                        client.get(key);
-                        readOps.increment();
-                    } else {
-                        // Write operation
-                        client.put(key, value);
-                        writeOps.increment();
+        for (int i = 0; i < count; i++) {
+            String key = key(thread, random.nextInt(keysPerThread));
+            boolean read = random.nextDouble() < readRatio;
+            long begin = System.nanoTime();
+            boolean measured = samples != null;
+            try {
+                if (read) {
+                    boolean miss = client.get(key).isEmpty();
+                    if (measured) {
+                        reads.increment();
+                        if (miss) {
+                            readMisses.increment();
+                        }
                     }
-
-                    long latency = System.nanoTime() - opStart;
-                    totalLatencyNanos.add(latency);
-                    totalOps.increment();
-
-                } catch (Exception e) {
+                } else {
+                    client.put(key, randomValue());
+                    if (measured) {
+                        writes.increment();
+                    }
+                }
+                if (measured) {
+                    samples[i] = System.nanoTime() - begin;
+                }
+            } catch (Exception e) {
+                if (measured) {
                     errors.increment();
                 }
             }
-        } finally {
-            client.close();
         }
     }
 
-    private TitanKVClient createClient() {
-        ClientConfig config = ClientConfig.builder()
-            .connectTimeoutMs(5000)
-            .readTimeoutMs(10000)
-            .maxConnectionsPerHost(5)
-            .retryOnFailure(false)
-            .build();
-        return new TitanKVClient(config, hosts);
+    private static String key(int thread, int index) {
+        return "bench:" + thread + ":" + index;
     }
 
-    private byte[] generateValue() {
+    private byte[] randomValue() {
         byte[] value = new byte[valueSize];
         ThreadLocalRandom.current().nextBytes(value);
         return value;
     }
 
-    /**
-     * Benchmark result class.
-     */
-    public static class BenchmarkResult {
-        public final long totalOps;
-        public final long readOps;
-        public final long writeOps;
-        public final long errors;
-        public final long durationNanos;
-        public final long totalLatencyNanos;
+    private TitanKVClient createClient() {
+        return new TitanKVClient(ClientConfig.builder()
+                .connectTimeoutMs(5000)
+                .readTimeoutMs(10000)
+                .maxConnectionsPerHost(2)
+                .retryOnFailure(false)
+                .build(), hosts);
+    }
 
-        public BenchmarkResult(long totalOps, long readOps, long writeOps,
-                               long errors, long durationNanos, long totalLatencyNanos) {
-            this.totalOps = totalOps;
-            this.readOps = readOps;
-            this.writeOps = writeOps;
+    public static final class Result {
+        final long reads;
+        final long readMisses;
+        final long writes;
+        final long errors;
+        final long elapsedNanos;
+        final long[] sortedLatencies;
+
+        Result(long reads, long readMisses, long writes, long errors, long elapsedNanos, long[] sortedLatencies) {
+            this.reads = reads;
+            this.readMisses = readMisses;
+            this.writes = writes;
             this.errors = errors;
-            this.durationNanos = durationNanos;
-            this.totalLatencyNanos = totalLatencyNanos;
+            this.elapsedNanos = elapsedNanos;
+            this.sortedLatencies = sortedLatencies;
         }
 
-        public double getOpsPerSecond() {
-            return totalOps / (durationNanos / 1_000_000_000.0);
+        double seconds() {
+            return elapsedNanos / 1e9;
         }
 
-        public double getReadOpsPerSecond() {
-            return readOps / (durationNanos / 1_000_000_000.0);
+        double percentileMs(double p) {
+            if (sortedLatencies.length == 0) {
+                return 0;
+            }
+            int index = (int) Math.min(sortedLatencies.length - 1, Math.ceil(p * sortedLatencies.length) - 1);
+            return sortedLatencies[Math.max(0, index)] / 1e6;
         }
 
-        public double getWriteOpsPerSecond() {
-            return writeOps / (durationNanos / 1_000_000_000.0);
-        }
-
-        public double getAvgLatencyMs() {
-            return totalOps > 0 ? (totalLatencyNanos / (double) totalOps) / 1_000_000.0 : 0;
-        }
-
-        public double getDurationSeconds() {
-            return durationNanos / 1_000_000_000.0;
-        }
-
-        public void print() {
+        void print() {
+            long ops = reads + writes;
             System.out.println();
-            System.out.println("════════════════════════════════════════════════════════════");
-            System.out.println("              TitanKV Benchmark Results                      ");
-            System.out.println("════════════════════════════════════════════════════════════");
-            System.out.printf("Total Operations:    %,d%n", totalOps);
-            System.out.printf("  - Reads:           %,d%n", readOps);
-            System.out.printf("  - Writes:          %,d%n", writeOps);
-            System.out.printf("Errors:              %,d%n", errors);
-            System.out.println("────────────────────────────────────────────────────────────");
-            System.out.printf("Duration:            %.2f seconds%n", getDurationSeconds());
-            System.out.printf("Total Throughput:    %,.0f ops/sec%n", getOpsPerSecond());
-            System.out.printf("  - Read Throughput: %,.0f ops/sec%n", getReadOpsPerSecond());
-            System.out.printf("  - Write Throughput:%,.0f ops/sec%n", getWriteOpsPerSecond());
-            System.out.printf("Avg Latency:         %.3f ms%n", getAvgLatencyMs());
-            System.out.println("════════════════════════════════════════════════════════════");
-            System.out.println();
+            System.out.println("Results");
+            System.out.println("-------------------------------------------");
+            System.out.printf("Operations:        %,d (%,d reads, %,d writes)%n", ops, reads, writes);
+            System.out.printf("Errors:            %,d%n", errors);
+            System.out.printf("Read misses:       %,d (should be 0: every key is preloaded)%n", readMisses);
+            System.out.printf("Duration:          %.2f s%n", seconds());
+            System.out.printf("Throughput:        %,.0f ops/sec (%,.0f reads/sec, %,.0f writes/sec)%n",
+                    ops / seconds(), reads / seconds(), writes / seconds());
+            System.out.printf("Latency p50/p95/p99/max: %.3f / %.3f / %.3f / %.3f ms%n",
+                    percentileMs(0.50), percentileMs(0.95), percentileMs(0.99), percentileMs(1.0));
         }
     }
 
-    /**
-     * Main entry point.
-     */
     public static void main(String[] args) throws Exception {
-        // Default configuration
-        String[] cluster = {"localhost:9001"};
-        int threads = 50;
-        int opsPerThread = 1000;
+        String[] hosts = {"localhost:9001"};
+        int threads = 16;
+        int ops = 20_000;
+        int warmup = 2_000;
         double readRatio = 0.8;
         int valueSize = 100;
+        int keys = 1_000;
 
-        // Parse arguments
         for (int i = 0; i < args.length; i++) {
-            switch (args[i]) {
-                case "--hosts":
-                case "-h":
-                    if (i + 1 < args.length) {
-                        cluster = args[++i].split(",");
-                    }
-                    break;
-                case "--threads":
-                case "-t":
-                    if (i + 1 < args.length) {
-                        threads = Integer.parseInt(args[++i]);
-                    }
-                    break;
-                case "--ops":
-                case "-o":
-                    if (i + 1 < args.length) {
-                        opsPerThread = Integer.parseInt(args[++i]);
-                    }
-                    break;
-                case "--read-ratio":
-                case "-r":
-                    if (i + 1 < args.length) {
-                        readRatio = Double.parseDouble(args[++i]);
-                    }
-                    break;
-                case "--value-size":
-                case "-v":
-                    if (i + 1 < args.length) {
-                        valueSize = Integer.parseInt(args[++i]);
-                    }
-                    break;
-                case "--help":
-                    printUsage();
-                    return;
+            String arg = args[i];
+            if (arg.equals("--help")) {
+                printUsage();
+                return;
+            }
+            if (i + 1 >= args.length) {
+                throw new IllegalArgumentException("Missing value for " + arg);
+            }
+            String value = args[++i];
+            switch (arg) {
+                case "--hosts": hosts = value.split(","); break;
+                case "--threads": threads = Integer.parseInt(value); break;
+                case "--ops": ops = Integer.parseInt(value); break;
+                case "--warmup": warmup = Integer.parseInt(value); break;
+                case "--read-ratio": readRatio = Double.parseDouble(value); break;
+                case "--value-size": valueSize = Integer.parseInt(value); break;
+                case "--keys": keys = Integer.parseInt(value); break;
+                default: throw new IllegalArgumentException("Unknown option " + arg);
             }
         }
 
         System.out.println("TitanKV Load Generator");
-        System.out.println("─────────────────────────────────────");
-        System.out.println("Hosts:          " + String.join(", ", cluster));
-        System.out.println("Threads:        " + threads);
-        System.out.println("Ops/Thread:     " + opsPerThread);
-        System.out.println("Total Ops:      " + (threads * opsPerThread));
-        System.out.println("Read Ratio:     " + (readRatio * 100) + "%");
-        System.out.println("Value Size:     " + valueSize + " bytes");
-        System.out.println("─────────────────────────────────────");
+        System.out.println("-------------------------------------------");
+        System.out.println("Hosts:            " + String.join(", ", hosts));
+        System.out.println("Threads:          " + threads);
+        System.out.println("Ops per thread:   " + ops + " (after " + warmup + " warmup)");
+        System.out.println("Read ratio:       " + readRatio);
+        System.out.println("Value size:       " + valueSize + " bytes");
+        System.out.println("Keys per thread:  " + keys);
+        System.out.println("CPUs:             " + Runtime.getRuntime().availableProcessors());
+        System.out.println("-------------------------------------------");
 
-        LoadGenerator generator = new LoadGenerator(cluster, threads, opsPerThread, readRatio, valueSize);
-        BenchmarkResult result = generator.run();
-        result.print();
+        new LoadGenerator(hosts, threads, ops, warmup, readRatio, valueSize, keys).run().print();
     }
 
     private static void printUsage() {
-        System.out.println("TitanKV Load Generator");
-        System.out.println();
-        System.out.println("Usage: LoadGenerator [options]");
-        System.out.println();
-        System.out.println("Options:");
-        System.out.println("  -h, --hosts <hosts>       Comma-separated host:port list (default: localhost:9001)");
-        System.out.println("  -t, --threads <n>         Number of concurrent threads (default: 50)");
-        System.out.println("  -o, --ops <n>             Operations per thread (default: 1000)");
-        System.out.println("  -r, --read-ratio <ratio>  Read ratio 0.0-1.0 (default: 0.8)");
-        System.out.println("  -v, --value-size <bytes>  Value size in bytes (default: 100)");
-        System.out.println("      --help                Show this help");
+        System.out.println("Usage: LoadGenerator [--hosts h1:p1,h2:p2] [--threads 16] [--ops 20000] [--warmup 2000]");
+        System.out.println("                     [--read-ratio 0.8] [--value-size 100] [--keys 1000]");
     }
 }
