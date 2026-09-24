@@ -39,6 +39,9 @@ import java.util.zip.CRC32;
  *  - Mutations hold the read side of {@code mutationLock}; a snapshot holds the write side. So
  *    when the WAL is truncated, every record in it has already been applied to the map and is
  *    therefore captured by the snapshot.
+ *  - Group commit: writers append under {@code walLock} but fsync outside it. A writer waits
+ *    until the WAL is durable up to its own record; one fsync covers every record appended
+ *    before it started, so concurrent writers share fsyncs instead of queueing for one each.
  */
 public class InMemoryStore implements KVStore {
 
@@ -66,6 +69,11 @@ public class InMemoryStore implements KVStore {
     private final Path walPath;
     private final Path snapshotPath;
     private final Object walLock = new Object();
+    private final Object syncLock = new Object();
+    // Bytes ever appended / known durable, never reset by snapshots. Used for group commit.
+    private long appendedTotal;
+    private volatile long durableTotal;
+    private final ThreadLocal<long[]> lastAppendEnd = ThreadLocal.withInitial(() -> new long[1]);
     private final ReentrantReadWriteLock mutationLock = new ReentrantReadWriteLock();
     private FileChannel walChannel;
     private long walBytes;
@@ -295,6 +303,7 @@ public class InMemoryStore implements KVStore {
         mutationLock.readLock().lock();
         try {
             result = mutation.get();
+            awaitDurable();
         } finally {
             mutationLock.readLock().unlock();
         }
@@ -308,13 +317,39 @@ public class InMemoryStore implements KVStore {
         }
         synchronized (walLock) {
             try {
-                walBytes += writeRecord(walChannel, op, key, value, timestamp, expiresAt);
-                if (walFsync) {
-                    walChannel.force(false);
-                }
+                int written = writeRecord(walChannel, op, key, value, timestamp, expiresAt);
+                walBytes += written;
+                appendedTotal += written;
+                lastAppendEnd.get()[0] = appendedTotal;
             } catch (IOException e) {
                 throw new IllegalStateException("WAL write failed", e);
             }
+        }
+    }
+
+    /**
+     * Block until this thread's last WAL record is on disk. Whichever waiting writer gets the sync
+     * lock fsyncs everything appended so far, so writers that arrive meanwhile are covered too.
+     */
+    private void awaitDurable() {
+        long target = lastAppendEnd.get()[0];
+        if (!walFsync || target <= durableTotal) {
+            return;
+        }
+        synchronized (syncLock) {
+            if (target <= durableTotal) {
+                return;
+            }
+            long upTo;
+            synchronized (walLock) {
+                upTo = appendedTotal;
+            }
+            try {
+                walChannel.force(false);
+            } catch (IOException e) {
+                throw new IllegalStateException("WAL fsync failed", e);
+            }
+            durableTotal = upTo;
         }
     }
 
@@ -362,6 +397,7 @@ public class InMemoryStore implements KVStore {
             walChannel.truncate(0);
             walChannel.force(true);
             walBytes = 0;
+            durableTotal = appendedTotal; // everything appended so far is in the fsynced snapshot
             logger.info("Snapshot of {} keys written to {}", store.size(), snapshotPath.toAbsolutePath());
         } catch (IOException e) {
             throw new IllegalStateException("Failed to install snapshot", e);
@@ -524,6 +560,7 @@ public class InMemoryStore implements KVStore {
         }
         try {
             appendToWal(WAL_OP_CLEAR, "", null, 0, 0);
+            awaitDurable();
             store.clear();
             currentMemoryBytes.set(0);
         } finally {
