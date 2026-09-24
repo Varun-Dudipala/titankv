@@ -4,6 +4,7 @@ import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.util.Env;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -108,8 +109,8 @@ public class ReplicationManager {
             return t;
         });
         this.nodeClients = new ConcurrentHashMap<>();
-        this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor);
-        this.internalAuthToken = readInternalToken();
+        this.internalAuthToken = Env.internalToken();
+        this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this::getClient);
     }
 
     /**
@@ -296,20 +297,6 @@ public class ReplicationManager {
                     .build();
             return new TitanKVClient(config, addr);
         });
-    }
-
-    private static String readInternalToken() {
-        String value = System.getenv("TITANKV_INTERNAL_TOKEN");
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.internal.token");
-        }
-        if (value == null || value.isEmpty()) {
-            value = System.getenv("TITANKV_CLUSTER_SECRET");
-        }
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.cluster.secret");
-        }
-        return (value != null && !value.isEmpty()) ? value : null;
     }
 
     private <T> void scheduleTimeout(CompletableFuture<T> future, ConsistencyLevel level, int required) {

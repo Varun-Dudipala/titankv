@@ -8,6 +8,7 @@ import com.titankv.network.protocol.BinaryProtocol;
 import com.titankv.network.protocol.Command;
 import com.titankv.network.protocol.ProtocolException;
 import com.titankv.network.protocol.Response;
+import com.titankv.util.Env;
 import com.titankv.util.MetricsCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,16 +69,19 @@ public class ConnectionHandler {
     private final Object interestOpsLock = new Object();
 
     private static final ConcurrentMap<String, String> HOST_IP_CACHE = new ConcurrentHashMap<>();
-    private static final String CLIENT_AUTH_TOKEN = readToken("TITANKV_CLIENT_TOKEN", "titankv.client.token");
-    private static final String INTERNAL_AUTH_TOKEN = readInternalToken();
-    private static final boolean CLIENT_AUTH_REQUIRED = CLIENT_AUTH_TOKEN != null && !CLIENT_AUTH_TOKEN.isEmpty();
-    private static final boolean INTERNAL_AUTH_REQUIRED = INTERNAL_AUTH_TOKEN != null && !INTERNAL_AUTH_TOKEN.isEmpty();
     private static final java.util.concurrent.atomic.AtomicLong LAST_TIMESTAMP = new java.util.concurrent.atomic.AtomicLong();
-    private static final ConsistencyLevel READ_CONSISTENCY = readConsistencyLevel(
+
+    // Read per connection (not statically) so servers started with different settings
+    // in the same JVM, e.g. in tests, each get their own configuration.
+    private final String clientAuthToken = Env.clientToken();
+    private final String internalAuthToken = Env.internalToken();
+    private final boolean clientAuthRequired = clientAuthToken != null;
+    private final boolean internalAuthRequired = internalAuthToken != null;
+    private final ConsistencyLevel readConsistency = readConsistencyLevel(
             "TITANKV_READ_CONSISTENCY", "titankv.read.consistency", ConsistencyLevel.QUORUM);
-    private static final ConsistencyLevel WRITE_CONSISTENCY = readConsistencyLevel(
+    private final ConsistencyLevel writeConsistency = readConsistencyLevel(
             "TITANKV_WRITE_CONSISTENCY", "titankv.write.consistency", ConsistencyLevel.QUORUM);
-    private static final ConsistencyLevel DELETE_CONSISTENCY = readConsistencyLevel(
+    private final ConsistencyLevel deleteConsistency = readConsistencyLevel(
             "TITANKV_DELETE_CONSISTENCY", "titankv.delete.consistency", ConsistencyLevel.QUORUM);
 
     private boolean clientAuthenticated = false;
@@ -193,24 +197,8 @@ public class ConnectionHandler {
         });
     }
 
-    private static String readToken(String envKey, String propKey) {
-        String value = System.getenv(envKey);
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty(propKey);
-        }
-        return value != null && !value.isEmpty() ? value : null;
-    }
-
-    private static String readInternalToken() {
-        String value = readToken("TITANKV_INTERNAL_TOKEN", "titankv.internal.token");
-        if (value == null) {
-            value = readToken("TITANKV_CLUSTER_SECRET", "titankv.cluster.secret");
-        }
-        return value;
-    }
-
     private static ConsistencyLevel readConsistencyLevel(String envKey, String propKey, ConsistencyLevel fallback) {
-        String value = readToken(envKey, propKey);
+        String value = Env.get(envKey, propKey);
         if (value == null) {
             return fallback;
         }
@@ -234,7 +222,7 @@ public class ConnectionHandler {
             return null;
         }
         if (isInternalCommand(type)) {
-            if (INTERNAL_AUTH_REQUIRED && !internalAuthenticated) {
+            if (internalAuthRequired && !internalAuthenticated) {
                 return Response.error("AUTH required for internal commands");
             }
             if (!isAuthorizedForInternalCommands()) {
@@ -242,7 +230,7 @@ public class ConnectionHandler {
             }
             return null;
         }
-        if (CLIENT_AUTH_REQUIRED && !clientAuthenticated) {
+        if (clientAuthRequired && !clientAuthenticated) {
             return Response.error("AUTH required");
         }
         return null;
@@ -259,8 +247,14 @@ public class ConnectionHandler {
         }
     }
 
+    private static boolean tokenMatches(String provided, String expected) {
+        return java.security.MessageDigest.isEqual(
+                provided.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                expected.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
     private Response handleAuth(Command command) {
-        if (!CLIENT_AUTH_REQUIRED && !INTERNAL_AUTH_REQUIRED) {
+        if (!clientAuthRequired && !internalAuthRequired) {
             return Response.ok();
         }
         byte[] tokenBytes = command.getValueUnsafe();
@@ -269,11 +263,11 @@ public class ConnectionHandler {
         }
         String token = new String(tokenBytes, java.nio.charset.StandardCharsets.UTF_8);
         boolean matched = false;
-        if (CLIENT_AUTH_REQUIRED && token.equals(CLIENT_AUTH_TOKEN)) {
+        if (clientAuthRequired && tokenMatches(token, clientAuthToken)) {
             clientAuthenticated = true;
             matched = true;
         }
-        if (INTERNAL_AUTH_REQUIRED && token.equals(INTERNAL_AUTH_TOKEN)) {
+        if (internalAuthRequired && tokenMatches(token, internalAuthToken)) {
             internalAuthenticated = true;
             matched = true;
         }
@@ -547,7 +541,7 @@ public class ConnectionHandler {
         if (replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1) {
             try {
                 Optional<com.titankv.consistency.ReplicationManager.ReadResult> result = replicationManager
-                        .read(command.getKey(), READ_CONSISTENCY)
+                        .read(command.getKey(), readConsistency)
                         .get(5, java.util.concurrent.TimeUnit.SECONDS);
                 if (result.isPresent()) {
                     com.titankv.consistency.ReplicationManager.ReadResult readResult = result.get();
@@ -623,7 +617,7 @@ public class ConnectionHandler {
         if (replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1) {
             try {
                 replicationManager
-                        .write(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt, WRITE_CONSISTENCY)
+                        .write(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt, writeConsistency)
                         .get(5, java.util.concurrent.TimeUnit.SECONDS);
                 return Response.ok();
             } catch (java.util.concurrent.TimeoutException e) {
@@ -708,7 +702,7 @@ public class ConnectionHandler {
         if (replicationManager != null && clusterManager != null && clusterManager.getAliveNodeCount() > 1) {
             try {
                 replicationManager
-                        .delete(command.getKey(), timestamp, expiresAt, DELETE_CONSISTENCY)
+                        .delete(command.getKey(), timestamp, expiresAt, deleteConsistency)
                         .get(5, java.util.concurrent.TimeUnit.SECONDS);
                 return Response.ok();
             } catch (java.util.concurrent.TimeoutException e) {
