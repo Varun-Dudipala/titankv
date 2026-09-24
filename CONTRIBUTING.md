@@ -31,9 +31,9 @@ Feature requests are welcome! Please open an issue with:
 2. **Make your changes** following our code style guidelines
 
 3. **Test your changes**
-   - Run unit tests: `mvn test`
+   - Run unit and integration tests: `mvn verify`
    - Test with a local cluster
-   - Verify no compilation warnings
+   - Keep the build free of compiler warnings (it compiles with `-Xlint:all`)
    - Test edge cases (network failures, node crashes)
 
 4. **Commit your changes** with clear, descriptive messages
@@ -62,11 +62,12 @@ cd titankv
 # Build the project
 mvn clean package
 
-# Run tests
-mvn test
+# Run unit tests, then integration tests that start real clusters
+mvn verify
 
-# Start a local cluster
+# Start and stop a local 3-node cluster
 ./scripts/start-cluster.sh
+./scripts/stop-cluster.sh
 ```
 
 ## Code Style Guidelines
@@ -102,8 +103,11 @@ mvn test
 
 ### Unit Tests
 ```bash
-# Run all tests
+# Run unit tests
 mvn test
+
+# Run unit and integration tests (integration tests are tagged "integration")
+mvn verify
 
 # Run specific test
 mvn test -Dtest=ConsistentHashTest
@@ -118,8 +122,9 @@ Test your changes with a real cluster:
 # Start 3-node cluster
 ./scripts/start-cluster.sh
 
-# In another terminal, run benchmark
+# Run the benchmark against it, then stop it
 ./scripts/run-benchmark.sh --hosts localhost:9001,localhost:9002,localhost:9003
+./scripts/stop-cluster.sh
 ```
 
 ### Performance Testing
