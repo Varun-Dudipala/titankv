@@ -113,6 +113,9 @@
                         <titankv.dev.mode>true</titankv.dev.mode>
                     </systemPropertyVariables>
                     <groups>integration</groups>
+                    <includes>
+                        <include>**/*Test.java</include>
+                    </includes>
                 </configuration>
                 <executions>
                     <execution>
