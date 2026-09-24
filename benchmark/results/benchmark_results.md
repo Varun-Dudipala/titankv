@@ -1,90 +1,81 @@
 # TitanKV Benchmark Results
 
-## Test Environment
+## Environment
 
-- **Hardware**: Apple MacBook Air (M-series)
-- **OS**: macOS Darwin 24.6.0
-- **Java**: 24
-- **Date**: 2026-01-10
+- 4 vCPU Linux VM (cloud), OpenJDK 21.0.10
+- All nodes **and** the load generator run on the same machine and share its 4 CPUs, over loopback.
+  A real deployment gives each node its own machine, so these numbers are a floor for CPU-bound
+  workloads, while network latency is not included.
+- fsync on this VM is fast (sub-millisecond); on spinning disks or slower SSDs durable-write
+  throughput will be lower.
+- Date: 2026-09-24
 
-## Single Node Benchmarks
+## Method
 
-### Test Configuration 1: Moderate Load (20 threads)
+`./scripts/run-benchmark.sh` runs `benchmark/LoadGenerator.java`:
 
-| Parameter | Value |
-|-----------|-------|
-| Threads | 20 |
-| Operations/Thread | 2,000 |
-| Total Operations | 40,000 |
-| Read Ratio | 80% |
-| Value Size | 100 bytes |
-| Server Config | Single node on localhost:9001 |
+- Closed loop: each client thread has its own `TitanKVClient` and issues one request at a time.
+- Each thread first writes its 1,000-key space, so every read hits an existing key (read misses are
+  reported; all runs below had 0), then runs an unmeasured warmup of 2,000 ops.
+- Latency is recorded per operation; percentiles come from all measured operations.
+- 100-byte random values. Reads and writes use QUORUM on the cluster (replication factor 3).
 
-**Results:**
+Reproduce:
 
-| Metric | Value |
-|--------|-------|
-| **Total Throughput** | **113,731 ops/sec** |
-| Read Throughput | 91,204 ops/sec |
-| Write Throughput | 22,527 ops/sec |
-| Average Latency | 0.169 ms |
-| Errors | 0 |
-| Duration | 0.35 seconds |
+```bash
+mvn package -DskipTests
+NODES=1 ./scripts/start-cluster.sh
+./scripts/run-benchmark.sh --hosts localhost:9001 --threads 16 --ops 12000
+./scripts/stop-cluster.sh
 
-### Test Configuration 2: High Load (50 threads)
-
-| Parameter | Value |
-|-----------|-------|
-| Threads | 50 |
-| Operations/Thread | 5,000 |
-| Total Operations | 250,000 |
-| Read Ratio | 80% |
-| Value Size | 100 bytes |
-| Server Config | Single node on localhost:9001 |
-
-**Results:**
-
-| Metric | Value |
-|--------|-------|
-| **Total Throughput** | **219,014 ops/sec** |
-| Read Throughput | 175,089 ops/sec |
-| Write Throughput | 43,925 ops/sec |
-| Average Latency | 0.220 ms |
-| Errors | 0 |
-| Duration | 1.14 seconds |
-
-## Performance Summary
-
-```
-                TitanKV Performance Summary
-    ╔══════════════════════════════════════════════════╗
-    ║  Peak Throughput:     219,014 ops/sec            ║
-    ║  Peak Write Rate:      43,925 ops/sec            ║
-    ║  Peak Read Rate:      175,089 ops/sec            ║
-    ║  Average Latency:       0.220 ms                 ║
-    ║  Error Rate:              0%                     ║
-    ╚══════════════════════════════════════════════════╝
+./scripts/start-cluster.sh                                   # 3 nodes, dev mode
+TITANKV_CLUSTER_SECRET=secret ./scripts/start-cluster.sh     # 3 nodes, production mode
+./scripts/run-benchmark.sh --hosts localhost:9001,localhost:9002,localhost:9003 --threads 16 --ops 6000
 ```
 
-## Comparison with Design Targets
+## Results
 
-| Metric | Target | Achieved | Status |
-|--------|--------|----------|--------|
-| Write ops/sec | 2,000+ | 43,925 | Exceeded |
-| Read ops/sec | 5,000+ | 175,089 | Exceeded |
-| Avg Latency | < 10ms | 0.22ms | Exceeded |
+| Setup | Clients | Workload | Throughput (ops/sec) | p50 / p99 latency | Errors |
+|---|---|---|---|---|---|
+| 1 node, in-memory | 16 | 80% reads | 51,262 | 0.26 / 0.72 ms | 0 |
+| 1 node, in-memory | 16 | 100% writes | 48,728 | 0.28 / 0.70 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 1 | 100% writes | 2,996 | 0.26 / 2.36 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 16 | 80% reads | 15,339 | 0.81 / 4.32 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 16 | 100% writes | 18,981 | 0.73 / 2.64 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 64 | 80% reads | 17,474 | 3.06 / 10.67 ms | 0 |
+| 3 nodes, QUORUM, auth + fsynced WAL | 1 | 100% writes | 1,379 | 0.68 / 1.59 ms | 0 |
+| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 80% reads | 12,171 | 1.08 / 4.13 ms | 0 |
+| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 100% writes | 4,691 | 3.09 / 8.65 ms | 0 |
 
-## Key Performance Factors
+"In-memory" is dev mode (no WAL, no authentication). In production mode every write is appended
+to the WAL on each of the 3 replicas and acknowledged only after fsync.
 
-1. **NIO-based TCP Server**: Non-blocking I/O handles many connections efficiently
-2. **Binary Protocol**: Minimal serialization overhead (29-byte request header with timestamps)
-3. **Connection Pooling**: Reuses connections to reduce handshake overhead
-4. **ConcurrentHashMap**: Lock-free reads for high read throughput
-5. **Direct ByteBuffers**: Reduced GC pressure during high load
+### Effect of WAL group commit
 
-## Notes
+Same 3-node production cluster, 16 clients:
 
-- Benchmarks run on localhost (minimal network latency)
-- In-memory storage (no disk I/O bottleneck)
-- Results may vary based on hardware and network conditions
-- Production deployments should account for network latency and persistence overhead
+| Workload | fsync per write | Group commit |
+|---|---|---|
+| 100% writes | 2,788 ops/sec | 4,691 ops/sec (+68%) |
+| 80% reads | 7,710 ops/sec | 12,171 ops/sec (+58%) |
+
+### Before the concurrency fix
+
+Before request handling was made non-blocking, worker threads waited on replica responses that
+needed those same workers. On this machine a 3-node cluster at 80% QUORUM reads ran at 237 ops/sec
+with errors from 4 clients, and did not finish with 8 or more clients.
+
+## Protocol size vs JSON over HTTP
+
+`./scripts/run-benchmark.sh --protocol` compares bytes on the wire for a full round trip (request
+and response) against a minimal JSON-over-HTTP/1.1 API with base64-encoded values:
+
+| Value size | PUT: binary / JSON-HTTP | GET: binary / JSON-HTTP | Binary saves (PUT, GET) |
+|---|---|---|---|
+| 10 B | 74 / 200 | 74 / 181 | 63%, 59% |
+| 100 B | 164 / 321 | 164 / 302 | 49%, 46% |
+| 1,000 B | 1,064 / 1,522 | 1,064 / 1,503 | 30%, 29% |
+| 10,000 B | 10,064 / 13,523 | 10,064 / 13,504 | 26%, 25% |
+
+The fixed binary header is 29 bytes per request and 25 per response. Savings shrink as values grow
+because base64's 33% expansion becomes the dominant JSON overhead.
