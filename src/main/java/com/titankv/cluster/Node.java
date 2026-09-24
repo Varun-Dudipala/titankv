@@ -24,6 +24,10 @@ public class Node {
     private final String hashHost;
     private volatile Status status;
     private volatile long lastHeartbeat;
+    // Gossip heartbeat state: generation is the node's start time, version counts its heartbeats
+    // within that generation. Higher (generation, version) means newer.
+    private long generation;
+    private long heartbeatVersion;
 
     /**
      * Create a new node.
@@ -186,6 +190,29 @@ public class Node {
         if (this.status == Status.SUSPECT) {
             this.status = Status.ALIVE;
         }
+    }
+
+    /**
+     * Record gossiped heartbeat state for this node.
+     *
+     * @return true if (generation, version) is newer than what was known, meaning the node
+     *         has been heard from since the last update
+     */
+    public synchronized boolean advanceHeartbeat(long newGeneration, long newVersion) {
+        if (newGeneration > generation || (newGeneration == generation && newVersion > heartbeatVersion)) {
+            generation = newGeneration;
+            heartbeatVersion = newVersion;
+            return true;
+        }
+        return false;
+    }
+
+    public synchronized long getGeneration() {
+        return generation;
+    }
+
+    public synchronized long getHeartbeatVersion() {
+        return heartbeatVersion;
     }
 
     /**

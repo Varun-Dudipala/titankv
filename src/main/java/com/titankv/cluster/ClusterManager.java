@@ -23,6 +23,7 @@ public class ClusterManager {
     private final List<Consumer<ClusterEvent>> eventListeners;
     private final ScheduledExecutorService scheduler;
     private final String clusterSecret;
+    private final Map<String, Long> departedGenerations = new ConcurrentHashMap<>();
 
     private GossipProtocol gossipProtocol;
     private volatile boolean running;
@@ -108,23 +109,25 @@ public class ClusterManager {
         }
         running = true;
 
-        // Start gossip protocol with authentication
         gossipProtocol = new GossipProtocol(localNode, this, clusterSecret);
-        gossipProtocol.start();
 
         // Join cluster via seed nodes
         // Note: Don't call addNode() here - we don't know the real node IDs yet.
         // The seed nodes will respond with JOIN messages containing their real IDs,
         // or send us membership lists with all known nodes.
+        // Gossip keeps re-sending JOIN to the seeds until it learns about another node,
+        // so a lost UDP packet or a seed that starts late does not leave this node isolated.
+        List<Node> seeds = new ArrayList<>();
         if (seedNodes != null && !seedNodes.isEmpty()) {
             for (String seed : seedNodes.split(",")) {
                 String trimmed = seed.trim();
                 if (!trimmed.isEmpty() && !trimmed.equals(localNode.getAddress())) {
-                    Node seedNode = Node.fromAddress(trimmed);
-                    gossipProtocol.sendJoin(seedNode);
+                    seeds.add(Node.fromAddress(trimmed));
                 }
             }
         }
+        gossipProtocol.setSeeds(seeds);
+        gossipProtocol.start();
 
         // Start health check task
         scheduler.scheduleAtFixedRate(this::checkHealth,
@@ -185,8 +188,11 @@ public class ClusterManager {
             node.setStatus(Node.Status.ALIVE);
         }
         node.updateHeartbeat();
+        departedGenerations.remove(node.getId());
         nodes.put(node.getId(), node);
-        hashRing.addNode(node);
+        if (node.isAvailable()) {
+            hashRing.addNode(node);
+        }
 
         fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_JOINED, node));
         logger.info("Node {} joined the cluster", node.getId());
@@ -204,10 +210,20 @@ public class ClusterManager {
 
         Node removed = nodes.remove(node.getId());
         if (removed != null) {
+            departedGenerations.put(removed.getId(), removed.getGeneration());
             hashRing.removeNode(removed);
             fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_LEFT, removed));
             logger.info("Node {} left the cluster", node.getId());
         }
+    }
+
+    /**
+     * Whether a node with this id left the cluster gracefully and this generation of it
+     * should not be re-added from stale gossip.
+     */
+    public boolean hasDeparted(String nodeId, long generation) {
+        Long departed = departedGenerations.get(nodeId);
+        return departed != null && generation <= departed;
     }
 
     /**
