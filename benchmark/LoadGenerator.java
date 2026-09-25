@@ -42,6 +42,7 @@ public class LoadGenerator {
     private final LongAdder writes = new LongAdder();
     private final LongAdder errors = new LongAdder();
     private final LongAdder preloadErrors = new LongAdder();
+    private static final Map<String, LongAdder> ERROR_KINDS = new java.util.concurrent.ConcurrentHashMap<>();
 
     public LoadGenerator(String[] hosts, int threads, int opsPerThread, int durationSeconds, int warmupOpsPerThread,
             double readRatio, int valueSize, int keysPerThread, boolean retry) {
@@ -195,6 +196,8 @@ public class LoadGenerator {
                 } catch (Exception e) {
                     if (measured) {
                         errors.increment();
+                        String kind = (read ? "read: " : "write: ") + String.valueOf(e.getMessage()).replaceAll("[0-9]+", "#");
+                        ERROR_KINDS.computeIfAbsent(kind, k -> new LongAdder()).increment();
                     }
                 }
             }
@@ -267,6 +270,7 @@ public class LoadGenerator {
                     ops / seconds(), reads / seconds(), writes / seconds());
             System.out.printf("Latency p50/p95/p99/max: %.3f / %.3f / %.3f / %.3f ms%n",
                     percentileMs(0.50), percentileMs(0.95), percentileMs(0.99), percentileMs(1.0));
+            ERROR_KINDS.forEach((kind, count) -> System.out.printf("  error x%d: %s%n", count.sum(), kind));
             System.out.printf("CSV,%.0f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%n", throughput(), percentileMs(0.50),
                     percentileMs(0.95), percentileMs(0.99), percentileMs(1.0), errors, readMisses, staleReads, ops);
         }
