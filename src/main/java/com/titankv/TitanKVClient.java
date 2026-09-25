@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -32,7 +33,8 @@ public class TitanKVClient implements AutoCloseable {
 
     // Circuit breaker configuration
     private static final int CIRCUIT_FAILURE_THRESHOLD = 5;
-    private static final long CIRCUIT_RESET_TIMEOUT_MS = 30_000; // 30 seconds
+    // After this long an open breaker lets requests through again, so a recovered node is retried
+    private static final long CIRCUIT_RESET_TIMEOUT_MS = 5_000;
 
     private final String[] hosts;
     private final ClientConfig config;
@@ -435,42 +437,48 @@ public class TitanKVClient implements AutoCloseable {
     /**
      * Execute a command with retry logic.
      */
+    /**
+     * Send a command for a key, failing over across nodes. Nodes are tried in ring order for the
+     * key, with nodes whose circuit breaker is open moved to the back. Failing over to a different
+     * node is immediate; the retry delay only applies once every node has been tried.
+     */
     private Response execute(Command command, String key) throws IOException {
         ensureOpen();
 
-        // Get the node for this key
-        Node node = hashRing.getNode(key);
-        String host = node.getAddress();
+        List<Node> ringOrder = hashRing.getNodes(key, hashRing.getNodeCount());
+        List<String> candidates = new ArrayList<>(ringOrder.size());
+        List<String> tripped = new ArrayList<>();
+        for (Node node : ringOrder) {
+            CircuitBreaker cb = circuitBreakers.get(node.getAddress());
+            (cb != null && cb.isOpen() ? tripped : candidates).add(node.getAddress());
+        }
+        candidates.addAll(tripped);
+        if (candidates.isEmpty()) {
+            candidates.add(hashRing.getNode(key).getAddress());
+        }
 
-        int retries = config.isRetryOnFailure() ? Math.max(1, config.getMaxRetries()) : 1;
+        int attempts = config.isRetryOnFailure() ? Math.max(1, config.getMaxRetries()) : 1;
         IOException lastException = null;
-
-        for (int attempt = 0; attempt < retries; attempt++) {
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            int round = attempt / candidates.size();
+            if (round > 0 && attempt % candidates.size() == 0) {
+                try {
+                    Thread.sleep(config.getRetryDelayMs() * round);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during retry", ie);
+                }
+            }
+            String host = candidates.get(attempt % candidates.size());
             try {
                 return executeOnHost(command, host);
             } catch (IOException e) {
                 lastException = e;
-                logger.warn("Request failed (attempt {}/{}): {}",
-                        attempt + 1, retries, e.getMessage());
-
-                if (attempt < retries - 1) {
-                    try {
-                        Thread.sleep(config.getRetryDelayMs() * (attempt + 1));
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted during retry", ie);
-                    }
-
-                    // Try next node in the ring
-                    List<Node> nodes = hashRing.getNodes(key, retries);
-                    if (nodes.size() > attempt + 1) {
-                        host = nodes.get(attempt + 1).getAddress();
-                    }
-                }
+                logger.debug("Request to {} failed (attempt {}/{}): {}", host, attempt + 1, attempts, e.getMessage());
             }
         }
-
-        throw new IOException("All retries failed", lastException);
+        throw new IOException("All retries failed: " + (lastException != null ? lastException.getMessage() : ""),
+                lastException);
     }
 
     /**

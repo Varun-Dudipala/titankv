@@ -8,49 +8,93 @@
   workloads, while network latency is not included.
 - fsync on this VM is fast (sub-millisecond); on spinning disks or slower SSDs durable-write
   throughput will be lower.
-- Date: 2026-09-25 (all features: strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
+- Date: 2026-09-25, with all features (strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
 
 ## Method
 
-`./scripts/run-benchmark.sh` runs `benchmark/LoadGenerator.java`:
+`./scripts/benchmark-suite.sh` runs every configuration below **5 times for 8 seconds** each and
+reports the median, the min–max range, and the spread (half the range as a share of the median).
 
-- Closed loop: each client thread has its own `TitanKVClient` and issues one request at a time.
-- Each thread first writes its 1,000-key space, so every read hits an existing key (read misses are
-  reported; all runs below had 0), then runs an unmeasured warmup of 2,000 ops.
-- Latency is recorded per operation; percentiles come from all measured operations.
-- 100-byte random values. Reads and writes use QUORUM on the cluster (replication factor 3).
-
-Reproduce:
+- Each client thread has its own `TitanKVClient` and issues one request at a time (closed loop).
+- Every fresh cluster first gets an unrecorded 5-second run, so the servers' JIT is warm.
+- Each thread writes its 1,000-key space before measuring, so reads hit existing keys; "mixed" is
+  80% reads and 20% writes of 100-byte values unless stated otherwise.
+- **Reads are checked for correctness.** Each value carries the writing thread's sequence number,
+  and a read that returns an older sequence than the thread's last acknowledged write counts as a
+  stale read.
+- Cluster runs use QUORUM reads and writes with replication factor 3, unless stated otherwise.
 
 ```bash
-mvn package -DskipTests
-NODES=1 ./scripts/start-cluster.sh
-./scripts/run-benchmark.sh --hosts localhost:9001 --threads 16 --ops 12000
-./scripts/stop-cluster.sh
-
-./scripts/start-cluster.sh                                   # 3 nodes, dev mode
-TITANKV_CLUSTER_SECRET=secret ./scripts/start-cluster.sh     # 3 nodes, production mode
-./scripts/run-benchmark.sh --hosts localhost:9001,localhost:9002,localhost:9003 --threads 16 --ops 6000
+./scripts/benchmark-suite.sh        # everything below, about 20 minutes
+./scripts/benchmark-failover.sh     # the node-failure run
 ```
+
+Raw logs and per-run CSV are in [`suite/`](suite/).
 
 ## Results
 
-| Setup | Clients | Workload | Throughput (ops/sec) | p50 / p99 latency | Errors |
-|---|---|---|---|---|---|
-| 1 node, in-memory | 16 | 80% reads | 58,624 | 0.24 / 0.49 ms | 0 |
-| 1 node, in-memory | 16 | 100% writes | 53,389 | 0.26 / 0.55 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 1 | 100% writes | 3,541 | 0.22 / 2.38 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 16 | 80% reads | 19,535 | 0.67 / 3.04 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 16 | 100% writes | 21,306 | 0.64 / 2.16 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 64 | 80% reads | 21,720 | 2.47 / 7.81 ms | 0 |
-| 3 nodes, QUORUM, auth + fsynced WAL | 1 | 100% writes | 1,348 | 0.60 / 4.26 ms | 0 |
-| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 80% reads | 12,973 | 0.97 / 4.84 ms | 0 |
-| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 100% writes | 5,708 | 2.55 / 6.78 ms | 0 |
+| Scenario | Setup | Clients | Workload | Median ops/sec | Min – max | Spread | p50 ms | p99 ms | Errors | Stale reads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| single | 1 node | 16 | mixed | 61,103 | 59,381 – 61,312 | ±2% | 0.25 | 0.53 | 0 | 0 |
+| single | 1 node | 16 | writes | 59,194 | 58,191 – 60,211 | ±2% | 0.25 | 0.53 | 0 | 0 |
+| scaling | 3 nodes | 16 | mixed | 22,560 | 21,048 – 22,956 | ±4% | 0.63 | 2.15 | 0 | 0 |
+| scaling | 5 nodes | 16 | mixed | 21,057 | 17,197 – 21,595 | ±10% | 0.67 | 2.49 | 0 | 0 |
+| consistency | ONE | 16 | mixed | 23,822 | 21,564 – 24,723 | ±7% | 0.54 | 2.53 | 0 | 0 |
+| consistency | QUORUM | 16 | mixed | 22,134 | 20,358 – 22,928 | ±6% | 0.63 | 2.25 | 0 | 0 |
+| consistency | ALL | 16 | mixed | 20,748 | 19,427 – 21,209 | ±4% | 0.70 | 2.15 | 0 | 0 |
+| value-size | 100 B | 16 | mixed | 22,420 | 18,835 – 23,067 | ±9% | 0.63 | 2.13 | 0 | 0 |
+| value-size | 1000 B | 16 | mixed | 20,604 | 19,479 – 21,499 | ±5% | 0.67 | 2.46 | 0 | 0 |
+| value-size | 10000 B | 16 | mixed | 14,576 | 10,955 – 15,500 | ±16% | 0.90 | 4.95 | 0 | 0 |
+| concurrency | 3 nodes | 1 | writes | 4,499 | 4,443 – 4,543 | ±1% | 0.21 | 0.38 | 0 | 0 |
+| concurrency | 3 nodes | 4 | writes | 11,984 | 11,622 – 12,158 | ±2% | 0.31 | 0.74 | 0 | 0 |
+| concurrency | 3 nodes | 16 | writes | 22,494 | 19,625 – 23,419 | ±8% | 0.63 | 2.31 | 0 | 0 |
+| concurrency | 3 nodes | 64 | writes | 23,079 | 16,689 – 23,875 | ±16% | 2.36 | 8.17 | 0 | 0 |
+| production | 3 nodes prod | 16 | mixed | 15,557 | 13,484 – 15,616 | ±7% | 0.88 | 3.47 | 0 | 0 |
+| production | 3 nodes prod | 16 | writes | 5,864 | 5,364 – 6,037 | ±6% | 2.49 | 6.63 | 0 | 0 |
 
-"In-memory" is dev mode (no WAL, no authentication). In production mode every write is appended
-to the WAL on each of the 3 replicas and acknowledged only after fsync.
+**Correctness:** across all 80 runs (14.6 million operations) there were **0 errors, 0 stale reads
+and 0 read misses**.
 
-### Effect of WAL group commit
+How to read it:
+
+- **Consistency levels** cost what theory predicts: ONE > QUORUM > ALL, since more replicas must
+  answer before replying. The differences are small here because all replicas are on one machine.
+- **Larger values** cost more: 10 KB values move 100 times the bytes of 100 B values.
+- **Concurrency**: throughput grows from 1 to 16 clients and flattens at 64, where p50 latency
+  rises instead. The 4 CPUs are saturated.
+- **Cluster size**: 5 nodes do not beat 3 here, because every node and the load generator share
+  the same 4 CPUs. Five JVMs split the same cores five ways. Horizontal scaling needs one machine
+  per node; on one box this only shows that adding nodes costs little.
+- **Production mode** adds authentication and an fsync on every replica before acknowledging.
+  Writes-only drops to about 5.9K/sec, bounded by fsyncs even with group commit.
+
+## Availability under node failure
+
+`./scripts/benchmark-failover.sh`: 16 clients (failing over between nodes) on a 3-node
+production-mode cluster for 40 seconds. Node 2 is killed with SIGKILL at 10s and restarted at 25s.
+
+| Phase | Avg ops/sec | Errors |
+|---|---|---|
+| All 3 nodes up (0–10s) | 14,548 | 0 |
+| Node 2 down (11–25s) | 17,365 | 0 |
+| Node 2 restarting and warming up (26–40s) | 10,698 | 0 |
+
+**538,683 operations with 0 errors, 0 stale reads and 0 read misses.** Node 2 recovered all 16,000
+keys from its WAL, and anti-entropy sent it only the 1,045 keys written while it was down.
+
+- **During the outage** QUORUM keeps working on the other two replicas. Throughput even rises,
+  because two JVMs share the CPUs instead of three.
+- **After the restart** there is a dip of about 10 seconds. The restarted JVM starts with a cold JIT
+  and immediately takes a third of the traffic, plus hint delivery and repair.
+- **This run found a client bug.** Throughput originally fell to about 2,200 ops/sec during the
+  outage. The client slept its retry delay before failing over away from the dead node, and kept
+  the node's circuit breaker open for 30 seconds. The client now fails over immediately, moves
+  nodes with an open breaker to the back of the order, and re-probes them after 5 seconds. The same
+  fix raised the chaos test from about 10K to about 147K acknowledged writes per run.
+
+Per-second numbers are in [`suite/failover.md`](suite/failover.md).
+
+## Effect of WAL group commit
 
 Same 3-node production cluster, 16 clients, measured when group commit was introduced:
 
@@ -59,7 +103,7 @@ Same 3-node production cluster, 16 clients, measured when group commit was intro
 | 100% writes | 2,788 ops/sec | 4,691 ops/sec (+68%) |
 | 80% reads | 7,710 ops/sec | 12,171 ops/sec (+58%) |
 
-### Before the concurrency fix
+## Before the concurrency fix
 
 Before request handling was made non-blocking, worker threads waited on replica responses that
 needed those same workers. On this machine a 3-node cluster at 80% QUORUM reads ran at 237 ops/sec

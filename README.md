@@ -200,14 +200,25 @@ clocks, the three convergence mechanisms, WAL recovery and the design trade-offs
 
 ## Performance
 
-On a 4-vCPU VM running all nodes and the load generator together
-([method and full results](benchmark/results/benchmark_results.md)):
+Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator together
+([method, spreads and all scenarios](benchmark/results/benchmark_results.md)):
 
 | Setup | 16 clients, 80% reads | 16 clients, writes only |
 |---|---|---|
-| 1 node, in-memory | 58,624 ops/sec | 53,389 ops/sec |
-| 3 nodes, QUORUM, in-memory | 19,535 ops/sec | 21,306 ops/sec |
-| 3 nodes, QUORUM, auth + fsynced WAL | 12,973 ops/sec | 5,708 ops/sec |
+| 1 node, in-memory | 61,103 ops/sec | 59,194 ops/sec |
+| 3 nodes, QUORUM, in-memory | 22,560 ops/sec | 22,494 ops/sec |
+| 3 nodes, QUORUM, auth + fsynced WAL | 15,557 ops/sec | 5,864 ops/sec |
+
+Every read in the benchmark is checked against the client's last acknowledged write: across 80
+runs and 14.6M operations there were 0 errors and 0 stale reads. With a node killed mid-run
+(`scripts/benchmark-failover.sh`), a production cluster served 538K operations in 40 seconds with
+0 errors, recovered the node from its WAL, and repaired only the 1,045 keys it missed.
+
+```bash
+./scripts/benchmark-suite.sh      # every scenario, 5 runs each
+./scripts/benchmark-failover.sh   # kill -9 a node under load
+./scripts/run-benchmark.sh --protocol
+```
 
 ## Testing
 

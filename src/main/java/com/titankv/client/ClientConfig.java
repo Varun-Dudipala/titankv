@@ -99,7 +99,7 @@ public class ClientConfig {
     }
 
     /**
-     * Whether to stop sending to a host for 30s after 5 consecutive failures. Node-to-node clients
+     * Whether to try a host last for 5s after 5 consecutive failures. Node-to-node clients
      * turn this off because gossip already tracks node liveness.
      */
     public void setCircuitBreakerEnabled(boolean circuitBreakerEnabled) {

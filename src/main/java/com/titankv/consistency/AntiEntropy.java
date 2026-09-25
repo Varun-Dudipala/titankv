@@ -91,6 +91,11 @@ public final class AntiEntropy {
         clusterManager.addEventListener(event -> {
             if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_LEFT) {
                 scheduler.schedule(this::repairWithAllPeers, 2, TimeUnit.SECONDS);
+            } else if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_RESTARTED) {
+                // A restarted node recovered what its WAL had (possibly nothing, in dev mode);
+                // a Merkle comparison sends only the keys it is missing or has stale.
+                Node restarted = event.getNode();
+                scheduler.schedule(() -> repairQuietly(restarted), 2, TimeUnit.SECONDS);
             }
         });
     }
@@ -98,12 +103,16 @@ public final class AntiEntropy {
     private void repairWithAllPeers() {
         for (Node node : clusterManager.getAllNodes()) {
             if (!node.equals(clusterManager.getLocalNode()) && node.isAvailable()) {
-                try {
-                    repairWith(node);
-                } catch (IOException | RuntimeException e) {
-                    logger.warn("Anti-entropy with {} failed: {}", node.getId(), e.getMessage());
-                }
+                repairQuietly(node);
             }
+        }
+    }
+
+    private void repairQuietly(Node node) {
+        try {
+            repairWith(node);
+        } catch (IOException | RuntimeException e) {
+            logger.warn("Anti-entropy with {} failed: {}", node.getId(), e.getMessage());
         }
     }
 
