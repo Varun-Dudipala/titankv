@@ -119,7 +119,7 @@ public class TitanKVClient implements AutoCloseable {
             }
         }
 
-        logger.info("TitanKV client initialized with {} hosts", hosts.length);
+        logger.debug("TitanKV client initialized with {} hosts", hosts.length);
     }
 
     /**
@@ -550,7 +550,7 @@ public class TitanKVClient implements AutoCloseable {
         Node node = Node.fromAddress(host);
         node.setStatus(Node.Status.ALIVE);
         hashRing.addNode(node);
-        logger.info("Added node {} to client", host);
+        logger.debug("Added node {} to client", host);
     }
 
     /**
@@ -561,7 +561,7 @@ public class TitanKVClient implements AutoCloseable {
     public void removeNode(String host) {
         Node node = Node.fromAddress(host);
         hashRing.removeNode(node);
-        logger.info("Removed node {} from client", host);
+        logger.debug("Removed node {} from client", host);
     }
 
     /**
@@ -595,7 +595,7 @@ public class TitanKVClient implements AutoCloseable {
         if (!closed) {
             closed = true;
             connectionPool.close();
-            logger.info("TitanKV client closed");
+            logger.debug("TitanKV client closed");
         }
     }
 

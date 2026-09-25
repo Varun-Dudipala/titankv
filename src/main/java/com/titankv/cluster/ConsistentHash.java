@@ -82,7 +82,7 @@ public class ConsistentHash {
                 ring.put(hash, vnode);
             }
 
-            logger.info("Added node {} with {} virtual nodes", node.getId(), virtualNodesPerNode);
+            logger.debug("Added node {} with {} virtual nodes", node.getId(), virtualNodesPerNode);
         } finally {
             lock.writeLock().unlock();
         }
@@ -109,7 +109,7 @@ public class ConsistentHash {
                 }
             }
 
-            logger.info("Removed node {} from ring", node.getId());
+            logger.debug("Removed node {} from ring", node.getId());
         } finally {
             lock.writeLock().unlock();
         }
@@ -260,7 +260,7 @@ public class ConsistentHash {
         try {
             ring.clear();
             physicalNodes.clear();
-            logger.info("Cleared hash ring");
+            logger.debug("Cleared hash ring");
         } finally {
             lock.writeLock().unlock();
         }
