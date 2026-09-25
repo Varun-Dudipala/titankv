@@ -65,9 +65,13 @@ mvn clean package
 # Run unit tests, then integration tests that start real clusters
 mvn verify
 
-# Start and stop a local 3-node cluster
+# Start a local 3-node cluster, open a shell on it, stop it
 ./scripts/start-cluster.sh
+./scripts/titankv-cli.sh localhost:9001
 ./scripts/stop-cluster.sh
+
+# Or run a 3-node cluster in Docker
+docker compose up -d --build
 ```
 
 ## Code Style Guidelines
