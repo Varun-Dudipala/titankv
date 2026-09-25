@@ -268,20 +268,11 @@ public class MetricsHttpServer {
     }
 
     private void handleReady(OutputStream out) throws IOException {
-        // Readiness check - can we serve traffic?
-        boolean ready = true;
-        String reason = "";
-
-        if (clusterManager != null && !clusterManager.isRunning()) {
-            ready = false;
-            reason = "cluster not running";
-        }
-
-        if (ready) {
+        if (clusterManager == null || clusterManager.isReady()) {
             sendResponse(out, 200, "application/json", "{\"status\":\"ready\"}");
         } else {
-            sendResponse(out, 503, "application/json", 
-                "{\"status\":\"not ready\",\"reason\":\"" + reason + "\"}");
+            sendResponse(out, 503, "application/json",
+                    "{\"status\":\"not ready\",\"reason\":\"joining cluster\"}");
         }
     }
 

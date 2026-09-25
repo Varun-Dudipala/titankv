@@ -38,8 +38,15 @@ PIDS=()
 for ((i = 0; i < NODES; i++)); do
     PORT=$((BASE_PORT + i))
     ARGS=(--port "$PORT")
-    if [ "$i" -gt 0 ]; then
-        ARGS+=(--seeds "localhost:$BASE_PORT")
+    # Every node lists the others as seeds, so any node can restart and rejoin
+    SEEDS=""
+    for ((j = 0; j < NODES; j++)); do
+        if [ "$j" -ne "$i" ]; then
+            SEEDS="${SEEDS:+$SEEDS,}localhost:$((BASE_PORT + j))"
+        fi
+    done
+    if [ -n "$SEEDS" ]; then
+        ARGS+=(--seeds "$SEEDS")
     fi
     nohup java -jar "$JAR_FILE" "${ARGS[@]}" > "$LOG_DIR/node$((i + 1)).log" 2>&1 &
     PIDS+=($!)

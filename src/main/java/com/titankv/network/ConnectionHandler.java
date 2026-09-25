@@ -216,7 +216,9 @@ public class ConnectionHandler {
     }
 
     private boolean isInternalCommand(byte type) {
-        return type == Command.GET_INTERNAL
+        return type == Command.MERKLE_TREE
+                || type == Command.MERKLE_LEAF
+                || type == Command.GET_INTERNAL
                 || type == Command.PUT_INTERNAL
                 || type == Command.DELETE_INTERNAL;
     }
@@ -428,6 +430,10 @@ public class ConnectionHandler {
         if (authError != null) {
             return done(authError);
         }
+        if (!isInternalCommand(command.getType()) && command.getType() != Command.PING
+                && clusterManager != null && !clusterManager.isReady()) {
+            return done(Response.error("Node is joining the cluster; retry on another node"));
+        }
         switch (command.getType()) {
             case Command.GET:
                 return handleGet(command);
@@ -443,6 +449,9 @@ public class ConnectionHandler {
                 return done(handlePutInternal(command));
             case Command.DELETE_INTERNAL:
                 return done(handleDeleteInternal(command));
+            case Command.MERKLE_TREE:
+            case Command.MERKLE_LEAF:
+                return done(handleMerkle(command));
             case Command.PING:
                 return done(Response.pong());
             case Command.KEYS:
@@ -569,6 +578,24 @@ public class ConnectionHandler {
             return Response.ok(kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
         }
         return Response.notFound();
+    }
+
+    /**
+     * Serve a peer's anti-entropy request. The key field carries the requesting node's id, since
+     * the tree covers only keys both nodes replicate.
+     */
+    private Response handleMerkle(Command command) {
+        com.titankv.consistency.AntiEntropy antiEntropy =
+                replicationManager != null ? replicationManager.getAntiEntropy() : null;
+        byte[] args = command.getValueUnsafe();
+        if (antiEntropy == null || command.getKey() == null || args == null) {
+            return Response.error("Anti-entropy not available");
+        }
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(args);
+        byte[] result = command.getType() == Command.MERKLE_TREE
+                ? antiEntropy.handleTreeRequest(command.getKey(), buffer.get())
+                : antiEntropy.handleLeafRequest(command.getKey(), buffer.getInt());
+        return Response.ok(result);
     }
 
     private CompletableFuture<Response> handlePut(Command command) {

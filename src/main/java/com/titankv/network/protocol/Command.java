@@ -20,6 +20,8 @@ public final class Command {
     public static final byte GET_INTERNAL = 0x11;  // Get from local store only
     public static final byte PUT_INTERNAL = 0x12;  // Put without triggering replication
     public static final byte DELETE_INTERNAL = 0x13;  // Delete without triggering replication
+    public static final byte MERKLE_TREE = 0x14;  // Anti-entropy: Merkle tree of keys shared with the sender
+    public static final byte MERKLE_LEAF = 0x15;  // Anti-entropy: key digests in one Merkle leaf
 
     private final byte type;
     private final String key;
@@ -183,6 +185,11 @@ public final class Command {
             case EXISTS: return "EXISTS";
             case KEYS: return "KEYS";
             case AUTH: return "AUTH";
+            case GET_INTERNAL: return "GET_INTERNAL";
+            case PUT_INTERNAL: return "PUT_INTERNAL";
+            case DELETE_INTERNAL: return "DELETE_INTERNAL";
+            case MERKLE_TREE: return "MERKLE_TREE";
+            case MERKLE_LEAF: return "MERKLE_LEAF";
             default: return "UNKNOWN(" + type + ")";
         }
     }

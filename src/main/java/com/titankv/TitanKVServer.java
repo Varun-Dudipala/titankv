@@ -281,6 +281,13 @@ public class TitanKVServer {
     }
 
     /**
+     * Get the replication manager (hinted handoff, anti-entropy).
+     */
+    public ReplicationManager getReplicationManager() {
+        return replicationManager;
+    }
+
+    /**
      * Get the cluster manager.
      */
     public ClusterManager getClusterManager() {
