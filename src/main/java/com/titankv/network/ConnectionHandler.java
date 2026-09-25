@@ -8,6 +8,7 @@ import com.titankv.network.protocol.Command;
 import com.titankv.network.protocol.ProtocolException;
 import com.titankv.network.protocol.Response;
 import com.titankv.util.Env;
+import com.titankv.util.HybridLogicalClock;
 import com.titankv.util.MetricsCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,7 +75,8 @@ public class ConnectionHandler {
     private final Object interestOpsLock = new Object();
 
     private static final ConcurrentMap<String, String> HOST_IP_CACHE = new ConcurrentHashMap<>();
-    private static final java.util.concurrent.atomic.AtomicLong LAST_TIMESTAMP = new java.util.concurrent.atomic.AtomicLong();
+    // Used only when there is no ClusterManager (a bare TcpServer in tests)
+    private static final HybridLogicalClock STANDALONE_CLOCK = new HybridLogicalClock();
 
     // Read per connection (not statically) so servers started with different settings
     // in the same JVM, e.g. in tests, each get their own configuration.
@@ -243,15 +245,8 @@ public class ConnectionHandler {
         return null;
     }
 
-    private static long nextTimestamp() {
-        long now = System.currentTimeMillis();
-        while (true) {
-            long last = LAST_TIMESTAMP.get();
-            long next = Math.max(now, last + 1);
-            if (LAST_TIMESTAMP.compareAndSet(last, next)) {
-                return next;
-            }
-        }
+    private HybridLogicalClock clock() {
+        return clusterManager != null ? clusterManager.getClock() : STANDALONE_CLOCK;
     }
 
     private static boolean tokenMatches(String provided, String expected) {
@@ -540,9 +535,12 @@ public class ConnectionHandler {
         }
         if (isDistributed()) {
             return replicated(replicationManager.read(command.getKey(), readConsistency), "Read", command.getKey(),
-                    result -> result.filter(r -> r.getValue() != null)
-                            .map(r -> Response.ok(r.getValue(), r.getTimestamp(), r.getExpiresAt()))
-                            .orElseGet(Response::notFound));
+                    result -> {
+                        result.ifPresent(r -> clock().observe(r.getTimestamp()));
+                        return result.filter(r -> r.getValue() != null)
+                                .map(r -> Response.ok(r.getValue(), r.getTimestamp(), r.getExpiresAt()))
+                                .orElseGet(Response::notFound);
+                    });
         }
         Optional<KeyValuePair> result = store.get(command.getKey());
         if (result.isPresent()) {
@@ -605,16 +603,20 @@ public class ConnectionHandler {
         if (command.getExpiresAt() < 0) {
             return done(Response.error("TTL must not be negative"));
         }
-        long timestamp = nextTimestamp();
+        // A client PUT's timestamp field is its causal context: the newest version it has seen.
+        // Observing it first makes this write newer than anything the client read or wrote before.
+        clock().observe(command.getTimestamp());
+        long timestamp = clock().next();
         // Client PUTs carry a relative TTL in the expires field
         long expiresAt = command.getExpiresAt() > 0 ? System.currentTimeMillis() + command.getExpiresAt() : 0;
+        Response written = Response.ok(null, timestamp, expiresAt);
 
         if (isDistributed()) {
             return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
-                    expiresAt, writeConsistency), "Write", command.getKey(), ok -> Response.ok());
+                    expiresAt, writeConsistency), "Write", command.getKey(), ok -> written);
         }
         store.putIfNewer(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt);
-        return done(Response.ok());
+        return done(written);
     }
 
     /**
@@ -629,6 +631,7 @@ public class ConnectionHandler {
         if (command.getTimestamp() == 0) {
             return Response.error("Timestamp required for internal PUT");
         }
+        clock().observe(command.getTimestamp());
         boolean written = store.putIfNewer(
                 command.getKey(),
                 command.getValueUnsafe(),
@@ -643,19 +646,18 @@ public class ConnectionHandler {
         if (command.getKey() == null) {
             return done(Response.error("Key required for DELETE"));
         }
-        // Tombstone timestamp must be newer than any existing entry
-        Optional<KeyValuePair> existing = store.getRaw(command.getKey());
-        long timestamp = nextTimestamp();
-        if (existing.isPresent()) {
-            timestamp = Math.max(timestamp, existing.get().getTimestamp() + 1);
-        }
+        // The tombstone must be newer than the client's causal context and any local version
+        clock().observe(command.getTimestamp());
+        store.getRaw(command.getKey()).ifPresent(existing -> clock().observe(existing.getTimestamp()));
+        long timestamp = clock().next();
+        Response deleted = Response.ok(null, timestamp, 0);
 
         if (isDistributed()) {
             return replicated(replicationManager.delete(command.getKey(), timestamp, 0, deleteConsistency),
-                    "Delete", command.getKey(), ok -> Response.ok());
+                    "Delete", command.getKey(), ok -> deleted);
         }
         store.putIfNewer(command.getKey(), null, timestamp, 0);
-        return done(Response.ok());
+        return done(deleted);
     }
 
     /**
@@ -670,6 +672,7 @@ public class ConnectionHandler {
         if (command.getTimestamp() == 0) {
             return Response.error("Timestamp required for internal DELETE");
         }
+        clock().observe(command.getTimestamp());
         // null value = tombstone, so stale replicas cannot resurrect the deleted value
         boolean written = store.putIfNewer(
                 command.getKey(),
