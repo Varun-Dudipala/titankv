@@ -28,6 +28,7 @@ public final class TitanKVCli {
             "  ping                          check the connection",
             "  status                        cluster members as seen by the connected node",
             "  removenode <node-id>          permanently remove a DEAD node",
+            "  cleanup                       drop keys the node no longer replicates (after joins)",
             "  help                          this text",
             "  quit                          exit the shell");
 
@@ -112,6 +113,9 @@ public final class TitanKVCli {
                     requireArgs(args, 2, "removenode <node-id>");
                     client.removeClusterNode(args[1]);
                     System.out.println("Removed " + args[1] + "; its data is being re-replicated");
+                    return true;
+                case "cleanup":
+                    System.out.println("Removed " + client.cleanup() + " keys this node no longer replicates");
                     return true;
                 case "help":
                     System.out.println(HELP);

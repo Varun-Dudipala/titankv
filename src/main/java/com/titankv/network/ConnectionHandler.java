@@ -454,6 +454,13 @@ public class ConnectionHandler {
                 return done(handleStatus());
             case Command.REMOVE_NODE:
                 return done(handleRemoveNode(command));
+            case Command.CLEANUP:
+                if (replicationManager == null) {
+                    return done(Response.error("CLEANUP requires a cluster"));
+                }
+                // Scans the whole store, so it runs off the worker pool
+                return CompletableFuture.supplyAsync(() -> Response.ok(
+                        Integer.toString(replicationManager.cleanup()).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
             case Command.KEYS:
                 return done(Response.error("KEYS command is disabled in distributed mode for performance reasons"));
             default:
