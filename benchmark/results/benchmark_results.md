@@ -8,7 +8,7 @@
   workloads, while network latency is not included.
 - fsync on this VM is fast (sub-millisecond); on spinning disks or slower SSDs durable-write
   throughput will be lower.
-- Date: 2026-09-24
+- Date: 2026-09-25 (all features: strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
 
 ## Method
 
@@ -37,22 +37,22 @@ TITANKV_CLUSTER_SECRET=secret ./scripts/start-cluster.sh     # 3 nodes, producti
 
 | Setup | Clients | Workload | Throughput (ops/sec) | p50 / p99 latency | Errors |
 |---|---|---|---|---|---|
-| 1 node, in-memory | 16 | 80% reads | 51,262 | 0.26 / 0.72 ms | 0 |
-| 1 node, in-memory | 16 | 100% writes | 48,728 | 0.28 / 0.70 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 1 | 100% writes | 2,996 | 0.26 / 2.36 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 16 | 80% reads | 15,339 | 0.81 / 4.32 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 16 | 100% writes | 18,981 | 0.73 / 2.64 ms | 0 |
-| 3 nodes, QUORUM, in-memory | 64 | 80% reads | 17,474 | 3.06 / 10.67 ms | 0 |
-| 3 nodes, QUORUM, auth + fsynced WAL | 1 | 100% writes | 1,379 | 0.68 / 1.59 ms | 0 |
-| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 80% reads | 12,171 | 1.08 / 4.13 ms | 0 |
-| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 100% writes | 4,691 | 3.09 / 8.65 ms | 0 |
+| 1 node, in-memory | 16 | 80% reads | 58,624 | 0.24 / 0.49 ms | 0 |
+| 1 node, in-memory | 16 | 100% writes | 53,389 | 0.26 / 0.55 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 1 | 100% writes | 3,541 | 0.22 / 2.38 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 16 | 80% reads | 19,535 | 0.67 / 3.04 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 16 | 100% writes | 21,306 | 0.64 / 2.16 ms | 0 |
+| 3 nodes, QUORUM, in-memory | 64 | 80% reads | 21,720 | 2.47 / 7.81 ms | 0 |
+| 3 nodes, QUORUM, auth + fsynced WAL | 1 | 100% writes | 1,348 | 0.60 / 4.26 ms | 0 |
+| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 80% reads | 12,973 | 0.97 / 4.84 ms | 0 |
+| 3 nodes, QUORUM, auth + fsynced WAL | 16 | 100% writes | 5,708 | 2.55 / 6.78 ms | 0 |
 
 "In-memory" is dev mode (no WAL, no authentication). In production mode every write is appended
 to the WAL on each of the 3 replicas and acknowledged only after fsync.
 
 ### Effect of WAL group commit
 
-Same 3-node production cluster, 16 clients:
+Same 3-node production cluster, 16 clients, measured when group commit was introduced:
 
 | Workload | fsync per write | Group commit |
 |---|---|---|
