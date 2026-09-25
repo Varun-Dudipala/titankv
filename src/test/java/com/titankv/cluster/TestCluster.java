@@ -50,6 +50,14 @@ public final class TestCluster implements AutoCloseable {
         return server;
     }
 
+    /**
+     * Start one more node that joins the running cluster.
+     */
+    public TitanKVServer addNode() throws Exception {
+        servers.add(null);
+        return startNode(servers.size() - 1);
+    }
+
     public void stopNode(int index) {
         servers.get(index).stop();
     }

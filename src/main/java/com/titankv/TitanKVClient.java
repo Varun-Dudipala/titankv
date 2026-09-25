@@ -363,6 +363,16 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
+     * Ask this client's first host to drop keys it no longer replicates, after handing each to its
+     * current replicas.
+     *
+     * @return number of keys removed
+     */
+    public int cleanup() throws IOException {
+        return Integer.parseInt(new String(internalRequest(Command.CLEANUP, null, null), StandardCharsets.UTF_8));
+    }
+
+    /**
      * Send a command to this client's first host, without key routing, and return the response
      * value. Used for cluster status, admin commands and node-to-node anti-entropy requests.
      *

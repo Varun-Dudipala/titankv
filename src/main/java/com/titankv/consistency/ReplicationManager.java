@@ -233,6 +233,44 @@ public final class ReplicationManager implements ReplicaIO {
     }
 
     /**
+     * Drop local keys this node no longer replicates (after nodes joined and took over ranges),
+     * like Cassandra's nodetool cleanup. Each key is first written to all of its current replicas,
+     * and only removed locally if every one of them accepted it, so no copy is lost.
+     *
+     * @return number of keys removed from this node
+     */
+    public int cleanup() {
+        if (localStore == null) {
+            return 0;
+        }
+        Node local = clusterManager.getLocalNode();
+        int removed = 0;
+        for (String key : localStore instanceof InMemoryStore
+                ? ((InMemoryStore) localStore).keysIncludingTombstones() : localStore.keys()) {
+            List<Node> replicas = clusterManager.getReplicasForKey(key, replicationFactor);
+            if (replicas.contains(local)) {
+                continue;
+            }
+            Optional<KeyValuePair> entry = localStore.getRaw(key);
+            if (entry.isEmpty()) {
+                continue;
+            }
+            KeyValuePair kv = entry.get();
+            try {
+                for (Node replica : replicas) {
+                    write(replica, key, kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
+                }
+                localStore.delete(key);
+                removed++;
+            } catch (IOException e) {
+                logger.warn("Cleanup kept {}: could not hand it to every replica: {}", key, e.getMessage());
+            }
+        }
+        logger.info("Cleanup removed {} keys this node no longer replicates", removed);
+        return removed;
+    }
+
+    /**
      * @return hints this node holds for replicas that missed writes, per target node id
      */
     public HintedHandoff getHintedHandoff() {
