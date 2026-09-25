@@ -113,8 +113,9 @@ public class DataRebalancer {
 
         switch (event.getType()) {
             case NODE_JOINED:
-            case NODE_RECOVERED:
-                // New/recovered node - transfer data that should belong to it
+            case NODE_RESTARTED:
+                // A new node, or a restarted one that may have lost unpersisted data: stream it
+                // the keys it replicates. A node that was only unreachable catches up from hints.
                 transferPool.submit(() -> handleNodeJoin(event.getNode()));
                 break;
 
@@ -173,7 +174,7 @@ public class DataRebalancer {
 
         // Include tombstones so a node that missed deletes while down does not serve the old values
         for (String key : store.keysIncludingTombstones()) {
-            List<Node> owners = clusterManager.getNodesForKey(key, replicationFactor);
+            List<Node> owners = clusterManager.getReplicasForKey(key, replicationFactor);
             
             // Check if target node should own this key
             boolean targetShouldOwn = owners.stream()
@@ -264,6 +265,7 @@ public class DataRebalancer {
                 .connectTimeoutMs(5000)
                 .readTimeoutMs((int) TRANSFER_TIMEOUT_MS)
                 .retryOnFailure(false)
+                .circuitBreaker(false)
                 .authToken(authToken)
                 .build();
             return new TitanKVClient(config, addr);

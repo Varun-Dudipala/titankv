@@ -57,7 +57,7 @@ public class TitanKVServer {
 
         Node localNode = new Node(this.nodeId, "localhost", port);
         this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager, store);
+        this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
@@ -85,7 +85,7 @@ public class TitanKVServer {
         // Create the local node and cluster manager
         Node localNode = new Node(this.nodeId, getHostFromId(this.nodeId), port);
         this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager, store);
+        this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
@@ -106,7 +106,7 @@ public class TitanKVServer {
 
         Node localNode = new Node(this.nodeId, "localhost", port);
         this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager, store);
+        this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
@@ -117,6 +117,14 @@ public class TitanKVServer {
     private static Path nodeDataDir(int port) {
         String base = Env.get("TITANKV_DATA_DIR", "titankv.data.dir");
         return Path.of(base != null ? base : "data").resolve("node-" + port);
+    }
+
+    /**
+     * Hints are persisted next to the WAL when the store is durable, otherwise kept in memory.
+     */
+    private static Path hintsDir(KVStore store, int port) {
+        boolean durable = store instanceof InMemoryStore && ((InMemoryStore) store).isWalEnabled();
+        return durable ? nodeDataDir(port).resolve("hints") : null;
     }
 
     /**

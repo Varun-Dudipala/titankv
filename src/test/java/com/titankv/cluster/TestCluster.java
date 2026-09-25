@@ -42,6 +42,20 @@ public final class TestCluster implements AutoCloseable {
         servers.get(index).stop();
     }
 
+    /**
+     * Stop a node without the LEAVE broadcast a graceful shutdown sends, so the other nodes
+     * still consider it a member and have to detect the failure from missing heartbeats.
+     */
+    public void crashNode(int index) {
+        ClusterManager crashed = servers.get(index).getClusterManager();
+        for (Node peer : crashed.getAllNodes()) {
+            if (!peer.equals(crashed.getLocalNode())) {
+                crashed.removeNode(peer);
+            }
+        }
+        servers.get(index).stop();
+    }
+
     public TitanKVServer node(int index) {
         return servers.get(index);
     }

@@ -101,7 +101,7 @@ public class ReadRepairHandler {
      * @param timeoutMs         how long to wait for enough answers
      */
     public CompletableFuture<RepairResult> readWithRepair(String key, int requiredResponses, long timeoutMs) {
-        List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
+        List<Node> replicas = liveReplicas(key);
         if (replicas.size() < requiredResponses) {
             return CompletableFuture.failedFuture(
                     new ConsistencyException("Not enough replicas responded", requiredResponses, 0));
@@ -153,7 +153,7 @@ public class ReadRepairHandler {
      * @return number of replicas that accepted the write
      */
     public CompletableFuture<Integer> forceRepair(String key, byte[] value, long timestamp, long expiresAt) {
-        List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
+        List<Node> replicas = liveReplicas(key);
         List<CompletableFuture<Boolean>> writes = new ArrayList<>();
         for (Node node : replicas) {
             writes.add(CompletableFuture.supplyAsync(() -> {
@@ -168,6 +168,19 @@ public class ReadRepairHandler {
         }
         return CompletableFuture.allOf(writes.toArray(new CompletableFuture<?>[0]))
                 .thenApply(v -> (int) writes.stream().filter(CompletableFuture::join).count());
+    }
+
+    /**
+     * The key's replicas that are currently up. Down replicas are not substituted by other nodes.
+     */
+    private List<Node> liveReplicas(String key) {
+        List<Node> live = new ArrayList<>();
+        for (Node replica : clusterManager.getReplicasForKey(key, replicationFactor)) {
+            if (replica.isAvailable()) {
+                live.add(replica);
+            }
+        }
+        return live;
     }
 
     private NodeValue readReplica(Node node, String key) throws IOException {
@@ -297,6 +310,7 @@ public class ReadRepairHandler {
                             .connectTimeoutMs(5000)
                             .readTimeoutMs(5000)
                             .retryOnFailure(false)
+                            .circuitBreaker(false)
                             .authToken(Env.internalToken())
                             .build(),
                     addr));

@@ -578,6 +578,13 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
+     * @return true if writes are persisted to a write-ahead log
+     */
+    public boolean isWalEnabled() {
+        return walEnabled;
+    }
+
+    /**
      * Estimated bytes used by stored entries.
      */
     public long getMemoryUsedBytes() {

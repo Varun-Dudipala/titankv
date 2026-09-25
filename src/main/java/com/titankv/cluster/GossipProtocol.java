@@ -399,8 +399,12 @@ public class GossipProtocol {
             long memberGeneration, long memberVersion) {
         Node known = clusterManager.getNode(id);
         if (known != null) {
+            long previousGeneration = known.getGeneration();
             if (known.advanceHeartbeat(memberGeneration, memberVersion)) {
                 clusterManager.updateHeartbeat(id);
+                if (previousGeneration != 0 && memberGeneration > previousGeneration) {
+                    clusterManager.nodeRestarted(known);
+                }
             }
             return;
         }

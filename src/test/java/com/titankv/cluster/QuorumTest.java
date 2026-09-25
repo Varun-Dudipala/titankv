@@ -29,7 +29,7 @@ class QuorumTest {
                 assertThat(client.getString("quorum-key")).contains("written-with-one-node-down");
             }
 
-            crash(cluster, 1);
+            cluster.crashNode(1);
             awaitAlive(cluster, 1);
             try (TitanKVClient client = cluster.client(survivor)) {
                 assertThatThrownBy(() -> client.put("quorum-key", "must-not-be-acknowledged"))
@@ -42,18 +42,6 @@ class QuorumTest {
         }
     }
 
-    /**
-     * Stop a node without the graceful LEAVE, so the survivor still counts it as a member.
-     */
-    private static void crash(TestCluster cluster, int index) {
-        ClusterManager crashed = cluster.node(index).getClusterManager();
-        for (Node peer : crashed.getAllNodes()) {
-            if (!peer.equals(crashed.getLocalNode())) {
-                crashed.removeNode(peer);
-            }
-        }
-        cluster.stopNode(index);
-    }
 
     private static void awaitAlive(TestCluster cluster, int expectedAlive) {
         TestCluster.awaitCondition(
