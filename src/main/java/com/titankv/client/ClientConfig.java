@@ -12,6 +12,7 @@ public class ClientConfig {
     private long retryDelayMs = 100;
     private boolean retryOnFailure = true;
     private String authToken = null;
+    private boolean circuitBreakerEnabled = true;
 
     public ClientConfig() {
         String token = System.getenv("TITANKV_CLIENT_TOKEN");
@@ -93,6 +94,18 @@ public class ClientConfig {
         this.retryOnFailure = retryOnFailure;
     }
 
+    public boolean isCircuitBreakerEnabled() {
+        return circuitBreakerEnabled;
+    }
+
+    /**
+     * Whether to stop sending to a host for 30s after 5 consecutive failures. Node-to-node clients
+     * turn this off because gossip already tracks node liveness.
+     */
+    public void setCircuitBreakerEnabled(boolean circuitBreakerEnabled) {
+        this.circuitBreakerEnabled = circuitBreakerEnabled;
+    }
+
     public String getAuthToken() {
         return authToken;
     }
@@ -134,6 +147,11 @@ public class ClientConfig {
 
         public Builder retryOnFailure(boolean retry) {
             config.setRetryOnFailure(retry);
+            return this;
+        }
+
+        public Builder circuitBreaker(boolean enabled) {
+            config.setCircuitBreakerEnabled(enabled);
             return this;
         }
 

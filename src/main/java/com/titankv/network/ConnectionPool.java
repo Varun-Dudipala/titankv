@@ -105,6 +105,16 @@ public class ConnectionPool {
     }
 
     /**
+     * Close every idle connection to a host, e.g. after one turned out to be stale.
+     */
+    public void evictIdle(String host) {
+        HostPool pool = hostPools.get(host);
+        if (pool != null) {
+            pool.evictIdle();
+        }
+    }
+
+    /**
      * Close all connections and clear the pool.
      */
     public void close() {
@@ -250,12 +260,11 @@ public class ConnectionPool {
             // Try to get idle connection without blocking
             PooledConnection conn = idle.poll();
             if (conn != null && conn.isOpen()) {
+                conn.markReused();
                 return conn;
             }
-            // Connection from pool was stale, release its permit
             if (conn != null) {
-                permits.release();
-                totalConnections.decrementAndGet();
+                invalidate(conn); // closed while idle
             }
 
             // Try to acquire permit (with timeout)
@@ -308,6 +317,13 @@ public class ConnectionPool {
             PooledConnection connection = new PooledConnection(host, channel);
             allConnections.add(connection);
             return connection;
+        }
+
+        void evictIdle() {
+            PooledConnection conn;
+            while ((conn = idle.poll()) != null) {
+                invalidate(conn);
+            }
         }
 
         void release(PooledConnection conn) {
@@ -367,6 +383,7 @@ public class ConnectionPool {
         private ByteBuffer readBuffer; // Mutable for dynamic growth
         private ByteBuffer writeBuffer; // Mutable for dynamic growth
         private boolean authenticated;
+        private boolean reused;
 
         PooledConnection(String host, SocketChannel channel) {
             this.host = host;
@@ -400,6 +417,17 @@ public class ConnectionPool {
         public ByteBuffer getWriteBuffer() {
             writeBuffer.clear();
             return writeBuffer;
+        }
+
+        /**
+         * @return true if this connection was handed out from the idle pool rather than newly opened
+         */
+        public boolean isReused() {
+            return reused;
+        }
+
+        void markReused() {
+            reused = true;
         }
 
         public boolean isAuthenticated() {

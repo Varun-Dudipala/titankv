@@ -114,7 +114,9 @@ public class TitanKVClient implements AutoCloseable {
             Node node = Node.fromAddress(host);
             node.setStatus(Node.Status.ALIVE);
             hashRing.addNode(node);
-            circuitBreakers.put(node.getAddress(), new CircuitBreaker());
+            if (config.isCircuitBreakerEnabled()) {
+                circuitBreakers.put(node.getAddress(), new CircuitBreaker());
+            }
         }
 
         logger.info("TitanKV client initialized with {} hosts", hosts.length);
@@ -412,47 +414,52 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Execute a command on a specific host with dynamic buffer growth support.
-     * Uses circuit breaker to avoid repeatedly hitting failing hosts.
+     * Execute a command on one host. A pooled connection may have gone stale since it was last used
+     * (for example, the server restarted); if a reused connection fails with anything but a timeout,
+     * idle connections to that host are dropped and the command is retried once on a new connection.
      */
     private Response executeOnHost(Command command, String host) throws IOException {
-        // Check circuit breaker first
         CircuitBreaker cb = circuitBreakers.get(host);
         if (cb != null && cb.isOpen()) {
             throw new IOException("Circuit breaker open for host: " + host);
         }
 
-        PooledConnection conn = null;
-        try {
-            conn = connectionPool.acquire(host);
-            ensureAuthenticated(conn, host);
-
-            Response response = sendCommand(conn, command);
-
-            // Record success for circuit breaker
-            if (cb != null) {
-                cb.recordSuccess();
-            }
-
-            return response;
-
-        } catch (IOException e) {
-            // Record failure for circuit breaker
-            if (cb != null) {
-                cb.recordFailure();
-                if (cb.isOpen()) {
-                    logger.warn("Circuit breaker opened for host {} after {} failures",
-                            host, CIRCUIT_FAILURE_THRESHOLD);
-                }
-            }
-            if (conn != null) {
-                connectionPool.invalidate(conn);
-                conn = null;
-            }
-            throw e;
-        } finally {
-            if (conn != null) {
+        boolean retriedStale = false;
+        while (true) {
+            PooledConnection conn = null;
+            boolean reused = false;
+            try {
+                conn = connectionPool.acquire(host);
+                reused = conn.isReused();
+                ensureAuthenticated(conn, host);
+                Response response = sendCommand(conn, command);
                 connectionPool.release(conn);
+                if (cb != null) {
+                    cb.recordSuccess();
+                }
+                return response;
+            } catch (IOException e) {
+                if (conn != null) {
+                    connectionPool.invalidate(conn);
+                }
+                if (reused && !retriedStale && !(e instanceof java.net.SocketTimeoutException)) {
+                    retriedStale = true;
+                    connectionPool.evictIdle(host);
+                    continue;
+                }
+                if (cb != null) {
+                    cb.recordFailure();
+                    if (cb.isOpen()) {
+                        logger.warn("Circuit breaker opened for host {} after {} failures",
+                                host, CIRCUIT_FAILURE_THRESHOLD);
+                    }
+                }
+                throw e;
+            } catch (RuntimeException e) {
+                if (conn != null) {
+                    connectionPool.invalidate(conn);
+                }
+                throw e;
             }
         }
     }
