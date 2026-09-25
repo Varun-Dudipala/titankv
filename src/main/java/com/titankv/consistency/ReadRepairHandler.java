@@ -11,7 +11,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Reads a key from its replicas, returns the newest version once enough replicas have
@@ -94,11 +93,13 @@ public class ReadRepairHandler {
     }
 
     /**
-     * Query every replica. The returned future completes with the newest version among the first
-     * {@code requiredResponses} answers; once all replicas have answered (or the timeout passes),
-     * stale replicas are repaired in the background.
+     * Read a key from as many replicas as the consistency level needs, local replica first, and
+     * return the newest version among their answers. If a replica fails, the next live replica is
+     * asked in its place. Once every contacted replica has answered, any of them holding an older
+     * version is repaired in the background. Replicas that were not contacted are brought up to
+     * date by hinted handoff and anti-entropy instead.
      *
-     * @param requiredResponses answers needed before returning (1 for ONE, a majority for QUORUM)
+     * @param requiredResponses answers needed (1 for ONE, a majority for QUORUM, all for ALL)
      * @param timeoutMs         how long to wait for enough answers
      */
     public CompletableFuture<RepairResult> readWithRepair(String key, int requiredResponses, long timeoutMs) {
@@ -107,45 +108,106 @@ public class ReadRepairHandler {
             return CompletableFuture.failedFuture(
                     new ConsistencyException("Not enough replicas responded", requiredResponses, 0));
         }
+        // Local replica first: it answers in-process without a network round trip
+        Node local = clusterManager.getLocalNode();
+        replicas.sort(Comparator.comparing(node -> !node.equals(local)));
 
-        CompletableFuture<RepairResult> result = new CompletableFuture<>();
-        List<NodeValue> responses = Collections.synchronizedList(new ArrayList<>());
-        AtomicInteger failures = new AtomicInteger();
-        List<CompletableFuture<Void>> reads = new ArrayList<>();
+        ReadSession session = new ReadSession(key, replicas, requiredResponses);
+        session.start();
+        return session.result.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+    }
 
-        for (Node replica : replicas) {
-            reads.add(CompletableFuture.runAsync(() -> {
-                try {
-                    NodeValue response = readReplica(replica, key);
-                    List<NodeValue> snapshot;
-                    synchronized (responses) {
-                        responses.add(response);
-                        snapshot = new ArrayList<>(responses);
-                    }
-                    if (snapshot.size() >= requiredResponses) {
-                        result.complete(summarize(snapshot));
-                    }
-                } catch (IOException | RuntimeException e) {
-                    logger.debug("Read from {} failed: {}", replica.getId(), e.getMessage());
-                    if (replicas.size() - failures.incrementAndGet() < requiredResponses) {
-                        result.completeExceptionally(new ConsistencyException(
-                                "Not enough replicas responded", requiredResponses, responses.size()));
-                    }
-                }
-            }, executor));
+    /**
+     * State of one read: which replicas have been asked, and their answers.
+     */
+    private final class ReadSession {
+        private final String key;
+        private final List<Node> replicas;
+        private final int required;
+        private final CompletableFuture<RepairResult> result = new CompletableFuture<>();
+        private final List<NodeValue> responses = new ArrayList<>();
+        private int nextReplica;
+        private int outstanding;
+
+        ReadSession(String key, List<Node> replicas, int required) {
+            this.key = key;
+            this.replicas = replicas;
+            this.required = required;
         }
 
-        CompletableFuture.allOf(reads.toArray(new CompletableFuture<?>[0]))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                .whenComplete((ignored, error) -> {
-                    List<NodeValue> all;
-                    synchronized (responses) {
-                        all = new ArrayList<>(responses);
-                    }
-                    repairStale(key, all);
-                });
+        void start() {
+            List<Node> first;
+            synchronized (this) {
+                first = new ArrayList<>(replicas.subList(0, required));
+                nextReplica = required;
+                outstanding = required;
+            }
+            // Send remote reads first, then do any in-process read on this thread meanwhile
+            Node inProcess = null;
+            for (Node replica : first) {
+                if (inProcess == null && replicaIO.isInProcess(replica)) {
+                    inProcess = replica;
+                } else {
+                    submit(replica);
+                }
+            }
+            if (inProcess != null) {
+                read(inProcess);
+            }
+        }
 
-        return result.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+        private void submit(Node replica) {
+            try {
+                executor.execute(() -> read(replica));
+            } catch (RejectedExecutionException e) {
+                read(replica); // shutting down: answer on this thread
+            }
+        }
+
+        private void read(Node replica) {
+            NodeValue response = null;
+            try {
+                response = readReplica(replica, key);
+            } catch (IOException | RuntimeException e) {
+                logger.debug("Read from {} failed: {}", replica.getId(), e.getMessage());
+            }
+
+            Node spare = null;
+            RepairResult complete = null;
+            boolean fail = false;
+            List<NodeValue> finished = null;
+            synchronized (this) {
+                outstanding--;
+                if (response != null) {
+                    responses.add(response);
+                    if (responses.size() == required) {
+                        complete = summarize(new ArrayList<>(responses));
+                    }
+                } else if (nextReplica < replicas.size()) {
+                    spare = replicas.get(nextReplica++);
+                    outstanding++;
+                } else if (responses.size() + outstanding < required) {
+                    fail = true;
+                }
+                if (outstanding == 0) {
+                    finished = new ArrayList<>(responses);
+                }
+            }
+
+            if (complete != null) {
+                result.complete(complete);
+            }
+            if (fail) {
+                result.completeExceptionally(new ConsistencyException(
+                        "Not enough replicas responded", required, responses.size()));
+            }
+            if (spare != null) {
+                submit(spare);
+            }
+            if (finished != null) {
+                repairStale(key, finished);
+            }
+        }
     }
 
     /**

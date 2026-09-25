@@ -19,4 +19,12 @@ public interface ReplicaIO {
      * Write a versioned value (null for a tombstone); the replica keeps whichever version is newer.
      */
     void write(Node replica, String key, byte[] value, long timestamp, long expiresAt) throws IOException;
+
+    /**
+     * Whether calls for this replica are served in-process (no network), so they are cheap enough
+     * to run on the caller's thread.
+     */
+    default boolean isInProcess(Node replica) {
+        return false;
+    }
 }
