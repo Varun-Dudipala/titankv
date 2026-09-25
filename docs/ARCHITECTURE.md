@@ -61,12 +61,21 @@ how many replicas happen to be up.
 
 ### Read (GET / EXISTS)
 
-1. The coordinator queries the key's replicas that are up (the local one in-process).
-2. As soon as enough have answered for the consistency level, it returns the newest version among
-   those answers: highest version, ties broken by comparing values so every coordinator picks the
-   same winner. A tombstone as the newest version means "not found".
-3. When all replicas have answered (or the timeout passes), any replica that returned an older
-   version, or none, is sent the newest one: **read repair**.
+1. The coordinator asks only as many live replicas as the consistency level needs (1, 2 or 3),
+   local replica first, since it answers in-process without a network round trip.
+2. It returns the newest version among those answers: highest version, ties broken by comparing
+   values so every coordinator picks the same winner. A tombstone as the newest version means
+   "not found".
+3. If a contacted replica fails, the next live replica is asked in its place. If one is merely
+   slow (no answer within 50 ms, `TITANKV_SPECULATIVE_RETRY_MS`), a spare replica is asked as well
+   and whichever answers first counts: **speculative retry**, as in Cassandra. A single sweeper
+   thread checks pending reads, so reads that answer quickly pay nothing for it.
+4. Once every contacted replica has answered, any that returned an older version, or none, is sent
+   the newest one: **read repair**. Replicas that were not asked are brought up to date by hinted
+   handoff and anti-entropy instead.
+
+Asking only the replicas needed, rather than all three, is what Cassandra and Dynamo do too. At
+QUORUM it saves a third of the read traffic between nodes.
 
 With QUORUM reads and writes, R + W = 2 + 2 > 3 = N: every read quorum shares a replica with every
 write quorum, so a QUORUM read returns the latest acknowledged QUORUM write.
@@ -149,11 +158,31 @@ selector thread ──► worker pool (max(4, CPUs)) ──► replication pool 
 - **Replica I/O** runs on a separate pool because it uses blocking client sockets. Node-to-node
   clients retry once on a fresh connection if a pooled one turns out to be stale (the peer
   restarted), and do not use the client circuit breaker, since gossip already tracks liveness.
+- **Repair traffic is kept apart.** Hint delivery and Merkle repair use their own small connection
+  pool per peer (2 connections), so a burst of repair after a node restarts cannot make client
+  reads wait for a connection.
 
-This separation fixed a distributed deadlock. Workers used to block while waiting for replica
+Separating workers from replica I/O fixed a distributed deadlock. Workers used to block while waiting for replica
 responses, and those responses (including a node's requests to itself) needed a free worker on the
 same pools. With a handful of concurrent clients every worker was waiting, and requests only
 finished when 5-second timeouts fired.
+
+### Keeping the replicated path cheap
+
+Profiling a 3-node cluster under load (`strace -c`, JFR) showed 93% CPU, 41% of it in the kernel,
+and about 13 system calls per operation, 8 of them `futex` calls from handing work between
+threads. The changes that cut it to about 9 per operation (3 `futex`):
+
+- Reads contact only the replicas the consistency level needs (above).
+- The local replica's write runs on the calling thread when it does not wait for a WAL fsync,
+  instead of being handed to the replication pool.
+- A response is written straight to the socket when nothing is queued ahead of it, instead of
+  registering `OP_WRITE` and waking the selector.
+- Node-to-node reads use the socket's `SO_TIMEOUT` rather than a timer task per read.
+
+Measured by alternating old and new builds on the same machine, this raised 3-node QUORUM
+throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. See
+[benchmark results](../benchmark/results/benchmark_results.md#profiling-the-replicated-path).
 
 ## Membership and failure detection
 

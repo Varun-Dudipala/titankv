@@ -94,6 +94,42 @@ keys from its WAL, and anti-entropy sent it only the 1,045 keys written while it
 
 Per-second numbers are in [`suite/failover.md`](suite/failover.md).
 
+## Profiling the replicated path
+
+Why is one node about 3 times faster than three? Mostly because replication multiplies the work on
+one shared machine. At QUORUM with RF 3, every write is applied on 3 replicas and every read touches
+2, and each replica hop adds a network round trip and a context switch. On this 4-core box all
+three JVMs and the load generator compete for the same cores, so about a third of single-node
+throughput is the expected ceiling. On separate machines each node brings its own cores.
+
+That ceiling was not being reached. Under load the 3-node cluster ran at 93% CPU with 41% in the
+kernel. `strace -c` counted about 13.2 system calls per client operation, 8.2 of them `futex`
+(threads waking each other up to hand work along). Four changes cut this to 8.7 system calls
+per operation, 3.3 of them `futex`:
+
+1. Reads contact only the replicas the consistency level needs, local one first and in-process.
+2. The local replica's write runs on the calling thread when it does not wait for an fsync.
+3. A response is written straight to the socket when nothing is queued ahead of it.
+4. Node-to-node reads use `SO_TIMEOUT` instead of scheduling a timer per read.
+
+Old and new builds alternated on the same machine (2 rounds × 5 runs each, medians):
+
+| Scenario | Before | After | Change |
+|---|---|---|---|
+| 1 node, mixed | 38.5K | 65K | +69% |
+| 3 nodes QUORUM, mixed | 12.2K | 19.4K | +59% |
+| 3 nodes QUORUM, writes | 12.8K | 17.3K | +35% |
+| 3 nodes production, mixed | 8.4K | 10.6K | +26% |
+| 3 nodes production, writes | 3.3K | 4.0K | +21% |
+
+All runs had 0 errors and 0 stale reads. Production-mode writes gain least because they wait for
+fsyncs, not CPU.
+
+Two more changes followed from the failover run, where 1–3 reads timed out just after the killed
+node came back. Hint delivery and Merkle repair were sharing the connection pool with client
+traffic. They now have their own pool, and a read that waits more than 50 ms on a replica also
+asks a spare one (speculative retry). Repeated failover runs since then have had 0 errors.
+
 ## Effect of WAL group commit
 
 Same 3-node production cluster, 16 clients, measured when group commit was introduced:
