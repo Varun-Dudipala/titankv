@@ -28,5 +28,4 @@ if [ "${1:-}" = "--protocol" ]; then
     shift
 fi
 
-# Keep client-side INFO logging out of the results
-exec java -Dlogback.configurationFile=/dev/null -cp "$JAR_FILE:$PROJECT_DIR/target/benchmark" "$MAIN" "$@"
+exec java -cp "$JAR_FILE:$PROJECT_DIR/target/benchmark" "$MAIN" "$@"

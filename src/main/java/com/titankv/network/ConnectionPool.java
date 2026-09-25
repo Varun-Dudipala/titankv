@@ -122,7 +122,7 @@ public class ConnectionPool {
             pool.close();
         }
         hostPools.clear();
-        logger.info("Connection pool closed");
+        logger.debug("Connection pool closed");
     }
 
     /**
