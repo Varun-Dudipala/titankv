@@ -777,6 +777,22 @@ public class ConnectionHandler {
                 return;
             }
 
+            // Fast path: nothing is queued ahead of this response, so write it straight to the
+            // socket. The selector only gets involved if the socket cannot take all of it, which
+            // saves two epoll_ctl calls and a selector wakeup per response.
+            if (!writeInProgress && pendingResponses.isEmpty()) {
+                try {
+                    channel.write(encoded);
+                } catch (IOException e) {
+                    logger.debug("Write to {} failed: {}", clientAddress, e.getMessage());
+                    close();
+                    return;
+                }
+                if (!encoded.hasRemaining()) {
+                    return;
+                }
+            }
+
             pendingResponses.offer(encoded);
 
             // Register write interest if not already in progress

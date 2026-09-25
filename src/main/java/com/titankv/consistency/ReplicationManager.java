@@ -212,8 +212,9 @@ public final class ReplicationManager implements ReplicaIO {
         AtomicInteger failures = new AtomicInteger();
         int allowedFailures = live.size() - required;
 
+        Runnable localWrite = null;
         for (Node replica : live) {
-            executor.execute(() -> {
+            Runnable task = () -> {
                 try {
                     write(replica, key, value, timestamp, expiresAt);
                     if (successes.incrementAndGet() >= required) {
@@ -227,9 +228,29 @@ public final class ReplicationManager implements ReplicaIO {
                                 "Cannot meet consistency level", consistency, required, successes.get()));
                     }
                 }
-            });
+            };
+            if (isLocal(replica) && !localWritesWait()) {
+                localWrite = task;
+            } else {
+                executor.execute(task);
+            }
         }
-        return result.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+        // The local replica is written on this thread, after the remote writes are on their way:
+        // an in-memory update is cheaper than handing it to another thread.
+        if (localWrite != null) {
+            localWrite.run();
+        }
+        // No timer here: every replica call ends within the socket timeout, and the caller bounds
+        // the whole request.
+        return result;
+    }
+
+    /**
+     * Whether a local write can block (it waits for a WAL fsync), in which case it goes to the
+     * replication pool rather than running on the caller's thread.
+     */
+    private boolean localWritesWait() {
+        return localStore instanceof InMemoryStore && ((InMemoryStore) localStore).isWalEnabled();
     }
 
     /**
@@ -318,6 +339,11 @@ public final class ReplicationManager implements ReplicaIO {
         } else {
             client.putInternal(key, value, timestamp, expiresAt);
         }
+    }
+
+    @Override
+    public boolean isInProcess(Node replica) {
+        return isLocal(replica);
     }
 
     private boolean isLocal(Node replica) {
