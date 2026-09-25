@@ -27,6 +27,12 @@ public class ReadRepairHandler {
     private final boolean ownsExecutor;
     private final Map<String, TitanKVClient> ownedClients = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong replicasRepaired = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong speculativeReads = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Reads with a spare replica that may still need a speculative request. */
+    private final Queue<ReadSession> speculationCandidates = new ConcurrentLinkedQueue<>();
+    private final long speculativeRetryNanos = TimeUnit.MILLISECONDS.toNanos(speculativeRetryMs());
+    private final ScheduledExecutorService speculationSweeper;
 
     /**
      * Create a standalone handler with its own threads and authenticated node connections.
@@ -50,6 +56,53 @@ public class ReadRepairHandler {
             t.setDaemon(true);
             return t;
         });
+        if (speculativeRetryNanos > 0) {
+            // One periodic sweep instead of a timer per read, so fast reads pay nothing for it
+            this.speculationSweeper = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "read-speculation");
+                t.setDaemon(true);
+                return t;
+            });
+            long period = Math.max(1, speculativeRetryNanos / 5);
+            speculationSweeper.scheduleAtFixedRate(this::sweepSpeculation, period, period, TimeUnit.NANOSECONDS);
+        } else {
+            this.speculationSweeper = null;
+        }
+    }
+
+    /**
+     * How long a read waits on a slow replica before also asking a spare one (Cassandra's
+     * speculative retry). 0 disables it.
+     */
+    private static long speculativeRetryMs() {
+        String configured = Env.get("TITANKV_SPECULATIVE_RETRY_MS", "titankv.speculative.retry.ms");
+        if (configured == null || configured.isBlank()) {
+            return 50;
+        }
+        try {
+            return Math.max(0, Long.parseLong(configured.trim()));
+        } catch (NumberFormatException e) {
+            logger.warn("Invalid speculative retry delay '{}', using 50 ms", configured);
+            return 50;
+        }
+    }
+
+    private void sweepSpeculation() {
+        long now = System.nanoTime();
+        Iterator<ReadSession> it = speculationCandidates.iterator();
+        while (it.hasNext()) {
+            ReadSession session = it.next();
+            if (session.result.isDone()) {
+                it.remove();
+            } else if (now - session.startedAt >= speculativeRetryNanos) {
+                it.remove();
+                try {
+                    session.speculate();
+                } catch (RuntimeException e) {
+                    logger.debug("Speculative read failed to start: {}", e.getMessage());
+                }
+            }
+        }
     }
 
     /**
@@ -95,7 +148,8 @@ public class ReadRepairHandler {
     /**
      * Read a key from as many replicas as the consistency level needs, local replica first, and
      * return the newest version among their answers. If a replica fails, the next live replica is
-     * asked in its place. Once every contacted replica has answered, any of them holding an older
+     * asked in its place, and if one is slow (TITANKV_SPECULATIVE_RETRY_MS, default 50 ms) a spare
+     * replica is asked as well and whichever answers first counts. Once every contacted replica has answered, any of them holding an older
      * version is repaired in the background. Replicas that were not contacted are brought up to
      * date by hinted handoff and anti-entropy instead.
      *
@@ -114,6 +168,9 @@ public class ReadRepairHandler {
 
         ReadSession session = new ReadSession(key, replicas, requiredResponses);
         session.start();
+        if (speculationSweeper != null && replicas.size() > requiredResponses && !session.result.isDone()) {
+            speculationCandidates.add(session);
+        }
         return session.result.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
@@ -126,6 +183,7 @@ public class ReadRepairHandler {
         private final int required;
         private final CompletableFuture<RepairResult> result = new CompletableFuture<>();
         private final List<NodeValue> responses = new ArrayList<>();
+        private final long startedAt = System.nanoTime();
         private int nextReplica;
         private int outstanding;
 
@@ -154,6 +212,22 @@ public class ReadRepairHandler {
             if (inProcess != null) {
                 read(inProcess);
             }
+        }
+
+        /**
+         * Ask the next spare replica too, because a contacted one is slow to answer.
+         */
+        void speculate() {
+            Node spare;
+            synchronized (this) {
+                if (result.isDone() || nextReplica >= replicas.size()) {
+                    return;
+                }
+                spare = replicas.get(nextReplica++);
+                outstanding++;
+            }
+            speculativeReads.incrementAndGet();
+            submit(spare);
         }
 
         private void submit(Node replica) {
@@ -337,7 +411,17 @@ public class ReadRepairHandler {
         return replicasRepaired.get();
     }
 
+    /**
+     * @return reads that also asked a spare replica because a contacted one was slow
+     */
+    public long getSpeculativeReads() {
+        return speculativeReads.get();
+    }
+
     public void shutdown() {
+        if (speculationSweeper != null) {
+            speculationSweeper.shutdownNow();
+        }
         if (ownsExecutor) {
             executor.shutdown();
             try {

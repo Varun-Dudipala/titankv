@@ -214,6 +214,10 @@ public class TitanKVServer {
                 rm -> rm.getReadRepairHandler().getReplicasRepaired())
                 .description("Stale replica copies repaired by reads")
                 .register(registry);
+        io.micrometer.core.instrument.FunctionCounter.builder("titankv.read.speculative", replicationManager,
+                rm -> rm.getReadRepairHandler().getSpeculativeReads())
+                .description("Reads that also asked a spare replica because one was slow")
+                .register(registry);
         if (replicationManager.getAntiEntropy() != null) {
             io.micrometer.core.instrument.FunctionCounter.builder("titankv.antientropy.keys.synced",
                     replicationManager, rm -> rm.getAntiEntropy().getKeysSynced())

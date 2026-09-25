@@ -209,4 +209,45 @@ class ReadRepairHandlerTest {
             customHandler.shutdown();
         }
     }
+
+    @Test
+    void readWithRepair_slowReplica_speculativelyAsksSpare() throws Exception {
+        for (int i = 1; i <= 2; i++) {
+            Node peer = new Node("peer" + i, "localhost", 19300 + i);
+            peer.setStatus(Node.Status.ALIVE);
+            clusterManager.addNode(peer);
+        }
+        // The local replica (asked first) hangs; the others answer at once
+        ReplicaIO io = new ReplicaIO() {
+            @Override
+            public java.util.Optional<ReplicationManager.ReadResult> read(Node replica, String key) {
+                if (replica.equals(localNode)) {
+                    try {
+                        Thread.sleep(3000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return java.util.Optional.of(new ReplicationManager.ReadResult("v".getBytes(), 42, 0));
+            }
+
+            @Override
+            public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt) {
+            }
+        };
+        ReadRepairHandler speculating = new ReadRepairHandler(clusterManager, 3, io,
+                java.util.concurrent.Executors.newFixedThreadPool(4));
+        try {
+            long start = System.nanoTime();
+            ReadRepairHandler.RepairResult result =
+                    speculating.readWithRepair("key", 1, 2000).get(2, TimeUnit.SECONDS);
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+            assertThat(result.getValue()).isEqualTo("v".getBytes());
+            assertThat(elapsedMs).isLessThan(1000);
+            assertThat(speculating.getSpeculativeReads()).isEqualTo(1);
+        } finally {
+            speculating.shutdown();
+        }
+    }
 }

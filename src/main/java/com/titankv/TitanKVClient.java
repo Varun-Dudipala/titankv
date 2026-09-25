@@ -35,6 +35,8 @@ public class TitanKVClient implements AutoCloseable {
     private static final int CIRCUIT_FAILURE_THRESHOLD = 5;
     // After this long an open breaker lets requests through again, so a recovered node is retried
     private static final long CIRCUIT_RESET_TIMEOUT_MS = 5_000;
+    // Error a node returns while it is (re)joining the cluster; see ConnectionHandler
+    static final String NOT_READY_PREFIX = "Node is joining the cluster";
 
     private final String[] hosts;
     private final ClientConfig config;
@@ -471,7 +473,13 @@ public class TitanKVClient implements AutoCloseable {
             }
             String host = candidates.get(attempt % candidates.size());
             try {
-                return executeOnHost(command, host);
+                Response response = executeOnHost(command, host);
+                if (response.isError() && isNodeNotReady(response)) {
+                    // A restarted node refuses clients until it rejoins; another node can serve this
+                    lastException = new IOException(host + ": " + response.getErrorMessage());
+                    continue;
+                }
+                return response;
             } catch (IOException e) {
                 lastException = e;
                 logger.debug("Request to {} failed (attempt {}/{}): {}", host, attempt + 1, attempts, e.getMessage());
@@ -530,6 +538,11 @@ public class TitanKVClient implements AutoCloseable {
                 throw e;
             }
         }
+    }
+
+    private static boolean isNodeNotReady(Response response) {
+        String message = response.getErrorMessage();
+        return message != null && message.startsWith(NOT_READY_PREFIX);
     }
 
     private void ensureAuthenticated(PooledConnection conn, String host) throws IOException {

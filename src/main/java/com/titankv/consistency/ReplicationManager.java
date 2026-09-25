@@ -36,6 +36,7 @@ public final class ReplicationManager implements ReplicaIO {
     private final int poolSize;
     private final ExecutorService executor;
     private final Map<String, TitanKVClient> nodeClients;
+    private final Map<String, TitanKVClient> backgroundClients = new ConcurrentHashMap<>();
     private final ReadRepairHandler readRepairHandler;
     private final String internalAuthToken;
     private final KVStore localStore;
@@ -120,19 +121,19 @@ public final class ReplicationManager implements ReplicaIO {
         this.nodeClients = new ConcurrentHashMap<>();
         this.internalAuthToken = Env.internalToken();
         this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this, executor);
-        this.hintedHandoff = new HintedHandoff(clusterManager, this, hintsDir);
+        this.hintedHandoff = new HintedHandoff(clusterManager, backgroundIO, hintsDir);
         this.antiEntropy = localStore instanceof InMemoryStore
-                ? new AntiEntropy(clusterManager, (InMemoryStore) localStore, replicationFactor, this,
+                ? new AntiEntropy(clusterManager, (InMemoryStore) localStore, replicationFactor, backgroundIO,
                         new AntiEntropy.PeerTransport() {
                             @Override
                             public byte[] merkleTree(Node peer, byte mode) throws IOException {
-                                return getClient(peer).internalRequest(Command.MERKLE_TREE,
+                                return client(peer, true).internalRequest(Command.MERKLE_TREE,
                                         clusterManager.getLocalNode().getId(), new byte[] {mode});
                             }
 
                             @Override
                             public byte[] merkleLeaf(Node peer, int leaf) throws IOException {
-                                return getClient(peer).internalRequest(Command.MERKLE_LEAF,
+                                return client(peer, true).internalRequest(Command.MERKLE_LEAF,
                                         clusterManager.getLocalNode().getId(),
                                         java.nio.ByteBuffer.allocate(4).putInt(leaf).array());
                             }
@@ -319,27 +320,61 @@ public final class ReplicationManager implements ReplicaIO {
 
     @Override
     public Optional<ReadResult> read(Node replica, String key) throws IOException {
-        if (isLocal(replica)) {
-            Optional<KeyValuePair> entry = localStore.getRaw(key);
-            return entry.map(kv -> new ReadResult(kv.getValue(), kv.getTimestamp(), kv.getExpiresAt()));
-        }
-        return getClient(replica).getInternalWithMetadata(key)
-                .map(m -> new ReadResult(m.getValue(), m.getTimestamp(), m.getExpiresAt()));
+        return read(replica, key, false);
     }
 
     @Override
     public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt) throws IOException {
+        write(replica, key, value, timestamp, expiresAt, false);
+    }
+
+    /**
+     * @param background use the separate, small connection pool for repair traffic (hints,
+     *                   anti-entropy), so it cannot hold up client requests
+     */
+    private Optional<ReadResult> read(Node replica, String key, boolean background) throws IOException {
+        if (isLocal(replica)) {
+            Optional<KeyValuePair> entry = localStore.getRaw(key);
+            return entry.map(kv -> new ReadResult(kv.getValue(), kv.getTimestamp(), kv.getExpiresAt()));
+        }
+        return client(replica, background).getInternalWithMetadata(key)
+                .map(m -> new ReadResult(m.getValue(), m.getTimestamp(), m.getExpiresAt()));
+    }
+
+    private void write(Node replica, String key, byte[] value, long timestamp, long expiresAt, boolean background)
+            throws IOException {
         if (isLocal(replica)) {
             localStore.putIfNewer(key, value, timestamp, expiresAt);
             return;
         }
-        TitanKVClient client = getClient(replica);
+        TitanKVClient client = client(replica, background);
         if (value == null) {
             client.deleteInternal(key, timestamp, expiresAt);
         } else {
             client.putInternal(key, value, timestamp, expiresAt);
         }
     }
+
+    /**
+     * Replica access for background repair (hinted handoff, anti-entropy).
+     */
+    private final ReplicaIO backgroundIO = new ReplicaIO() {
+        @Override
+        public Optional<ReadResult> read(Node replica, String key) throws IOException {
+            return ReplicationManager.this.read(replica, key, true);
+        }
+
+        @Override
+        public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt)
+                throws IOException {
+            ReplicationManager.this.write(replica, key, value, timestamp, expiresAt, true);
+        }
+
+        @Override
+        public boolean isInProcess(Node replica) {
+            return isLocal(replica);
+        }
+    };
 
     @Override
     public boolean isInProcess(Node replica) {
@@ -350,12 +385,15 @@ public final class ReplicationManager implements ReplicaIO {
         return localStore != null && replica.equals(clusterManager.getLocalNode());
     }
 
-    private TitanKVClient getClient(Node node) {
-        return nodeClients.computeIfAbsent(node.getAddress(), addr -> {
+    private TitanKVClient client(Node node, boolean background) {
+        Map<String, TitanKVClient> clients = background ? backgroundClients : nodeClients;
+        // Repair traffic gets at most 2 connections per node, which also throttles it
+        int connections = background ? 2 : poolSize;
+        return clients.computeIfAbsent(node.getAddress(), addr -> {
             ClientConfig config = ClientConfig.builder()
                     .connectTimeoutMs((int) timeoutMs)
                     .readTimeoutMs((int) timeoutMs)
-                    .maxConnectionsPerHost(poolSize)
+                    .maxConnectionsPerHost(connections)
                     .retryOnFailure(false)
                     .circuitBreaker(false)
                     .authToken(internalAuthToken)
@@ -392,6 +430,10 @@ public final class ReplicationManager implements ReplicaIO {
             client.close();
         }
         nodeClients.clear();
+        for (TitanKVClient client : backgroundClients.values()) {
+            client.close();
+        }
+        backgroundClients.clear();
 
         logger.info("Replication manager shutdown complete");
     }
