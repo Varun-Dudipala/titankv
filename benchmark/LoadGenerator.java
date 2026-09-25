@@ -41,6 +41,7 @@ public class LoadGenerator {
     private final LongAdder staleReads = new LongAdder();
     private final LongAdder writes = new LongAdder();
     private final LongAdder errors = new LongAdder();
+    private final LongAdder preloadErrors = new LongAdder();
 
     public LoadGenerator(String[] hosts, int threads, int opsPerThread, int durationSeconds, int warmupOpsPerThread,
             double readRatio, int valueSize, int keysPerThread, boolean retry) {
@@ -75,7 +76,11 @@ public class LoadGenerator {
                 Worker worker = new Worker(thread);
                 try (TitanKVClient client = createClient()) {
                     for (int k = 0; k < keysPerThread; k++) {
-                        worker.write(client, key(thread, k));
+                        try {
+                            worker.write(client, key(thread, k));
+                        } catch (Exception e) {
+                            preloadErrors.increment(); // keep going: a dead thread would stall the barrier
+                        }
                     }
                     start.await();
                     worker.runOps(client, warmupOpsPerThread, null, false);
@@ -88,6 +93,9 @@ public class LoadGenerator {
 
         System.out.println("Preloading " + threads * keysPerThread + " keys...");
         start.await();
+        if (preloadErrors.sum() > 0) {
+            System.out.println("WARNING: " + preloadErrors.sum() + " preload writes failed; those keys may read as misses");
+        }
         System.out.println("Warming up (" + threads * warmupOpsPerThread + " ops)...");
         measured.await();
         long startNanos = System.nanoTime();
