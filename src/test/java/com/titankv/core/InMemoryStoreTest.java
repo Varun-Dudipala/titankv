@@ -1,5 +1,6 @@
 package com.titankv.core;
 
+import com.titankv.util.HybridLogicalClock;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -221,7 +222,7 @@ class InMemoryStoreTest {
         assertThat(store.exists("key1")).isTrue();
 
         // Write tombstone with newer timestamp
-        long timestamp = System.currentTimeMillis() + 100;
+        long timestamp = HybridLogicalClock.encode(System.currentTimeMillis() + 100);
         boolean written = store.putIfNewer("key1", null, timestamp, 0);
 
         assertThat(written).isTrue();

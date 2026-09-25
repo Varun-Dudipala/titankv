@@ -39,6 +39,9 @@ public class TitanKVClient implements AutoCloseable {
     private final ConnectionPool connectionPool;
     private final ConsistentHash hashRing;
     private volatile boolean closed = false;
+    // Newest version timestamp this client has read or written; sent with every write so the
+    // write is ordered after it even if the coordinating node's clock is behind.
+    private final AtomicLong causalContext = new AtomicLong();
 
     // Circuit breaker state per host
     private final Map<String, CircuitBreaker> circuitBreakers = new ConcurrentHashMap<>();
@@ -159,6 +162,7 @@ public class TitanKVClient implements AutoCloseable {
     public Optional<ValueWithMetadata> getWithMetadata(String key) throws IOException {
         validateKey(key);
         Response response = execute(Command.get(key), key);
+        observe(response);
 
         if (response.isOk()) {
             return Optional.of(new ValueWithMetadata(
@@ -205,12 +209,7 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public void put(String key, byte[] value) throws IOException {
-        validateKey(key);
-        Response response = execute(Command.put(key, value), key);
-
-        if (response.isError()) {
-            throw new IOException("Server error: " + response.getErrorMessage());
-        }
+        put(key, value, 0);
     }
 
     /**
@@ -224,10 +223,11 @@ public class TitanKVClient implements AutoCloseable {
         if (ttlMillis < 0) {
             throw new IllegalArgumentException("ttlMillis must not be negative");
         }
-        Response response = execute(Command.put(key, value, ttlMillis), key);
+        Response response = execute(new Command(Command.PUT, key, value, causalContext.get(), ttlMillis), key);
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
+        observe(response);
     }
 
     /**
@@ -249,10 +249,29 @@ public class TitanKVClient implements AutoCloseable {
      */
     public void delete(String key) throws IOException {
         validateKey(key);
-        Response response = execute(Command.delete(key), key);
+        Response response = execute(new Command(Command.DELETE, key, null, causalContext.get(), 0), key);
 
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        observe(response);
+    }
+
+    /**
+     * The newest version timestamp this client has seen. Another client (or process) can pass it to
+     * {@link #observeCausalContext(long)} so its writes are ordered after everything this one saw.
+     */
+    public long getCausalContext() {
+        return causalContext.get();
+    }
+
+    public void observeCausalContext(long timestamp) {
+        causalContext.accumulateAndGet(timestamp, Math::max);
+    }
+
+    private void observe(Response response) {
+        if (response.isOk() && response.getTimestamp() > 0) {
+            causalContext.accumulateAndGet(response.getTimestamp(), Math::max);
         }
     }
 

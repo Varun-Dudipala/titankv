@@ -1,5 +1,6 @@
 package com.titankv.cluster;
 
+import com.titankv.util.HybridLogicalClock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,6 +25,7 @@ public class ClusterManager {
     private final ScheduledExecutorService scheduler;
     private final String clusterSecret;
     private final Map<String, Long> departedGenerations = new ConcurrentHashMap<>();
+    private final HybridLogicalClock clock = new HybridLogicalClock();
 
     private GossipProtocol gossipProtocol;
     private volatile boolean running;
@@ -382,6 +384,13 @@ public class ClusterManager {
                 logger.error("Error in event listener", e);
             }
         }
+    }
+
+    /**
+     * This node's clock for versioning writes.
+     */
+    public HybridLogicalClock getClock() {
+        return clock;
     }
 
     /**

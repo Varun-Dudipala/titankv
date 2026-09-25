@@ -2,6 +2,7 @@ package com.titankv.core;
 
 import com.titankv.network.protocol.BinaryProtocol;
 import com.titankv.util.Env;
+import com.titankv.util.HybridLogicalClock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -442,7 +443,7 @@ public class InMemoryStore implements KVStore {
     public Optional<KeyValuePair> put(String key, byte[] value, long ttlMillis) {
         validateKey(key);
         long now = System.currentTimeMillis();
-        KeyValuePair entry = new KeyValuePair(value, now, ttlMillis > 0 ? now + ttlMillis : 0);
+        KeyValuePair entry = new KeyValuePair(value, HybridLogicalClock.encode(now), ttlMillis > 0 ? now + ttlMillis : 0);
         ensureCapacity(key, entry);
         return mutate(() -> {
             KeyValuePair[] previous = new KeyValuePair[1];
@@ -651,7 +652,8 @@ public class InMemoryStore implements KVStore {
         int removed = 0;
         for (var entry : store.entrySet()) {
             KeyValuePair value = entry.getValue();
-            boolean purge = value.isExpired() || (value.isTombstone() && value.getTimestamp() < tombstoneCutoff);
+            boolean purge = value.isExpired()
+                    || (value.isTombstone() && HybridLogicalClock.physicalMillis(value.getTimestamp()) < tombstoneCutoff);
             if (purge && store.remove(entry.getKey(), value)) {
                 adjustMemory(entry.getKey(), value, null);
                 removed++;

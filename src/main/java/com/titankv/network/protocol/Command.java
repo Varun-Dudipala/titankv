@@ -74,7 +74,8 @@ public final class Command {
     /**
      * Create a PUT command with a time-to-live. For client PUTs the expires field carries the TTL
      * in milliseconds and the server converts it to an absolute time with its own clock, so client
-     * clock skew does not affect expiry.
+     * clock skew does not affect expiry. The timestamp field of a client PUT or DELETE is optional
+     * causal context: the newest version timestamp the client has seen.
      */
     public static Command put(String key, byte[] value, long ttlMillis) {
         return new Command(PUT, key, value, 0, ttlMillis);
