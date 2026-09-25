@@ -35,6 +35,7 @@ class ReadRepairTest {
     @Test
     void replicaMissingAValueIsRepairedByARead() throws Exception {
         client.put("repair-missing", "value");
+        cluster.awaitReplicated("repair-missing");
         KVStore replica = cluster.node(2).getStore();
         replica.delete("repair-missing"); // local-only removal: this replica lost the write
 
@@ -46,8 +47,11 @@ class ReadRepairTest {
     @Test
     void staleValueDoesNotResurrectADeletedKey() throws Exception {
         client.put("repair-deleted", "old");
+        cluster.awaitReplicated("repair-deleted");
         KeyValuePair oldVersion = cluster.node(2).getStore().getRaw("repair-deleted").orElseThrow();
         client.delete("repair-deleted");
+        TestCluster.awaitCondition(() -> cluster.node(2).getStore().getRaw("repair-deleted")
+                .map(KeyValuePair::isTombstone).orElse(false), 5_000, "tombstone to reach node 3");
 
         // Roll one replica back to the pre-delete value, as if it had missed the delete
         KVStore replica = cluster.node(2).getStore();
@@ -64,6 +68,9 @@ class ReadRepairTest {
     void newerWriteWinsOverOlderReplicaVersion() throws Exception {
         client.put("repair-newest", "v1");
         client.put("repair-newest", "v2");
+        TestCluster.awaitCondition(() -> cluster.node(1).getStore().get("repair-newest")
+                .map(kv -> new String(kv.getValueUnsafe(), StandardCharsets.UTF_8).equals("v2")).orElse(false),
+                5_000, "v2 to reach node 2");
         KVStore replica = cluster.node(1).getStore();
         long newest = replica.getRaw("repair-newest").orElseThrow().getTimestamp();
         replica.delete("repair-newest");

@@ -328,6 +328,21 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
+     * Send a node-to-node command addressed to this client's first host and return the response
+     * value. Used for anti-entropy requests, which are not routed by key.
+     *
+     * @throws IOException if the request fails or the server returns an error
+     */
+    public byte[] internalRequest(byte type, String senderId, byte[] args) throws IOException {
+        ensureOpen();
+        Response response = executeOnHost(new Command(type, senderId, args), Node.fromAddress(hosts[0]).getAddress());
+        if (!response.isOk()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        return response.getValue();
+    }
+
+    /**
      * Get a value from local store only (internal replication, no cascade).
      * This method is used by ReplicationManager to prevent read recursion.
      *

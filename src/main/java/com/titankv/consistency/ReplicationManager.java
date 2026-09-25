@@ -4,7 +4,9 @@ import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.core.InMemoryStore;
 import com.titankv.core.KVStore;
+import com.titankv.network.protocol.Command;
 import com.titankv.core.KeyValuePair;
 import com.titankv.util.Env;
 import org.slf4j.Logger;
@@ -38,6 +40,7 @@ public final class ReplicationManager implements ReplicaIO {
     private final String internalAuthToken;
     private final KVStore localStore;
     private final HintedHandoff hintedHandoff;
+    private final AntiEntropy antiEntropy;
 
     /**
      * Read result with value metadata. A null value with a non-zero timestamp is a tombstone.
@@ -118,6 +121,43 @@ public final class ReplicationManager implements ReplicaIO {
         this.internalAuthToken = Env.internalToken();
         this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this, executor);
         this.hintedHandoff = new HintedHandoff(clusterManager, this, hintsDir);
+        this.antiEntropy = localStore instanceof InMemoryStore
+                ? new AntiEntropy(clusterManager, (InMemoryStore) localStore, replicationFactor, this,
+                        new AntiEntropy.PeerTransport() {
+                            @Override
+                            public byte[] merkleTree(Node peer, byte mode) throws IOException {
+                                return getClient(peer).internalRequest(Command.MERKLE_TREE,
+                                        clusterManager.getLocalNode().getId(), new byte[] {mode});
+                            }
+
+                            @Override
+                            public byte[] merkleLeaf(Node peer, int leaf) throws IOException {
+                                return getClient(peer).internalRequest(Command.MERKLE_LEAF,
+                                        clusterManager.getLocalNode().getId(),
+                                        java.nio.ByteBuffer.allocate(4).putInt(leaf).array());
+                            }
+                        },
+                        antiEntropyIntervalMs())
+                : null;
+    }
+
+    private static long antiEntropyIntervalMs() {
+        String configured = Env.get("TITANKV_ANTI_ENTROPY_INTERVAL_MS", "titankv.anti.entropy.interval.ms");
+        if (configured != null) {
+            try {
+                return Long.parseLong(configured.trim());
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid TITANKV_ANTI_ENTROPY_INTERVAL_MS {}, using 60000", configured);
+            }
+        }
+        return 60_000;
+    }
+
+    /**
+     * @return Merkle-tree repair with other replicas, or null if there is no local InMemoryStore
+     */
+    public AntiEntropy getAntiEntropy() {
+        return antiEntropy;
     }
 
     /**
@@ -265,6 +305,9 @@ public final class ReplicationManager implements ReplicaIO {
     }
 
     public void shutdown() {
+        if (antiEntropy != null) {
+            antiEntropy.shutdown();
+        }
         hintedHandoff.shutdown();
         readRepairHandler.shutdown();
         executor.shutdown();

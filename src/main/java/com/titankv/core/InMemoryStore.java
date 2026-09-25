@@ -537,6 +537,17 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
+     * Visit every unexpired entry, tombstones included. Weakly consistent with concurrent writes.
+     */
+    public void forEachEntry(java.util.function.BiConsumer<String, KeyValuePair> action) {
+        store.forEach((key, value) -> {
+            if (!value.isExpired()) {
+                action.accept(key, value);
+            }
+        });
+    }
+
+    /**
      * All unexpired keys, including deleted keys whose tombstones are still retained.
      */
     public Set<String> keysIncludingTombstones() {

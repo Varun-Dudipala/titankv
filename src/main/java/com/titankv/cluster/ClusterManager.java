@@ -27,6 +27,7 @@ public class ClusterManager {
 
     private GossipProtocol gossipProtocol;
     private volatile boolean running;
+    private volatile boolean seedsConfigured;
 
     /**
      * Create a new cluster manager.
@@ -126,6 +127,7 @@ public class ClusterManager {
                 }
             }
         }
+        seedsConfigured = !seeds.isEmpty();
         gossipProtocol.setSeeds(seeds);
         gossipProtocol.start();
 
@@ -380,6 +382,15 @@ public class ClusterManager {
                 logger.error("Error in event listener", e);
             }
         }
+    }
+
+    /**
+     * Whether this node may serve client requests. A node started with seeds belongs to a cluster,
+     * so until it has found another member it must not act as a one-node cluster: it would accept
+     * writes with a single copy and serve reads that miss data held by the rest of the cluster.
+     */
+    public boolean isReady() {
+        return running && (!seedsConfigured || nodes.size() > 1);
     }
 
     /**

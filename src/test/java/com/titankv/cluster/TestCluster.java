@@ -24,14 +24,26 @@ public final class TestCluster implements AutoCloseable {
         TestCluster cluster = new TestCluster(basePort);
         for (int i = 0; i < size; i++) {
             cluster.servers.add(null);
+        }
+        for (int i = 0; i < size; i++) {
             cluster.startNode(i);
         }
         cluster.awaitConverged(20_000);
         return cluster;
     }
 
+    /**
+     * Start (or restart) a node. Like a real deployment, every node lists the others as seeds, so a
+     * restarted node rejoins the cluster instead of starting a cluster of its own.
+     */
     public TitanKVServer startNode(int index) throws Exception {
-        String seeds = index == 0 ? null : "localhost:" + basePort;
+        List<String> others = new ArrayList<>();
+        for (int i = 0; i < servers.size(); i++) {
+            if (i != index) {
+                others.add("localhost:" + (basePort + i));
+            }
+        }
+        String seeds = others.isEmpty() ? null : String.join(",", others);
         TitanKVServer server = new TitanKVServer(basePort + index, "node-" + (index + 1), seeds);
         server.start();
         servers.set(index, server);
@@ -88,6 +100,15 @@ public final class TestCluster implements AutoCloseable {
                 .retryOnFailure(true)
                 .build();
         return new TitanKVClient(config, hosts);
+    }
+
+    /**
+     * Wait until every node holds a version of the key (tombstones count). A QUORUM write returns
+     * before the last replica has applied it, so tests that inspect a replica directly wait first.
+     */
+    public void awaitReplicated(String key) {
+        awaitCondition(() -> servers.stream().allMatch(s -> s.getStore().getRaw(key).isPresent()),
+                5_000, key + " to reach every replica");
     }
 
     public void awaitConverged(long timeoutMs) {
