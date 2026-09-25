@@ -267,8 +267,9 @@ public class ClusterManager {
                 fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_SUSPECT, node));
                 logger.warn("Node {} is suspect (no heartbeat for {}ms)", node.getId(), elapsed);
             } else if (node.getStatus() == Node.Status.SUSPECT && elapsed > DEAD_THRESHOLD_MS) {
+                // Stays on the ring: its keys keep the same replicas, and writes meant for it
+                // are kept as hints until it returns.
                 node.setStatus(Node.Status.DEAD);
-                hashRing.removeNode(node);
                 fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_DEAD, node));
                 logger.error("Node {} is dead (no heartbeat for {}ms)", node.getId(), elapsed);
             }
@@ -294,6 +295,23 @@ public class ClusterManager {
      */
     public List<Node> getNodesForKey(String key, int count) {
         return hashRing.getNodes(key, count);
+    }
+
+    /**
+     * The key's replicas, including ones that are currently down. Dead nodes stay on the ring
+     * until they leave, so this set is stable across failures.
+     */
+    public List<Node> getReplicasForKey(String key, int count) {
+        return hashRing.getReplicas(key, count);
+    }
+
+    /**
+     * Called by gossip when a known node reports a newer generation, meaning its process restarted
+     * and may have lost data that was not on disk.
+     */
+    public void nodeRestarted(Node node) {
+        fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_RESTARTED, node));
+        logger.info("Node {} restarted", node.getId());
     }
 
     /**
@@ -380,7 +398,8 @@ public class ClusterManager {
             NODE_LEFT,
             NODE_SUSPECT,
             NODE_DEAD,
-            NODE_RECOVERED
+            NODE_RECOVERED,
+            NODE_RESTARTED
         }
 
         private final Type type;

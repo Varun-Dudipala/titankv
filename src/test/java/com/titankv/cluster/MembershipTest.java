@@ -27,7 +27,7 @@ class MembershipTest {
     void crashedNodeIsDetectedDeadAndRecoversAfterRestart() throws Exception {
         try (TestCluster cluster = TestCluster.start(BASE_PORT + 10, 4)) {
             String crashedId = cluster.node(3).getNodeId();
-            simulateCrash(cluster, 3);
+            cluster.crashNode(3);
 
             TestCluster.awaitCondition(() -> allOthersSee(cluster, 3, crashedId, Node.Status.DEAD),
                     20_000, "surviving nodes to mark " + crashedId + " DEAD");
@@ -54,20 +54,6 @@ class MembershipTest {
             assertThat(cluster.node(0).getClusterManager().getNode(leftId)).isNull();
             assertThat(cluster.node(1).getClusterManager().getNode(leftId)).isNull();
         }
-    }
-
-    /**
-     * Stop the node's gossip without the LEAVE broadcast a graceful shutdown sends, so the
-     * others have to detect the failure from missing heartbeats.
-     */
-    private static void simulateCrash(TestCluster cluster, int index) {
-        ClusterManager crashed = cluster.node(index).getClusterManager();
-        for (Node peer : crashed.getAllNodes()) {
-            if (!peer.equals(crashed.getLocalNode())) {
-                crashed.removeNode(peer);
-            }
-        }
-        cluster.stopNode(index);
     }
 
     private static boolean allOthersSee(TestCluster cluster, int excluded, String nodeId, Node.Status status) {

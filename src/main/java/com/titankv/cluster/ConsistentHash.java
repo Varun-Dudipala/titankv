@@ -146,6 +146,17 @@ public class ConsistentHash {
     }
 
     /**
+     * The key's replicas: the first {@code count} distinct nodes clockwise from the key's hash,
+     * whether or not they are currently available. This set only changes when nodes join or leave
+     * the ring, so a key keeps the same replicas through failures (strict quorum).
+     *
+     * @throws IllegalStateException if no nodes are in the ring
+     */
+    public List<Node> getReplicas(String key, int count) {
+        return walk(key, count, false);
+    }
+
+    /**
      * Get N distinct nodes for replication.
      * Walks clockwise around the ring, collecting distinct physical nodes.
      *
@@ -155,6 +166,10 @@ public class ConsistentHash {
      * @throws IllegalStateException if no nodes are in the ring
      */
     public List<Node> getNodes(String key, int count) {
+        return walk(key, count, true);
+    }
+
+    private List<Node> walk(String key, int count, boolean availableOnly) {
         lock.readLock().lock();
         try {
             if (ring.isEmpty()) {
@@ -170,7 +185,7 @@ public class ConsistentHash {
             // Walk from hash position to end of ring
             for (VirtualNode vnode : tailMap.values()) {
                 Node node = vnode.getPhysicalNode();
-                if (!seen.contains(node) && node.isAvailable()) {
+                if (!seen.contains(node) && (!availableOnly || node.isAvailable())) {
                     seen.add(node);
                     result.add(node);
                     if (result.size() >= count) {
@@ -182,7 +197,7 @@ public class ConsistentHash {
             // Wrap around from beginning of ring
             for (VirtualNode vnode : ring.values()) {
                 Node node = vnode.getPhysicalNode();
-                if (!seen.contains(node) && node.isAvailable()) {
+                if (!seen.contains(node) && (!availableOnly || node.isAvailable())) {
                     seen.add(node);
                     result.add(node);
                     if (result.size() >= count) {

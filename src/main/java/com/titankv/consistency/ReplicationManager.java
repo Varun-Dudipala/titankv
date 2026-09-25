@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -36,6 +37,7 @@ public final class ReplicationManager implements ReplicaIO {
     private final ReadRepairHandler readRepairHandler;
     private final String internalAuthToken;
     private final KVStore localStore;
+    private final HintedHandoff hintedHandoff;
 
     /**
      * Read result with value metadata. A null value with a non-zero timestamp is a tombstone.
@@ -65,23 +67,24 @@ public final class ReplicationManager implements ReplicaIO {
     }
 
     public ReplicationManager(ClusterManager clusterManager) {
-        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS, null);
+        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS, null, null);
     }
 
-    public ReplicationManager(ClusterManager clusterManager, KVStore localStore) {
-        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS, localStore);
+    public ReplicationManager(ClusterManager clusterManager, KVStore localStore, Path hintsDir) {
+        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS, localStore, hintsDir);
     }
 
     public ReplicationManager(ClusterManager clusterManager, int replicationFactor, long timeoutMs) {
-        this(clusterManager, replicationFactor, timeoutMs, null);
+        this(clusterManager, replicationFactor, timeoutMs, null, null);
     }
 
     /**
      * @param localStore this node's store; the local replica is read and written directly
      *                   instead of over the network. Null sends every replica request over TCP.
+     * @param hintsDir   where to persist hints for unreachable replicas, or null for memory only
      */
     public ReplicationManager(ClusterManager clusterManager, int replicationFactor, long timeoutMs,
-            KVStore localStore) {
+            KVStore localStore, Path hintsDir) {
         this.clusterManager = clusterManager;
         this.replicationFactor = replicationFactor;
         this.timeoutMs = timeoutMs;
@@ -114,6 +117,7 @@ public final class ReplicationManager implements ReplicaIO {
         this.nodeClients = new ConcurrentHashMap<>();
         this.internalAuthToken = Env.internalToken();
         this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this, executor);
+        this.hintedHandoff = new HintedHandoff(clusterManager, this, hintsDir);
     }
 
     /**
@@ -126,14 +130,15 @@ public final class ReplicationManager implements ReplicaIO {
     }
 
     /**
-     * Write to replicas with the specified consistency level.
+     * Write to the key's replicas and complete once the consistency level is met.
      *
-     * @return future that completes when the consistency level is met
+     * The replica set is fixed (strict quorum): replicas that are down are not replaced by other
+     * nodes. They get a hint instead, as does any replica whose write fails, and hints never count
+     * toward the consistency level.
      */
     public CompletableFuture<Boolean> write(String key, byte[] value, long timestamp, long expiresAt,
             ConsistencyLevel consistency) {
-        return replicate(key, consistency, "Write",
-                replica -> write(replica, key, value, timestamp, expiresAt));
+        return replicate(key, value, timestamp, expiresAt, consistency, "Write");
     }
 
     /**
@@ -142,37 +147,41 @@ public final class ReplicationManager implements ReplicaIO {
      */
     public CompletableFuture<Boolean> delete(String key, long timestamp, long expiresAt,
             ConsistencyLevel consistency) {
-        return replicate(key, consistency, "Delete",
-                replica -> write(replica, key, null, timestamp, expiresAt));
+        return replicate(key, null, timestamp, expiresAt, consistency, "Delete");
     }
 
-    private interface ReplicaOperation {
-        void apply(Node replica) throws IOException;
-    }
-
-    private CompletableFuture<Boolean> replicate(String key, ConsistencyLevel consistency, String name,
-            ReplicaOperation operation) {
+    private CompletableFuture<Boolean> replicate(String key, byte[] value, long timestamp, long expiresAt,
+            ConsistencyLevel consistency, String name) {
         int required = consistency.getRequired(effectiveReplicationFactor());
-        List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
-        if (replicas.size() < required) {
+        List<Node> replicas = clusterManager.getReplicasForKey(key, replicationFactor);
+        List<Node> live = new ArrayList<>();
+        List<Node> down = new ArrayList<>();
+        for (Node replica : replicas) {
+            (replica.isAvailable() ? live : down).add(replica);
+        }
+        if (live.size() < required) {
             return CompletableFuture.failedFuture(new ConsistencyException(
-                    "Not enough replicas available", consistency, required, replicas.size()));
+                    "Not enough replicas available", consistency, required, live.size()));
+        }
+        for (Node replica : down) {
+            hintedHandoff.store(replica, key, value, timestamp, expiresAt);
         }
 
         CompletableFuture<Boolean> result = new CompletableFuture<>();
         AtomicInteger successes = new AtomicInteger();
         AtomicInteger failures = new AtomicInteger();
-        int allowedFailures = replicas.size() - required;
+        int allowedFailures = live.size() - required;
 
-        for (Node replica : replicas) {
+        for (Node replica : live) {
             executor.execute(() -> {
                 try {
-                    operation.apply(replica);
+                    write(replica, key, value, timestamp, expiresAt);
                     if (successes.incrementAndGet() >= required) {
                         result.complete(true);
                     }
                 } catch (IOException | RuntimeException e) {
-                    logger.warn("{} to {} failed: {}", name, replica.getId(), e.getMessage());
+                    logger.warn("{} to {} failed, storing hint: {}", name, replica.getId(), e.getMessage());
+                    hintedHandoff.store(replica, key, value, timestamp, expiresAt);
                     if (failures.incrementAndGet() > allowedFailures) {
                         result.completeExceptionally(new ConsistencyException(
                                 "Cannot meet consistency level", consistency, required, successes.get()));
@@ -181,6 +190,13 @@ public final class ReplicationManager implements ReplicaIO {
             });
         }
         return result.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * @return hints this node holds for replicas that missed writes, per target node id
+     */
+    public HintedHandoff getHintedHandoff() {
+        return hintedHandoff;
     }
 
     /**
@@ -237,6 +253,7 @@ public final class ReplicationManager implements ReplicaIO {
                     .readTimeoutMs((int) timeoutMs)
                     .maxConnectionsPerHost(poolSize)
                     .retryOnFailure(false)
+                    .circuitBreaker(false)
                     .authToken(internalAuthToken)
                     .build();
             return new TitanKVClient(config, addr);
@@ -248,6 +265,7 @@ public final class ReplicationManager implements ReplicaIO {
     }
 
     public void shutdown() {
+        hintedHandoff.shutdown();
         readRepairHandler.shutdown();
         executor.shutdown();
         try {
