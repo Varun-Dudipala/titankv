@@ -222,6 +222,43 @@ public class ClusterManager {
     }
 
     /**
+     * Permanently remove a dead node from the cluster (like Cassandra's removenode), on this node
+     * and, through gossip, on every other node. Its keys move to other replicas, which
+     * anti-entropy then fills in.
+     *
+     * @return null on success, otherwise why the node cannot be removed
+     */
+    public String removeDeadNode(String nodeId) {
+        Node node = nodes.get(nodeId);
+        if (node == null) {
+            return "Unknown node " + nodeId;
+        }
+        if (node.equals(localNode)) {
+            return "A node cannot remove itself; stop it to leave the cluster";
+        }
+        if (node.getStatus() != Node.Status.DEAD) {
+            return "Node " + nodeId + " is " + node.getStatus() + "; only DEAD nodes can be removed";
+        }
+        removeNode(node);
+        if (gossipProtocol != null) {
+            gossipProtocol.broadcastRemoval(node);
+        }
+        return null;
+    }
+
+    /**
+     * Apply a removal gossiped by another node. The generation is remembered even if the node is
+     * unknown here, so stale gossip about it is ignored.
+     */
+    void markRemoved(String nodeId, long generation) {
+        Node node = nodes.get(nodeId);
+        if (node != null && node.getGeneration() <= generation) {
+            removeNode(node);
+        }
+        departedGenerations.merge(nodeId, generation, Math::max);
+    }
+
+    /**
      * Whether a node with this id left the cluster gracefully and this generation of it
      * should not be re-added from stale gossip.
      */
