@@ -29,7 +29,7 @@ reports the median, the min–max range, and the spread (half the range as a sha
 ./scripts/benchmark-failover.sh     # the node-failure run
 ```
 
-Raw logs and per-run CSV are in [`suite/`](suite/).
+Every run's numbers are in [`suite/summary.csv`](suite/summary.csv).
 
 ## Results
 

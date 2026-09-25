@@ -126,7 +126,7 @@ With replication factor 3:
 | Failure | What happens |
 |---|---|
 | A node crashes | Marked SUSPECT after 3s, DEAD after 10s. QUORUM continues on the other 2 replicas; writes it misses become hints on the coordinator. |
-| It comes back | Gossip sees a newer heartbeat; hints are delivered; if the process restarted, peers also stream it their keys; read repair and anti-entropy fix anything left. |
+| It comes back | Gossip sees a newer heartbeat and hints are delivered; if the process restarted, an immediate Merkle-tree repair sends it only the keys it is missing; read repair fixes anything else it serves. |
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
 | A node is gone for good | `removenode <id>` drops it cluster-wide; anti-entropy re-replicates its keys to their new replicas. |
 | A restarted node has not found the cluster yet | It rejects client requests (`/ready` is 503) rather than acting as a one-node cluster. |
