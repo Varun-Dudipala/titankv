@@ -425,7 +425,8 @@ public class ConnectionHandler {
         if (authError != null) {
             return done(authError);
         }
-        if (!isInternalCommand(command.getType()) && command.getType() != Command.PING
+        byte type = command.getType();
+        if (!isInternalCommand(type) && type != Command.PING && type != Command.STATUS
                 && clusterManager != null && !clusterManager.isReady()) {
             return done(Response.error("Node is joining the cluster; retry on another node"));
         }
@@ -449,6 +450,10 @@ public class ConnectionHandler {
                 return done(handleMerkle(command));
             case Command.PING:
                 return done(Response.pong());
+            case Command.STATUS:
+                return done(handleStatus());
+            case Command.REMOVE_NODE:
+                return done(handleRemoveNode(command));
             case Command.KEYS:
                 return done(Response.error("KEYS command is disabled in distributed mode for performance reasons"));
             default:
@@ -594,6 +599,33 @@ public class ConnectionHandler {
                 ? antiEntropy.handleTreeRequest(command.getKey(), buffer.get())
                 : antiEntropy.handleLeafRequest(command.getKey(), buffer.getInt());
         return Response.ok(result);
+    }
+
+    /**
+     * One line per cluster member: id, status, address, and seconds since it was last heard from.
+     */
+    private Response handleStatus() {
+        if (clusterManager == null) {
+            return Response.ok("single node, no cluster manager\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        StringBuilder sb = new StringBuilder();
+        long now = System.currentTimeMillis();
+        java.util.List<com.titankv.cluster.Node> members = new java.util.ArrayList<>(clusterManager.getAllNodes());
+        members.sort(java.util.Comparator.comparing(com.titankv.cluster.Node::getId));
+        for (com.titankv.cluster.Node node : members) {
+            boolean local = node.equals(clusterManager.getLocalNode());
+            sb.append(String.format("%-24s %-8s %-24s %s%n", node.getId(), node.getStatus(), node.getAddress(),
+                    local ? "(this node)" : String.format("last heard %.1fs ago", (now - node.getLastHeartbeat()) / 1000.0)));
+        }
+        return Response.ok(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private Response handleRemoveNode(Command command) {
+        if (clusterManager == null || command.getKey() == null) {
+            return Response.error("REMOVE_NODE requires a cluster and a node id");
+        }
+        String error = clusterManager.removeDeadNode(command.getKey());
+        return error == null ? Response.ok() : Response.error(error);
     }
 
     private CompletableFuture<Response> handlePut(Command command) {

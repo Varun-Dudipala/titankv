@@ -347,8 +347,24 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Send a node-to-node command addressed to this client's first host and return the response
-     * value. Used for anti-entropy requests, which are not routed by key.
+     * Cluster membership as seen by this client's first host: one line per node.
+     */
+    public String clusterStatus() throws IOException {
+        byte[] status = internalRequest(Command.STATUS, null, null);
+        return status != null ? new String(status, StandardCharsets.UTF_8) : "";
+    }
+
+    /**
+     * Permanently remove a DEAD node from the cluster. Its data is re-replicated to the new
+     * replicas by anti-entropy.
+     */
+    public void removeClusterNode(String nodeId) throws IOException {
+        internalRequest(Command.REMOVE_NODE, nodeId, null);
+    }
+
+    /**
+     * Send a command to this client's first host, without key routing, and return the response
+     * value. Used for cluster status, admin commands and node-to-node anti-entropy requests.
      *
      * @throws IOException if the request fails or the server returns an error
      */
@@ -626,68 +642,9 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Command-line interface for testing.
+     * Command-line interface; see {@link com.titankv.cli.TitanKVCli}.
      */
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.out.println("Usage: TitanKVClient <host:port> [command] [args...]");
-            System.out.println("Commands:");
-            System.out.println("  get <key>           - Get a value");
-            System.out.println("  put <key> <value>   - Store a value");
-            System.out.println("  delete <key>        - Delete a value");
-            System.out.println("  ping                - Ping the server");
-            return;
-        }
-
-        String host = args[0];
-
-        try (TitanKVClient client = new TitanKVClient(host)) {
-            if (args.length == 1 || args[1].equals("ping")) {
-                boolean ok = client.ping();
-                System.out.println(ok ? "PONG" : "Connection failed");
-                return;
-            }
-
-            String command = args[1];
-
-            switch (command.toLowerCase()) {
-                case "get":
-                    if (args.length < 3) {
-                        System.out.println("Usage: get <key>");
-                        return;
-                    }
-                    Optional<String> value = client.getString(args[2]);
-                    if (value.isPresent()) {
-                        System.out.println(value.get());
-                    } else {
-                        System.out.println("(nil)");
-                    }
-                    break;
-
-                case "put":
-                    if (args.length < 4) {
-                        System.out.println("Usage: put <key> <value>");
-                        return;
-                    }
-                    client.put(args[2], args[3]);
-                    System.out.println("OK");
-                    break;
-
-                case "delete":
-                    if (args.length < 3) {
-                        System.out.println("Usage: delete <key>");
-                        return;
-                    }
-                    client.delete(args[2]);
-                    System.out.println("OK");
-                    break;
-
-                default:
-                    System.out.println("Unknown command: " + command);
-            }
-        } catch (IOException e) {
-            System.err.println("Error: " + e.getMessage());
-            System.exit(1);
-        }
+        com.titankv.cli.TitanKVCli.main(args);
     }
 }

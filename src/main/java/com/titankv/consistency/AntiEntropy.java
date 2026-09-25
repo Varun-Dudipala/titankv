@@ -86,6 +86,25 @@ public final class AntiEntropy {
             scheduler.scheduleWithFixedDelay(this::repairWithRandomPeer, intervalMs, intervalMs,
                     TimeUnit.MILLISECONDS);
         }
+        // When a node leaves or is removed, its keys gain new replicas that have none of the data:
+        // repair with every peer right away instead of waiting for the periodic rounds.
+        clusterManager.addEventListener(event -> {
+            if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_LEFT) {
+                scheduler.schedule(this::repairWithAllPeers, 2, TimeUnit.SECONDS);
+            }
+        });
+    }
+
+    private void repairWithAllPeers() {
+        for (Node node : clusterManager.getAllNodes()) {
+            if (!node.equals(clusterManager.getLocalNode()) && node.isAvailable()) {
+                try {
+                    repairWith(node);
+                } catch (IOException | RuntimeException e) {
+                    logger.warn("Anti-entropy with {} failed: {}", node.getId(), e.getMessage());
+                }
+            }
+        }
     }
 
     private void repairWithRandomPeer() {

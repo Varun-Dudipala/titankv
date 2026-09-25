@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   header:  [type:1][sentAt:8][senderId:str]
  *   JOIN:    header [host:str][port:4][generation:8][version:8]
  *   LEAVE:   header
+ *   REMOVE:  header [removed id:str][removed generation:8]   (an operator removed a dead node)
  *   DIGEST:  header [count:4] then per member [id:str][host:str][port:4][status:1][generation:8][version:8]
  * where str is [length:2][UTF-8 bytes]. sentAt strictly increases per sender, which lets the
  * receiver reject replayed packets.
@@ -42,6 +43,7 @@ public class GossipProtocol {
     private static final byte MSG_JOIN = 0x01;
     private static final byte MSG_LEAVE = 0x02;
     private static final byte MSG_DIGEST = 0x04;
+    private static final byte MSG_REMOVE = 0x06;
 
     private static final int GOSSIP_PORT_OFFSET = 1000;
     private static final int GOSSIP_INTERVAL_MS = 1000;
@@ -219,6 +221,26 @@ public class GossipProtocol {
         }
     }
 
+    /**
+     * Tell every node that a dead node has been removed by an operator. Sent three times, a second
+     * apart, since UDP may drop a packet and a node that misses it would keep the node forever.
+     */
+    public void broadcastRemoval(Node removed) {
+        long removedGeneration = removed.getGeneration();
+        for (int attempt = 0; attempt < 3; attempt++) {
+            scheduler.schedule(() -> {
+                for (Node node : clusterManager.getAllNodes()) {
+                    if (!node.equals(localNode)) {
+                        ByteBuffer message = newMessage(MSG_REMOVE);
+                        writeString(message, removed.getId());
+                        message.putLong(removedGeneration);
+                        send(message, node);
+                    }
+                }
+            }, attempt * 1000L, TimeUnit.MILLISECONDS);
+        }
+    }
+
     private void broadcastLeave() {
         for (Node node : clusterManager.getAllNodes()) {
             if (!node.equals(localNode)) {
@@ -347,6 +369,13 @@ public class GossipProtocol {
                     break;
                 case MSG_DIGEST:
                     handleDigest(buffer);
+                    break;
+                case MSG_REMOVE:
+                    String removedId = readString(buffer);
+                    long removedGeneration = buffer.getLong();
+                    if (!removedId.equals(localNode.getId())) {
+                        clusterManager.markRemoved(removedId, removedGeneration);
+                    }
                     break;
                 default:
                     logger.warn("Unknown gossip message type {} from {}:{}", type, from, fromPort);
