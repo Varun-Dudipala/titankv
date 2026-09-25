@@ -113,9 +113,8 @@ public class DataRebalancer {
 
         switch (event.getType()) {
             case NODE_JOINED:
-            case NODE_RESTARTED:
-                // A new node, or a restarted one that may have lost unpersisted data: stream it
-                // the keys it replicates. A node that was only unreachable catches up from hints.
+                // A new node starts empty: stream it every key it now replicates. A restarted node
+                // is repaired by anti-entropy instead, which only transfers what it is missing.
                 transferPool.submit(() -> handleNodeJoin(event.getNode()));
                 break;
 
