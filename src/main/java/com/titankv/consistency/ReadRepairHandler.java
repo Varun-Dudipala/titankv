@@ -27,6 +27,7 @@ public class ReadRepairHandler {
     private final ExecutorService executor;
     private final boolean ownsExecutor;
     private final Map<String, TitanKVClient> ownedClients = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong replicasRepaired = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Create a standalone handler with its own threads and authenticated node connections.
@@ -209,6 +210,7 @@ public class ReadRepairHandler {
             return;
         }
         logger.debug("Read repair for key {} on {} stale replicas", key, stale.size());
+        replicasRepaired.addAndGet(stale.size());
         for (Node node : stale) {
             try {
                 executor.execute(() -> {
@@ -264,6 +266,13 @@ public class ReadRepairHandler {
             }
         }
         return stale;
+    }
+
+    /**
+     * @return stale replica copies this node has sent repairs for since startup
+     */
+    public long getReplicasRepaired() {
+        return replicasRepaired.get();
     }
 
     public void shutdown() {

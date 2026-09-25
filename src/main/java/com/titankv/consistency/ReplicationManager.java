@@ -300,6 +300,10 @@ public final class ReplicationManager implements ReplicaIO {
         });
     }
 
+    public ReadRepairHandler getReadRepairHandler() {
+        return readRepairHandler;
+    }
+
     public int getReplicationFactor() {
         return replicationFactor;
     }
