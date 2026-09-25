@@ -171,7 +171,8 @@ finished when 5-second timeouts fired.
   others as seeds, so any node can restart and rejoin.
 - `ClusterManager` marks a node SUSPECT after 3 seconds without a newer heartbeat and DEAD after 10
   seconds. Down nodes stay members and stay on the ring. A newer heartbeat makes the node ALIVE
-  again; a newer *generation* means the process restarted, which also triggers data streaming.
+  again; a newer *generation* means the process restarted, which also triggers an immediate
+  anti-entropy repair with it.
 - **Readiness.** A node started with seeds rejects client requests until it has found another member,
   and `/ready` reports 503. Without this, a restarted node would briefly act as a one-node cluster and
   acknowledge writes with a single copy. The chaos test caught exactly that when a seed node restarted.
@@ -220,7 +221,8 @@ Cassandra's `gc_grace_seconds`.
   it stream those keys (tombstones included, original versions kept) to it, and anti-entropy covers
   anything missed. The nodes that gave up ranges keep their copies until an operator runs `cleanup`,
   which writes each such key to all its current replicas and only then deletes the local copy.
-- **Restart.** Peers stream data to the restarted node (it may have had no WAL) and deliver its hints.
+- **Restart.** Peers deliver the node's hints and run a Merkle-tree repair with it, which sends only
+  the keys its WAL did not have (all of them if it ran without a WAL).
 - **Removal.** `removenode` on a DEAD node changes the ring; anti-entropy fills the new replicas.
 
 ## Testing strategy
