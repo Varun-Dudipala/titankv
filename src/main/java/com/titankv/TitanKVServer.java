@@ -185,6 +185,7 @@ public class TitanKVServer {
 
         // Initialize and start metrics HTTP server
         if (store instanceof InMemoryStore) {
+            registerReplicationMetrics();
             metricsHttpServer = new MetricsHttpServer(metricsPort(port), metrics, clusterManager, (InMemoryStore) store);
             try {
                 metricsHttpServer.start();
@@ -201,6 +202,28 @@ public class TitanKVServer {
         }
 
         logger.info("TitanKV Server started successfully");
+    }
+
+    private void registerReplicationMetrics() {
+        io.micrometer.core.instrument.MeterRegistry registry = metrics.getRegistry();
+        io.micrometer.core.instrument.Gauge.builder("titankv.hints.pending", replicationManager,
+                rm -> rm.getHintedHandoff().totalPendingHints())
+                .description("Writes waiting to be handed off to replicas that missed them")
+                .register(registry);
+        io.micrometer.core.instrument.FunctionCounter.builder("titankv.read.repairs", replicationManager,
+                rm -> rm.getReadRepairHandler().getReplicasRepaired())
+                .description("Stale replica copies repaired by reads")
+                .register(registry);
+        if (replicationManager.getAntiEntropy() != null) {
+            io.micrometer.core.instrument.FunctionCounter.builder("titankv.antientropy.keys.synced",
+                    replicationManager, rm -> rm.getAntiEntropy().getKeysSynced())
+                    .description("Keys copied between replicas by Merkle-tree repair")
+                    .register(registry);
+        }
+        io.micrometer.core.instrument.Gauge.builder("titankv.store.memory.bytes", store,
+                s -> ((InMemoryStore) s).getMemoryUsedBytes())
+                .description("Estimated bytes used by stored entries")
+                .register(registry);
     }
 
     /**

@@ -298,6 +298,7 @@ public class MetricsHttpServer {
         sb.append("  \"cluster\": {\n");
         if (clusterManager != null) {
             sb.append("    \"running\": ").append(clusterManager.isRunning()).append(",\n");
+            sb.append("    \"ready\": ").append(clusterManager.isReady()).append(",\n");
             sb.append("    \"total_nodes\": ").append(clusterManager.getNodeCount()).append(",\n");
             sb.append("    \"alive_nodes\": ").append(clusterManager.getAliveNodeCount()).append(",\n");
             sb.append("    \"local_node\": \"").append(clusterManager.getLocalNode().getId()).append("\",\n");

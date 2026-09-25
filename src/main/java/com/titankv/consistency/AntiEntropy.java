@@ -49,6 +49,8 @@ public final class AntiEntropy {
     private final ReplicaIO replicaIO;
     private final PeerTransport transport;
     private final ScheduledExecutorService scheduler;
+    private final java.util.concurrent.atomic.AtomicLong keysSynced = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong rounds = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Fetches another node's tree and leaf digests.
@@ -106,6 +108,7 @@ public final class AntiEntropy {
      * Synchronize every key this node and the peer both replicate.
      */
     public RepairStats repairWith(Node peer) throws IOException {
+        rounds.incrementAndGet();
         long[] local = buildTree(peer.getId());
         long peerRoot = ByteBuffer.wrap(transport.merkleTree(peer, MODE_ROOT)).getLong();
         if (peerRoot == local[0]) {
@@ -146,6 +149,7 @@ public final class AntiEntropy {
             logger.info("Anti-entropy with {}: {} differing leaves, pulled {} keys, pushed {} keys",
                     peer.getId(), leaves.size(), pulled, pushed);
         }
+        keysSynced.addAndGet(pulled + pushed);
         return new RepairStats(leaves.size(), pulled, pushed);
     }
 
@@ -286,6 +290,17 @@ public final class AntiEntropy {
             digests.put(new String(key, StandardCharsets.UTF_8), new Digest(buffer.getLong(), buffer.getLong()));
         }
         return digests;
+    }
+
+    /**
+     * @return repair rounds run and keys copied in either direction since startup
+     */
+    public long getRounds() {
+        return rounds.get();
+    }
+
+    public long getKeysSynced() {
+        return keysSynced.get();
     }
 
     public void shutdown() {
