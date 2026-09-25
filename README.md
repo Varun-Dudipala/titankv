@@ -205,14 +205,18 @@ Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator togeth
 
 | Setup | 16 clients, 80% reads | 16 clients, writes only |
 |---|---|---|
-| 1 node, in-memory | 61,103 ops/sec | 59,194 ops/sec |
-| 3 nodes, QUORUM, in-memory | 22,560 ops/sec | 22,494 ops/sec |
-| 3 nodes, QUORUM, auth + fsynced WAL | 15,557 ops/sec | 5,864 ops/sec |
+| 1 node, in-memory | 61,973 ops/sec | 65,367 ops/sec |
+| 3 nodes, QUORUM, in-memory | 19,101 ops/sec | 16,914 ops/sec |
+| 3 nodes, QUORUM, auth + fsynced WAL | 10,302 ops/sec | 4,207 ops/sec |
 
 Every read in the benchmark is checked against the client's last acknowledged write: across 80
-runs and 14.6M operations there were 0 errors and 0 stale reads. With a node killed mid-run
-(`scripts/benchmark-failover.sh`), a production cluster served 538K operations in 40 seconds with
-0 errors, recovered the node from its WAL, and repaired only the 1,045 keys it missed.
+runs and 13.7M operations there were 0 errors and 0 stale reads. With a node killed mid-run
+(`scripts/benchmark-failover.sh`), a production cluster served 371K operations in 40 seconds with
+0 errors, and the node recovered from its WAL plus hints and Merkle repair.
+
+Three nodes do about a third of one node's throughput here because replication triples the work
+and all nodes share one 4-core machine. Profiling cut system calls per operation from 13 to 9, a
+59% gain for 3 nodes ([details](benchmark/results/benchmark_results.md#profiling-the-replicated-path)).
 
 ```bash
 ./scripts/benchmark-suite.sh      # every scenario, 5 runs each

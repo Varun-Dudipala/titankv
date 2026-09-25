@@ -8,7 +8,7 @@
   workloads, while network latency is not included.
 - fsync on this VM is fast (sub-millisecond); on spinning disks or slower SSDs durable-write
   throughput will be lower.
-- Date: 2026-09-25, with all features (strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
+- Date: 2026-09-25 (rerun on a different, slower VM than earlier measurements), with all features (strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
 
 ## Method
 
@@ -35,38 +35,39 @@ Every run's numbers are in [`suite/summary.csv`](suite/summary.csv).
 
 | Scenario | Setup | Clients | Workload | Median ops/sec | Min – max | Spread | p50 ms | p99 ms | Errors | Stale reads |
 |---|---|---|---|---|---|---|---|---|---|---|
-| single | 1 node | 16 | mixed | 61,103 | 59,381 – 61,312 | ±2% | 0.25 | 0.53 | 0 | 0 |
-| single | 1 node | 16 | writes | 59,194 | 58,191 – 60,211 | ±2% | 0.25 | 0.53 | 0 | 0 |
-| scaling | 3 nodes | 16 | mixed | 22,560 | 21,048 – 22,956 | ±4% | 0.63 | 2.15 | 0 | 0 |
-| scaling | 5 nodes | 16 | mixed | 21,057 | 17,197 – 21,595 | ±10% | 0.67 | 2.49 | 0 | 0 |
-| consistency | ONE | 16 | mixed | 23,822 | 21,564 – 24,723 | ±7% | 0.54 | 2.53 | 0 | 0 |
-| consistency | QUORUM | 16 | mixed | 22,134 | 20,358 – 22,928 | ±6% | 0.63 | 2.25 | 0 | 0 |
-| consistency | ALL | 16 | mixed | 20,748 | 19,427 – 21,209 | ±4% | 0.70 | 2.15 | 0 | 0 |
-| value-size | 100 B | 16 | mixed | 22,420 | 18,835 – 23,067 | ±9% | 0.63 | 2.13 | 0 | 0 |
-| value-size | 1000 B | 16 | mixed | 20,604 | 19,479 – 21,499 | ±5% | 0.67 | 2.46 | 0 | 0 |
-| value-size | 10000 B | 16 | mixed | 14,576 | 10,955 – 15,500 | ±16% | 0.90 | 4.95 | 0 | 0 |
-| concurrency | 3 nodes | 1 | writes | 4,499 | 4,443 – 4,543 | ±1% | 0.21 | 0.38 | 0 | 0 |
-| concurrency | 3 nodes | 4 | writes | 11,984 | 11,622 – 12,158 | ±2% | 0.31 | 0.74 | 0 | 0 |
-| concurrency | 3 nodes | 16 | writes | 22,494 | 19,625 – 23,419 | ±8% | 0.63 | 2.31 | 0 | 0 |
-| concurrency | 3 nodes | 64 | writes | 23,079 | 16,689 – 23,875 | ±16% | 2.36 | 8.17 | 0 | 0 |
-| production | 3 nodes prod | 16 | mixed | 15,557 | 13,484 – 15,616 | ±7% | 0.88 | 3.47 | 0 | 0 |
-| production | 3 nodes prod | 16 | writes | 5,864 | 5,364 – 6,037 | ±6% | 2.49 | 6.63 | 0 | 0 |
+| single | 1 node | 16 | mixed | 61,973 | 61,009 – 67,475 | ±5% | 0.22 | 0.91 | 0 | 0 |
+| single | 1 node | 16 | writes | 65,367 | 63,530 – 66,589 | ±2% | 0.22 | 0.76 | 0 | 0 |
+| scaling | 3 nodes | 16 | mixed | 19,101 | 17,076 – 20,387 | ±9% | 0.72 | 2.73 | 0 | 0 |
+| scaling | 5 nodes | 16 | mixed | 15,982 | 14,038 – 17,215 | ±10% | 0.83 | 4.32 | 0 | 0 |
+| consistency | ONE | 16 | mixed | 39,872 | 36,591 – 40,672 | ±5% | 0.33 | 1.61 | 0 | 0 |
+| consistency | QUORUM | 16 | mixed | 19,310 | 14,290 – 21,325 | ±18% | 0.71 | 2.43 | 0 | 0 |
+| consistency | ALL | 16 | mixed | 14,732 | 13,630 – 16,439 | ±10% | 0.96 | 3.52 | 0 | 0 |
+| value-size | 100 B | 16 | mixed | 18,780 | 15,343 – 20,383 | ±13% | 0.76 | 2.80 | 0 | 0 |
+| value-size | 1000 B | 16 | mixed | 18,629 | 12,934 – 19,547 | ±18% | 0.76 | 2.66 | 0 | 0 |
+| value-size | 10000 B | 16 | mixed | 12,142 | 6,975 – 12,799 | ±24% | 1.08 | 6.19 | 0 | 0 |
+| concurrency | 3 nodes | 1 | writes | 3,408 | 2,268 – 3,516 | ±18% | 0.27 | 0.49 | 0 | 0 |
+| concurrency | 3 nodes | 4 | writes | 10,511 | 10,418 – 10,666 | ±1% | 0.35 | 0.94 | 0 | 0 |
+| concurrency | 3 nodes | 16 | writes | 16,914 | 10,739 – 17,424 | ±20% | 0.86 | 3.04 | 0 | 0 |
+| concurrency | 3 nodes | 64 | writes | 16,690 | 15,269 – 17,370 | ±6% | 3.27 | 12.44 | 0 | 0 |
+| production | 3 nodes prod | 16 | mixed | 10,302 | 8,784 – 10,530 | ±8% | 1.37 | 4.51 | 0 | 0 |
+| production | 3 nodes prod | 16 | writes | 4,207 | 3,599 – 4,402 | ±10% | 3.58 | 8.61 | 0 | 0 |
 
-**Correctness:** across all 80 runs (14.6 million operations) there were **0 errors, 0 stale reads
+**Correctness:** across all 80 runs (13.7 million operations) there were **0 errors, 0 stale reads
 and 0 read misses**.
 
 How to read it:
 
-- **Consistency levels** cost what theory predicts: ONE > QUORUM > ALL, since more replicas must
-  answer before replying. The differences are small here because all replicas are on one machine.
+- **Consistency levels** cost what theory predicts: ONE > QUORUM > ALL. ONE is about twice as fast
+  as QUORUM because a read is answered by the local replica in-process, with no network hop.
 - **Larger values** cost more: 10 KB values move 100 times the bytes of 100 B values.
 - **Concurrency**: throughput grows from 1 to 16 clients and flattens at 64, where p50 latency
   rises instead. The 4 CPUs are saturated.
+- **1 node vs 3 nodes**: see [profiling](#profiling-the-replicated-path) below.
 - **Cluster size**: 5 nodes do not beat 3 here, because every node and the load generator share
   the same 4 CPUs. Five JVMs split the same cores five ways. Horizontal scaling needs one machine
   per node; on one box this only shows that adding nodes costs little.
 - **Production mode** adds authentication and an fsync on every replica before acknowledging.
-  Writes-only drops to about 5.9K/sec, bounded by fsyncs even with group commit.
+  Writes-only drops to about 4.2K/sec, bounded by fsyncs even with group commit.
 
 ## Availability under node failure
 
@@ -75,17 +76,17 @@ production-mode cluster for 40 seconds. Node 2 is killed with SIGKILL at 10s and
 
 | Phase | Avg ops/sec | Errors |
 |---|---|---|
-| All 3 nodes up (0–10s) | 14,548 | 0 |
-| Node 2 down (11–25s) | 17,365 | 0 |
-| Node 2 restarting and warming up (26–40s) | 10,698 | 0 |
+| All 3 nodes up (0–10s) | 10,094 | 0 |
+| Node 2 down (11–25s) | 12,698 | 0 |
+| Node 2 back (30s–end) | 5,591 | 0 |
 
-**538,683 operations with 0 errors, 0 stale reads and 0 read misses.** Node 2 recovered all 16,000
-keys from its WAL, and anti-entropy sent it only the 1,045 keys written while it was down.
+**371,013 operations with 0 errors, 0 stale reads and 0 read misses** (a repeat run: 0 errors).
+Node 2 recovered its keys from its WAL; hints and Merkle anti-entropy sent it the writes it missed.
 
 - **During the outage** QUORUM keeps working on the other two replicas. Throughput even rises,
   because two JVMs share the CPUs instead of three.
-- **After the restart** there is a dip of about 10 seconds. The restarted JVM starts with a cold JIT
-  and immediately takes a third of the traffic, plus hint delivery and repair.
+- **After the restart** throughput dips. The restarted JVM starts with a cold JIT and immediately
+  takes a third of the traffic, while also receiving hints and Merkle repair.
 - **This run found a client bug.** Throughput originally fell to about 2,200 ops/sec during the
   outage. The client slept its retry delay before failing over away from the dead node, and kept
   the node's circuit breaker open for 30 seconds. The client now fails over immediately, moves
