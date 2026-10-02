@@ -211,9 +211,16 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
   seconds. Down nodes stay members and stay on the ring. A newer heartbeat makes the node ALIVE
   again; a newer *generation* means the process restarted, which also triggers an immediate
   anti-entropy repair with it.
-- **Readiness.** A node started with seeds rejects client requests until it has found another member,
-  and `/ready` reports 503. Without this, a restarted node would briefly act as a one-node cluster and
-  acknowledge writes with a single copy. The chaos test caught exactly that when a seed node restarted.
+- **Every member is on the ring, up or down.** A node adopts every member a digest lists, including
+  ones reported down (as DEAD), because a down member is still a replica of its keys.
+- **Readiness.** A node started with seeds rejects client requests, and `/ready` reports 503, until
+  it has applied a peer's full membership digest. A node that receives its first digest answers with
+  its own, so the peer it joined through is synced at once too. Without this gate, a restarted node
+  would act as a one-node cluster and acknowledge writes with a single copy, as the chaos test found
+  when a seed node restarted. A weaker gate ("knows one other member") also failed: a restarted node
+  served with a partial ring, missing members that were down, and sent their keys to the wrong
+  replicas. The chaos test's stale-read check caught that on a slow CI runner, and
+  `MembershipTest` now reproduces it.
 - **Shutting down is not leaving.** On graceful shutdown a node broadcasts LEAVE. Its peers mark it
   DEAD at once instead of after 10 seconds, but it stays a member and stays on the ring, as in
   Cassandra: a shutdown is usually a restart, and taking the node off the ring would give its keys

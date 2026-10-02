@@ -58,9 +58,9 @@ echo -n "Waiting for the cluster to form"
 for _ in $(seq 1 60); do
     READY=0
     for ((i = 0; i < NODES; i++)); do
-        ALIVE=$(curl -s "http://localhost:$((BASE_PORT + i + 90))/status" \
-            | sed -n 's/.*"alive_nodes": \([0-9]*\).*/\1/p' || true)
-        if [ "${ALIVE:-0}" = "$NODES" ]; then
+        STATUS=$(curl -s "http://localhost:$((BASE_PORT + i + 90))/status" || true)
+        ALIVE=$(echo "$STATUS" | sed -n 's/.*"alive_nodes": \([0-9]*\).*/\1/p')
+        if [ "${ALIVE:-0}" = "$NODES" ] && { [ "$NODES" = 1 ] || echo "$STATUS" | grep -q '"ready": true'; }; then
             READY=$((READY + 1))
         fi
     done

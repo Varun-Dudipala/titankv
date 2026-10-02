@@ -244,6 +244,16 @@ public class TitanKVServer {
     }
 
     /**
+     * Fault injection for tests: stop as if the process had been killed. Client connections are
+     * dropped first and the other members are not told, so they have to detect the failure.
+     */
+    public void crash() {
+        tcpServer.stop();
+        clusterManager.stop(false);
+        stop();
+    }
+
+    /**
      * Check if the server is running.
      */
     public boolean isRunning() {

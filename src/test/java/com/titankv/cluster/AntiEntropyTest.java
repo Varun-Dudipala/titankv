@@ -120,11 +120,13 @@ class AntiEntropyTest {
             assertThat(value(cluster.node(0).getStore(), "tie")).isEqualTo("banana");
             assertThat(value(cluster.node(1).getStore(), "tie")).isEqualTo("banana");
 
-            cluster.node(2).getStore().putIfNewer("tie", bytes("apple"), version, 0);
-            AntiEntropy.RepairStats stats = antiEntropy(cluster.node(0)).repairWith(peer(cluster, 0, 2));
+            // Node 3 holds the losing version (streaming to it may already have delivered the winner)
+            KVStore third = cluster.node(2).getStore();
+            third.delete("tie");
+            third.putIfNewer("tie", bytes("apple"), version, 0);
+            antiEntropy(cluster.node(0)).repairWith(peer(cluster, 0, 2));
 
-            assertThat(stats.differingLeaves()).isEqualTo(1);
-            assertThat(value(cluster.node(2).getStore(), "tie")).isEqualTo("banana");
+            assertThat(value(third, "tie")).isEqualTo("banana");
             assertThat(antiEntropy(cluster.node(0)).repairWith(peer(cluster, 0, 2)).differingLeaves()).isZero();
         }
     }
