@@ -1,6 +1,8 @@
 package com.titankv.core;
 
 import com.titankv.network.protocol.BinaryProtocol;
+import com.titankv.util.Env;
+import com.titankv.util.HybridLogicalClock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,30 +21,48 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.zip.CRC32;
 
 /**
- * Thread-safe in-memory key-value store implementation using ConcurrentHashMap.
- * Supports TTL with automatic expiration cleanup and memory limits.
+ * Thread-safe in-memory key-value store backed by a ConcurrentHashMap, with optional
+ * write-ahead log (WAL) and snapshots for crash recovery, TTL expiry and a memory limit.
+ *
+ * Durability: every mutation appends a CRC-checked record to the WAL (fsynced by default) before
+ * it is acknowledged. When the WAL grows past its limit the store writes a snapshot of all live
+ * entries and truncates the WAL. On startup the snapshot and then the WAL are replayed.
+ *
+ * Invariants:
+ *  - A key's WAL record is appended inside that key's map update, so for any one key the WAL
+ *    order matches the order updates were applied in memory.
+ *  - Mutations hold the read side of {@code mutationLock}; a snapshot holds the write side. So
+ *    when the WAL is truncated, every record in it has already been applied to the map and is
+ *    therefore captured by the snapshot.
+ *  - Group commit: writers append under {@code walLock} but fsync outside it. A writer waits
+ *    until the WAL is durable up to its own record; one fsync covers every record appended
+ *    before it started, so concurrent writers share fsyncs instead of queueing for one each.
  */
 public class InMemoryStore implements KVStore {
 
     private static final Logger logger = LoggerFactory.getLogger(InMemoryStore.class);
-    private static final long DEFAULT_MAX_MEMORY_BYTES = 512 * 1024 * 1024; // 512MB
-    private static final int ENTRY_OVERHEAD_BYTES = 48; // Estimated object overhead
+    private static final long DEFAULT_MAX_MEMORY_BYTES = 512L * 1024 * 1024;
+    private static final int ENTRY_OVERHEAD_BYTES = 48; // estimated per-entry object overhead
     private static final int WAL_MAGIC = 0x544B564C; // "TKVL"
     private static final short WAL_VERSION = 1;
     private static final byte WAL_OP_PUT = 0x01;
     private static final byte WAL_OP_DELETE = 0x02;
     private static final byte WAL_OP_CLEAR = 0x03;
-    private static final long DEFAULT_WAL_MAX_BYTES = 128L * 1024 * 1024; // 128MB
+    private static final int WAL_HEADER_SIZE = 4 + 2 + 1 + 4 + 4 + 8 + 8;
+    private static final long DEFAULT_WAL_MAX_BYTES = 128L * 1024 * 1024;
+    private static final long DEFAULT_TOMBSTONE_GRACE_MS = 24L * 60 * 60 * 1000;
 
-    private final ConcurrentHashMap<String, KeyValuePair> store;
+    private final ConcurrentHashMap<String, KeyValuePair> store = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleanupExecutor;
-    private final long cleanupIntervalMs;
     private final long maxMemoryBytes;
-    private final AtomicLong currentMemoryBytes;
+    private final AtomicLong currentMemoryBytes = new AtomicLong();
+    private final long tombstoneGraceMs;
     private final boolean walEnabled;
     private final boolean walFsync;
     private final long walMaxBytes;
@@ -50,274 +70,186 @@ public class InMemoryStore implements KVStore {
     private final Path walPath;
     private final Path snapshotPath;
     private final Object walLock = new Object();
+    private final Object syncLock = new Object();
+    // Bytes ever appended / known durable, never reset by snapshots. Used for group commit.
+    private long appendedTotal;
+    private volatile long durableTotal;
+    private final ThreadLocal<long[]> lastAppendEnd = ThreadLocal.withInitial(() -> new long[1]);
+    private final ReentrantReadWriteLock mutationLock = new ReentrantReadWriteLock();
     private FileChannel walChannel;
     private long walBytes;
-    private volatile boolean loading;
+    private boolean loading;
 
-    /**
-     * Get max memory from environment/system property, or use default.
-     * Checks: TITANKV_MAX_MEMORY_MB env var, titankv.max.memory.mb property
-     */
-    private static long getDefaultMaxMemoryBytes() {
-        String envValue = System.getenv("TITANKV_MAX_MEMORY_MB");
-        if (envValue != null && !envValue.isEmpty()) {
-            try {
-                long mb = Long.parseLong(envValue.trim());
-                if (mb > 0) {
-                    logger.info("Using TITANKV_MAX_MEMORY_MB={} MB", mb);
-                    return mb * 1024 * 1024;
-                }
-            } catch (NumberFormatException e) {
-                logger.warn("Invalid TITANKV_MAX_MEMORY_MB value: {}, using default", envValue);
-            }
-        }
-
-        String propValue = System.getProperty("titankv.max.memory.mb");
-        if (propValue != null && !propValue.isEmpty()) {
-            try {
-                long mb = Long.parseLong(propValue.trim());
-                if (mb > 0) {
-                    logger.info("Using titankv.max.memory.mb={} MB", mb);
-                    return mb * 1024 * 1024;
-                }
-            } catch (NumberFormatException e) {
-                logger.warn("Invalid titankv.max.memory.mb value: {}, using default", propValue);
-            }
-        }
-
-        return DEFAULT_MAX_MEMORY_BYTES;
-    }
-
-    private static boolean isDevMode() {
-        return "true".equalsIgnoreCase(System.getenv("TITANKV_DEV_MODE"))
-                || "true".equalsIgnoreCase(System.getProperty("titankv.dev.mode"));
-    }
-
-    private static boolean getBooleanProperty(String envKey, String propKey, boolean fallback) {
-        String value = System.getenv(envKey);
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty(propKey);
-        }
-        if (value == null || value.isEmpty()) {
-            return fallback;
-        }
-        return "true".equalsIgnoreCase(value) || "1".equals(value);
-    }
-
-    private static boolean getDefaultWalEnabled() {
-        boolean devMode = isDevMode();
-        return getBooleanProperty("TITANKV_WAL_ENABLED", "titankv.wal.enabled", !devMode);
-    }
-
-    private static boolean getDefaultWalFsync() {
-        return getBooleanProperty("TITANKV_WAL_FSYNC", "titankv.wal.fsync", true);
-    }
-
-    private static long getDefaultWalMaxBytes() {
-        String envValue = System.getenv("TITANKV_WAL_MAX_MB");
-        if (envValue == null || envValue.isEmpty()) {
-            envValue = System.getProperty("titankv.wal.max.mb");
-        }
-        if (envValue != null && !envValue.isEmpty()) {
-            try {
-                long mb = Long.parseLong(envValue.trim());
-                if (mb > 0) {
-                    return mb * 1024 * 1024;
-                }
-            } catch (NumberFormatException e) {
-                logger.warn("Invalid WAL max size {}, using default", envValue);
-            }
-        }
-        return DEFAULT_WAL_MAX_BYTES;
-    }
-
-    private static Path getDefaultDataDir() {
-        String envValue = System.getenv("TITANKV_DATA_DIR");
-        if (envValue == null || envValue.isEmpty()) {
-            envValue = System.getProperty("titankv.data.dir");
-        }
-        if (envValue == null || envValue.isEmpty()) {
-            envValue = "data";
-        }
-        return Path.of(envValue);
-    }
-
-    /**
-     * Create a new in-memory store with default cleanup interval (1 minute) and
-     * default memory limit.
-     */
     public InMemoryStore() {
-        this(60_000, getDefaultMaxMemoryBytes());
+        this(60_000, defaultMaxMemoryBytes(), defaultDataDir());
     }
 
-    /**
-     * Create a new in-memory store with custom cleanup interval and default memory
-     * limit.
-     *
-     * @param cleanupIntervalMs interval between cleanup runs in milliseconds
-     */
     public InMemoryStore(long cleanupIntervalMs) {
-        this(cleanupIntervalMs, getDefaultMaxMemoryBytes());
+        this(cleanupIntervalMs, defaultMaxMemoryBytes(), defaultDataDir());
+    }
+
+    public InMemoryStore(long cleanupIntervalMs, long maxMemoryBytes) {
+        this(cleanupIntervalMs, maxMemoryBytes, defaultDataDir());
+    }
+
+    public InMemoryStore(Path dataDir) {
+        this(60_000, defaultMaxMemoryBytes(), dataDir);
     }
 
     /**
-     * Create a new in-memory store with custom cleanup interval and memory limit.
-     *
-     * @param cleanupIntervalMs interval between cleanup runs in milliseconds
-     * @param maxMemoryBytes    maximum memory usage in bytes
+     * @param cleanupIntervalMs how often expired entries and old tombstones are purged
+     * @param maxMemoryBytes    writes that would exceed this estimated size are rejected
+     * @param dataDir           directory for the WAL and snapshot (used only if the WAL is enabled)
      */
-    public InMemoryStore(long cleanupIntervalMs, long maxMemoryBytes) {
+    public InMemoryStore(long cleanupIntervalMs, long maxMemoryBytes, Path dataDir) {
         if (cleanupIntervalMs <= 0) {
             throw new IllegalArgumentException("cleanupIntervalMs must be positive");
         }
         if (maxMemoryBytes <= 0) {
             throw new IllegalArgumentException("maxMemoryBytes must be positive");
         }
-        this.store = new ConcurrentHashMap<>();
-        this.cleanupIntervalMs = cleanupIntervalMs;
         this.maxMemoryBytes = maxMemoryBytes;
-        this.currentMemoryBytes = new AtomicLong(0);
-        this.walEnabled = getDefaultWalEnabled();
-        this.walFsync = getDefaultWalFsync();
-        this.walMaxBytes = getDefaultWalMaxBytes();
-        this.dataDir = getDefaultDataDir();
+        this.tombstoneGraceMs = positiveLong("TITANKV_TOMBSTONE_GRACE_MS", "titankv.tombstone.grace.ms", 1,
+                DEFAULT_TOMBSTONE_GRACE_MS);
+        // The WAL defaults to on, except in dev mode where durability is not expected
+        this.walEnabled = Env.getBoolean("TITANKV_WAL_ENABLED", "titankv.wal.enabled", !Env.isDevMode());
+        this.walFsync = Env.getBoolean("TITANKV_WAL_FSYNC", "titankv.wal.fsync", true);
+        this.walMaxBytes = positiveLong("TITANKV_WAL_MAX_MB", "titankv.wal.max.mb", 1024 * 1024,
+                DEFAULT_WAL_MAX_BYTES);
+        this.dataDir = dataDir;
         this.walPath = dataDir.resolve("wal.log");
         this.snapshotPath = dataDir.resolve("snapshot.dat");
-        this.loading = false;
         this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "titankv-cleanup");
             t.setDaemon(true);
             return t;
         });
         if (walEnabled) {
-            initializeWal();
+            recover();
         }
-        startCleanupTask();
+        cleanupExecutor.scheduleAtFixedRate(this::cleanupExpired, cleanupIntervalMs, cleanupIntervalMs,
+                TimeUnit.MILLISECONDS);
     }
 
-    private void startCleanupTask() {
-        cleanupExecutor.scheduleAtFixedRate(this::cleanupExpired,
-                cleanupIntervalMs, cleanupIntervalMs, TimeUnit.MILLISECONDS);
-        logger.debug("Started TTL cleanup task with interval {}ms", cleanupIntervalMs);
+    private static long defaultMaxMemoryBytes() {
+        return positiveLong("TITANKV_MAX_MEMORY_MB", "titankv.max.memory.mb", 1024 * 1024, DEFAULT_MAX_MEMORY_BYTES);
     }
 
-    private void initializeWal() {
+    private static Path defaultDataDir() {
+        String dir = Env.get("TITANKV_DATA_DIR", "titankv.data.dir");
+        return Path.of(dir != null ? dir : "data");
+    }
+
+    /**
+     * @return the configured value times {@code unit}, or the fallback if unset or invalid
+     */
+    private static long positiveLong(String envKey, String propKey, long unit, long fallback) {
+        String value = Env.get(envKey, propKey);
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            long parsed = Long.parseLong(value.trim());
+            if (parsed > 0) {
+                return parsed * unit;
+            }
+        } catch (NumberFormatException e) {
+            // fall through
+        }
+        logger.warn("Invalid value {} for {}, using default", value, envKey);
+        return fallback;
+    }
+
+    // ==================== Recovery ====================
+
+    private void recover() {
         try {
             Files.createDirectories(dataDir);
             loading = true;
-            loadSnapshotIfPresent();
-            loadWalIfPresent(walPath);
+            if (Files.exists(snapshotPath)) {
+                replayFile(snapshotPath);
+                logger.info("Loaded snapshot from {}", snapshotPath.toAbsolutePath());
+            }
+            if (Files.exists(walPath)) {
+                replayFile(walPath);
+                logger.info("Replayed WAL from {}", walPath.toAbsolutePath());
+            }
+            walChannel = FileChannel.open(walPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                    StandardOpenOption.APPEND);
+            walBytes = walChannel.size();
+            logger.info("WAL enabled at {} (size={} bytes, {} keys recovered)",
+                    walPath.toAbsolutePath(), walBytes, store.size());
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to initialize WAL directory: " + dataDir, e);
+            throw new IllegalStateException("Failed to initialize WAL in " + dataDir, e);
         } finally {
             loading = false;
         }
-        try {
-            walChannel = FileChannel.open(walPath,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.APPEND);
-            walBytes = walChannel.size();
-            logger.info("WAL enabled at {} (size={} bytes)", walPath.toAbsolutePath(), walBytes);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to open WAL at " + walPath, e);
-        }
     }
 
-    private void loadSnapshotIfPresent() {
-        if (!Files.exists(snapshotPath)) {
-            return;
-        }
-        try (FileChannel channel = FileChannel.open(snapshotPath, StandardOpenOption.READ)) {
-            replayLog(channel);
-            logger.info("Loaded snapshot from {}", snapshotPath.toAbsolutePath());
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to load snapshot: " + snapshotPath, e);
-        }
-    }
-
-    private void loadWalIfPresent(Path path) {
-        if (!Files.exists(path)) {
-            return;
-        }
+    /**
+     * Apply every intact record in order. Stops at the first truncated or corrupt record, which
+     * is what a crash in the middle of an append leaves behind.
+     */
+    private void replayFile(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            replayLog(channel);
-            logger.info("Replayed WAL from {}", path.toAbsolutePath());
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to replay WAL: " + path, e);
-        }
-    }
+            ByteBuffer header = ByteBuffer.allocate(WAL_HEADER_SIZE);
+            while (true) {
+                header.clear();
+                int read = readFully(channel, header);
+                if (read == -1) {
+                    return;
+                }
+                if (read < WAL_HEADER_SIZE) {
+                    logger.warn("Truncated record header in {}, stopping replay", path);
+                    return;
+                }
+                header.flip();
+                int magic = header.getInt();
+                short version = header.getShort();
+                byte op = header.get();
+                int keyLen = header.getInt();
+                int valueLen = header.getInt();
+                long timestamp = header.getLong();
+                long expiresAt = header.getLong();
 
-    private void replayLog(FileChannel channel) throws IOException {
-        ByteBuffer header = ByteBuffer.allocate(4 + 2 + 1 + 4 + 4 + 8 + 8);
-        while (true) {
-            header.clear();
-            int read = readFully(channel, header);
-            if (read == -1) {
-                break;
-            }
-            if (read < header.capacity()) {
-                logger.warn("Truncated WAL record (header), stopping replay");
-                break;
-            }
-            header.flip();
-            int magic = header.getInt();
-            short version = header.getShort();
-            byte op = header.get();
-            int keyLen = header.getInt();
-            int valueLen = header.getInt();
-            long timestamp = header.getLong();
-            long expiresAt = header.getLong();
+                if (magic != WAL_MAGIC || version != WAL_VERSION
+                        || keyLen < 0 || keyLen > BinaryProtocol.MAX_KEY_LENGTH
+                        || valueLen < -1 || valueLen > BinaryProtocol.MAX_VALUE_LENGTH) {
+                    logger.warn("Corrupt record header in {}, stopping replay", path);
+                    return;
+                }
 
-            if (magic != WAL_MAGIC || version != WAL_VERSION) {
-                logger.warn("Invalid WAL header (magic/version), stopping replay");
-                break;
-            }
-            if (keyLen < 0 || keyLen > BinaryProtocol.MAX_KEY_LENGTH) {
-                logger.warn("Invalid WAL key length {}, stopping replay", keyLen);
-                break;
-            }
-            if (valueLen < -1 || valueLen > BinaryProtocol.MAX_VALUE_LENGTH) {
-                logger.warn("Invalid WAL value length {}, stopping replay", valueLen);
-                break;
-            }
-
-            int valueSize = valueLen > 0 ? valueLen : 0;
-            int payloadSize = keyLen + valueSize + 4;
-            ByteBuffer payload = ByteBuffer.allocate(payloadSize);
-            int payloadRead = readFully(channel, payload);
-            if (payloadRead < payloadSize) {
-                logger.warn("Truncated WAL record (payload), stopping replay");
-                break;
-            }
-            payload.flip();
-            byte[] keyBytes = new byte[keyLen];
-            payload.get(keyBytes);
-            byte[] value = null;
-            if (valueLen >= 0) {
-                value = new byte[valueLen];
-                if (valueLen > 0) {
+                int valueSize = Math.max(valueLen, 0);
+                ByteBuffer payload = ByteBuffer.allocate(keyLen + valueSize + 4);
+                if (readFully(channel, payload) < payload.capacity()) {
+                    logger.warn("Truncated record in {}, stopping replay", path);
+                    return;
+                }
+                payload.flip();
+                byte[] keyBytes = new byte[keyLen];
+                payload.get(keyBytes);
+                byte[] value = valueLen >= 0 ? new byte[valueLen] : null;
+                if (valueSize > 0) {
                     payload.get(value);
                 }
-            }
-            int checksum = payload.getInt();
-            CRC32 crc = new CRC32();
-            crc.update(header.array(), 0, header.capacity());
-            crc.update(keyBytes, 0, keyBytes.length);
-            if (valueSize > 0) {
-                crc.update(value, 0, value.length);
-            }
-            if ((int) crc.getValue() != checksum) {
-                logger.warn("WAL checksum mismatch, stopping replay");
-                break;
-            }
+                int checksum = payload.getInt();
 
-            String key = new String(keyBytes, StandardCharsets.UTF_8);
-            applyRecord(op, key, value, timestamp, expiresAt);
+                CRC32 crc = new CRC32();
+                crc.update(header.array(), 0, WAL_HEADER_SIZE);
+                crc.update(keyBytes);
+                if (valueSize > 0) {
+                    crc.update(value);
+                }
+                if ((int) crc.getValue() != checksum) {
+                    logger.warn("Checksum mismatch in {}, stopping replay", path);
+                    return;
+                }
+                applyRecord(op, new String(keyBytes, StandardCharsets.UTF_8), value, timestamp, expiresAt);
+            }
         }
     }
 
-    private int readFully(FileChannel channel, ByteBuffer buffer) throws IOException {
+    private static int readFully(FileChannel channel, ByteBuffer buffer) throws IOException {
         int total = 0;
         while (buffer.hasRemaining()) {
             int read = channel.read(buffer);
@@ -330,110 +262,155 @@ public class InMemoryStore implements KVStore {
     }
 
     private void applyRecord(byte op, String key, byte[] value, long timestamp, long expiresAt) {
-        if (op == WAL_OP_PUT) {
-            if (expiresAt > 0 && System.currentTimeMillis() > expiresAt) {
-                return;
-            }
-            KeyValuePair entry = new KeyValuePair(value, timestamp, expiresAt);
-            applyPut(key, entry);
-            return;
+        switch (op) {
+            case WAL_OP_PUT:
+                if (expiresAt > 0 && System.currentTimeMillis() > expiresAt) {
+                    applyDelete(key);
+                } else {
+                    applyPut(key, new KeyValuePair(value, timestamp, expiresAt));
+                }
+                break;
+            case WAL_OP_DELETE:
+                applyDelete(key);
+                break;
+            case WAL_OP_CLEAR:
+                store.clear();
+                currentMemoryBytes.set(0);
+                break;
+            default:
+                logger.warn("Unknown WAL op {}, skipping", op);
         }
-        if (op == WAL_OP_DELETE) {
-            applyDelete(key);
-            return;
-        }
-        if (op == WAL_OP_CLEAR) {
-            store.clear();
-            currentMemoryBytes.set(0);
-            return;
-        }
-        logger.warn("Unknown WAL op {}, skipping", op);
     }
 
     private void applyPut(String key, KeyValuePair entry) {
-        if (key == null || key.isEmpty()) {
-            return;
-        }
-        long entrySize = estimateSize(key, entry.getValueUnsafe());
-        while (currentMemoryBytes.get() + entrySize > maxMemoryBytes) {
-            if (!evictOne()) {
-                logger.warn("Memory limit exceeded during WAL replay for key {}", key);
-                break;
-            }
-        }
         KeyValuePair previous = store.put(key, entry);
-        if (previous != null) {
-            currentMemoryBytes.addAndGet(-estimateSize(key, previous.getValueUnsafe()));
-        }
-        currentMemoryBytes.addAndGet(entrySize);
+        adjustMemory(key, previous, entry);
     }
 
     private void applyDelete(String key) {
-        KeyValuePair removed = store.remove(key);
-        if (removed != null) {
-            currentMemoryBytes.addAndGet(-estimateSize(key, removed.getValueUnsafe()));
-        }
+        adjustMemory(key, store.remove(key), null);
     }
 
-    private void writeWalRecord(byte op, String key, byte[] value, long timestamp, long expiresAt) {
+    // ==================== WAL writing ====================
+
+    /**
+     * Run a mutation so it cannot interleave with a snapshot, then snapshot if the WAL is full.
+     */
+    private <T> T mutate(Supplier<T> mutation) {
+        if (!walEnabled) {
+            return mutation.get();
+        }
+        T result;
+        mutationLock.readLock().lock();
+        try {
+            result = mutation.get();
+            awaitDurable();
+        } finally {
+            mutationLock.readLock().unlock();
+        }
+        maybeSnapshot();
+        return result;
+    }
+
+    private void appendToWal(byte op, String key, byte[] value, long timestamp, long expiresAt) {
         if (!walEnabled || loading) {
             return;
         }
         synchronized (walLock) {
             try {
-                int bytesWritten = writeRecordToChannel(walChannel, op, key, value, timestamp, expiresAt);
-                walBytes += bytesWritten;
-                if (walFsync) {
-                    walChannel.force(true);
-                }
-                if (walBytes >= walMaxBytes) {
-                    snapshotLocked();
-                }
+                int written = writeRecord(walChannel, op, key, value, timestamp, expiresAt);
+                walBytes += written;
+                appendedTotal += written;
+                lastAppendEnd.get()[0] = appendedTotal;
             } catch (IOException e) {
                 throw new IllegalStateException("WAL write failed", e);
             }
         }
     }
 
-    private void snapshotLocked() {
-        if (!walEnabled) {
+    /**
+     * Block until this thread's last WAL record is on disk. Whichever waiting writer gets the sync
+     * lock fsyncs everything appended so far, so writers that arrive meanwhile are covered too.
+     */
+    private void awaitDurable() {
+        long target = lastAppendEnd.get()[0];
+        if (!walFsync || target <= durableTotal) {
             return;
         }
-        Path tempSnapshot = snapshotPath.resolveSibling("snapshot.tmp");
-        try (FileChannel snapshotChannel = FileChannel.open(tempSnapshot,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING,
-                StandardOpenOption.WRITE)) {
-            for (var entry : store.entrySet()) {
-                KeyValuePair value = entry.getValue();
-                if (value.isExpired()) {
-                    continue;
-                }
-                writeRecordToChannel(snapshotChannel, WAL_OP_PUT,
-                        entry.getKey(),
-                        value.getValueUnsafe(),
-                        value.getTimestamp(),
-                        value.getExpiresAt());
+        synchronized (syncLock) {
+            if (target <= durableTotal) {
+                return;
             }
-            snapshotChannel.force(true);
-            Files.move(tempSnapshot, snapshotPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            walChannel.truncate(0);
-            walChannel.position(0);
-            walBytes = 0;
-            logger.info("Snapshot written to {}", snapshotPath.toAbsolutePath());
-        } catch (IOException e) {
-            logger.warn("Snapshot failed: {}", e.getMessage());
+            long upTo;
+            synchronized (walLock) {
+                upTo = appendedTotal;
+            }
+            try {
+                walChannel.force(false);
+            } catch (IOException e) {
+                throw new IllegalStateException("WAL fsync failed", e);
+            }
+            durableTotal = upTo;
         }
     }
 
-    private int writeRecordToChannel(FileChannel channel, byte op, String key, byte[] value,
+    private void maybeSnapshot() {
+        synchronized (walLock) {
+            if (walBytes < walMaxBytes) {
+                return;
+            }
+        }
+        mutationLock.writeLock().lock();
+        try {
+            synchronized (walLock) {
+                if (walBytes >= walMaxBytes) {
+                    writeSnapshot();
+                }
+            }
+        } finally {
+            mutationLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Write all live entries to a new snapshot, atomically replace the old one, then truncate the
+     * WAL. Caller holds the mutation write lock, so no mutation is in flight.
+     */
+    private void writeSnapshot() {
+        Path tempSnapshot = snapshotPath.resolveSibling("snapshot.tmp");
+        try (FileChannel out = FileChannel.open(tempSnapshot, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            for (var entry : store.entrySet()) {
+                KeyValuePair kv = entry.getValue();
+                if (!kv.isExpired()) {
+                    writeRecord(out, WAL_OP_PUT, entry.getKey(), kv.getValueUnsafe(), kv.getTimestamp(),
+                            kv.getExpiresAt());
+                }
+            }
+            out.force(true);
+        } catch (IOException e) {
+            logger.warn("Snapshot failed, keeping the WAL: {}", e.getMessage());
+            return;
+        }
+        try {
+            Files.move(tempSnapshot, snapshotPath, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+            walChannel.truncate(0);
+            walChannel.force(true);
+            walBytes = 0;
+            durableTotal = appendedTotal; // everything appended so far is in the fsynced snapshot
+            logger.info("Snapshot of {} keys written to {}", store.size(), snapshotPath.toAbsolutePath());
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to install snapshot", e);
+        }
+    }
+
+    private static int writeRecord(FileChannel channel, byte op, String key, byte[] value,
             long timestamp, long expiresAt) throws IOException {
-        byte[] keyBytes = key != null ? key.getBytes(StandardCharsets.UTF_8) : new byte[0];
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         int valueLen = value != null ? value.length : -1;
-        int valueSize = valueLen > 0 ? valueLen : 0;
-        int headerSize = 4 + 2 + 1 + 4 + 4 + 8 + 8;
-        int totalSize = headerSize + keyBytes.length + valueSize + 4;
-        ByteBuffer buffer = ByteBuffer.allocate(totalSize);
+        int valueSize = Math.max(valueLen, 0);
+        ByteBuffer buffer = ByteBuffer.allocate(WAL_HEADER_SIZE + keyBytes.length + valueSize + 4);
         buffer.putInt(WAL_MAGIC);
         buffer.putShort(WAL_VERSION);
         buffer.put(op);
@@ -452,30 +429,10 @@ public class InMemoryStore implements KVStore {
         while (buffer.hasRemaining()) {
             channel.write(buffer);
         }
-        return totalSize;
+        return buffer.capacity();
     }
 
-    /**
-     * Remove all expired entries and update memory tracking.
-     * Uses conditional remove to avoid race condition where value is updated
-     * between check and remove.
-     */
-    private void cleanupExpired() {
-        int removed = 0;
-        for (var entry : store.entrySet()) {
-            KeyValuePair value = entry.getValue();
-            if (value.isExpired()) {
-                // Use conditional remove to only remove if the value hasn't changed
-                if (store.remove(entry.getKey(), value)) {
-                    currentMemoryBytes.addAndGet(-estimateSize(entry.getKey(), value.getValueUnsafe()));
-                    removed++;
-                }
-            }
-        }
-        if (removed > 0) {
-            logger.debug("Cleaned up {} expired entries, memoryUsed={}", removed, currentMemoryBytes.get());
-        }
-    }
+    // ==================== Operations ====================
 
     @Override
     public Optional<KeyValuePair> put(String key, byte[] value) {
@@ -485,231 +442,91 @@ public class InMemoryStore implements KVStore {
     @Override
     public Optional<KeyValuePair> put(String key, byte[] value, long ttlMillis) {
         validateKey(key);
-
         long now = System.currentTimeMillis();
-        long expiresAt = ttlMillis > 0 ? now + ttlMillis : 0;
-        long entrySize = estimateSize(key, value);
-
-        // Try to evict expired entries if we're over the limit
-        while (currentMemoryBytes.get() + entrySize > maxMemoryBytes) {
-            if (!evictOne()) {
-                throw new IllegalStateException("Store memory limit exceeded and no entries to evict");
-            }
-        }
-
-        writeWalRecord(WAL_OP_PUT, key, value, now, expiresAt);
-        KeyValuePair newEntry = new KeyValuePair(value, now, expiresAt);
-        KeyValuePair previous = store.put(key, newEntry);
-
-        // Update memory tracking
-        if (previous != null) {
-            currentMemoryBytes.addAndGet(-estimateSize(key, previous.getValueUnsafe()));
-        }
-        currentMemoryBytes.addAndGet(entrySize);
-
-        logger.trace("PUT key={}, valueSize={}, ttl={}, memoryUsed={}",
-                key, value != null ? value.length : 0, ttlMillis, currentMemoryBytes.get());
-        return Optional.ofNullable(previous);
+        KeyValuePair entry = new KeyValuePair(value, HybridLogicalClock.encode(now), ttlMillis > 0 ? now + ttlMillis : 0);
+        ensureCapacity(key, entry);
+        return mutate(() -> {
+            KeyValuePair[] previous = new KeyValuePair[1];
+            store.compute(key, (k, old) -> {
+                appendToWal(WAL_OP_PUT, key, value, entry.getTimestamp(), entry.getExpiresAt());
+                previous[0] = old;
+                return entry;
+            });
+            adjustMemory(key, previous[0], entry);
+            return Optional.ofNullable(previous[0]);
+        });
     }
 
     /**
-     * Put a value only if the provided timestamp is newer than existing (or no
-     * existing value).
-     * This is used for replication and read repair to maintain consistent conflict
-     * resolution.
-     *
-     * @param key       the key
-     * @param value     the value (null for tombstone)
-     * @param timestamp the authoritative timestamp from the source
-     * @param expiresAt the expiration timestamp (0 = no expiration)
-     * @return true if the value was written, false if existing value is newer
+     * Store a versioned value if it is newer than the current entry (last write wins). Used by
+     * replication, read repair and deletes (a null value is a tombstone).
      */
+    @Override
     public boolean putIfNewer(String key, byte[] value, long timestamp, long expiresAt) {
-        validateKey(key);
+        return putIfNewer(key, new KeyValuePair(value, timestamp, expiresAt));
+    }
 
-        // Check existing value
-        KeyValuePair existing = store.get(key);
-        if (existing != null && existing.getTimestamp() >= timestamp) {
-            logger.trace("PUT_IF_NEWER rejected: existing timestamp {} >= new timestamp {}",
-                    existing.getTimestamp(), timestamp);
+    /**
+     * Store the entry if it is newer than the current one.
+     *
+     * @return true if stored, false if the existing entry is at least as new
+     */
+    public boolean putIfNewer(String key, KeyValuePair entry) {
+        validateKey(key);
+        if (!entry.isNewerThan(store.get(key))) {
             return false;
         }
-
-        long entrySize = estimateSize(key, value);
-
-        // Try to evict if needed
-        while (currentMemoryBytes.get() + entrySize > maxMemoryBytes) {
-            if (!evictOne()) {
-                throw new IllegalStateException("Store memory limit exceeded and no entries to evict");
-            }
-        }
-
-        // Create entry with explicit timestamp and expiry
-        KeyValuePair newEntry = new KeyValuePair(value, timestamp, expiresAt);
-
-        // Capture old value for memory accounting (compute returns final value, not
-        // previous)
-        final KeyValuePair[] oldValueHolder = new KeyValuePair[1];
-
-        // Use compute to ensure atomicity
-        KeyValuePair result = store.compute(key, (k, old) -> {
-            // Double-check timestamp during compute (race condition protection)
-            if (old != null && old.getTimestamp() >= timestamp) {
-                return old; // Keep existing
-            }
-            writeWalRecord(WAL_OP_PUT, key, value, timestamp, expiresAt);
-            // Capture old value before replacing
-            oldValueHolder[0] = old;
-            return newEntry;
-        });
-
-        // If we successfully wrote newEntry (result is our new entry), update memory
-        if (result == newEntry) {
-            // Update memory tracking using the captured old value
-            KeyValuePair oldValue = oldValueHolder[0];
-            if (oldValue != null) {
-                currentMemoryBytes.addAndGet(-estimateSize(key, oldValue.getValueUnsafe()));
-            }
-            currentMemoryBytes.addAndGet(entrySize);
-
-            logger.trace("PUT_IF_NEWER key={}, timestamp={}, expiresAt={}, memoryUsed={}",
-                    key, timestamp, expiresAt, currentMemoryBytes.get());
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Estimate the memory size of a key-value entry.
-     */
-    private long estimateSize(String key, byte[] value) {
-        long keySize = key.length() * 2L; // UTF-16 chars
-        long valueSize = value != null ? value.length : 0;
-        return keySize + valueSize + ENTRY_OVERHEAD_BYTES;
-    }
-
-    /**
-     * Try to evict one entry (expired first, then oldest by timestamp).
-     * Uses conditional remove to avoid race where value is updated between check
-     * and remove.
-     *
-     * Eviction policy:
-     * 1. First pass: evict any expired entries
-     * 2. Second pass: evict oldest entry by timestamp (LRU-like)
-     *
-     * @return true if an entry was evicted, false if store is empty
-     */
-    private boolean evictOne() {
-        // First pass: try to evict expired entries
-        for (var entry : store.entrySet()) {
-            KeyValuePair value = entry.getValue();
-            if (value.isExpired()) {
-                // Use conditional remove to only remove if the value hasn't changed
-                if (store.remove(entry.getKey(), value)) {
-                    currentMemoryBytes.addAndGet(-estimateSize(entry.getKey(), value.getValueUnsafe()));
-                    logger.debug("Evicted expired key: {}", entry.getKey());
-                    return true;
+        ensureCapacity(key, entry);
+        return mutate(() -> {
+            KeyValuePair[] previous = new KeyValuePair[1];
+            boolean[] stored = {false};
+            store.compute(key, (k, current) -> {
+                if (!entry.isNewerThan(current)) {
+                    return current;
                 }
+                appendToWal(WAL_OP_PUT, key, entry.getValueUnsafe(), entry.getTimestamp(), entry.getExpiresAt());
+                previous[0] = current;
+                stored[0] = true;
+                return entry;
+            });
+            if (stored[0]) {
+                adjustMemory(key, previous[0], entry);
             }
-        }
-
-        // Second pass: no expired entries, evict oldest by timestamp
-        String oldestKey = null;
-        KeyValuePair oldestValue = null;
-        long oldestTimestamp = Long.MAX_VALUE;
-
-        for (var entry : store.entrySet()) {
-            KeyValuePair value = entry.getValue();
-            if (value.getTimestamp() < oldestTimestamp) {
-                oldestTimestamp = value.getTimestamp();
-                oldestKey = entry.getKey();
-                oldestValue = value;
-            }
-        }
-
-        if (oldestKey != null && oldestValue != null) {
-            // Use conditional remove in case value was updated during iteration
-            if (store.remove(oldestKey, oldestValue)) {
-                currentMemoryBytes.addAndGet(-estimateSize(oldestKey, oldestValue.getValueUnsafe()));
-                logger.debug("Evicted oldest key (timestamp={}): {}", oldestTimestamp, oldestKey);
-                return true;
-            }
-        }
-
-        // Store is empty or all removals raced
-        return false;
+            return stored[0];
+        });
     }
 
     @Override
     public Optional<KeyValuePair> get(String key) {
         validateKey(key);
-        KeyValuePair entry = store.get(key);
-        if (entry == null) {
-            logger.trace("GET key={} -> NOT_FOUND", key);
-            return Optional.empty();
-        }
-        if (entry.isTombstone()) {
-            logger.trace("GET key={} -> TOMBSTONE", key);
-            return Optional.empty();
-        }
-        if (entry.isExpired()) {
-            // Lazy deletion of expired entry
-            if (store.remove(key, entry)) {
-                currentMemoryBytes.addAndGet(-estimateSize(key, entry.getValueUnsafe()));
-            }
-            logger.trace("GET key={} -> EXPIRED", key);
-            return Optional.empty();
-        }
-        logger.trace("GET key={} -> FOUND", key);
-        return Optional.of(entry);
+        KeyValuePair entry = liveEntry(key);
+        return entry == null || entry.isTombstone() ? Optional.empty() : Optional.of(entry);
     }
 
     @Override
     public Optional<KeyValuePair> getRaw(String key) {
         validateKey(key);
-        KeyValuePair entry = store.get(key);
-        if (entry == null) {
-            return Optional.empty();
-        }
-        if (entry.isExpired()) {
-            if (store.remove(key, entry)) {
-                currentMemoryBytes.addAndGet(-estimateSize(key, entry.getValueUnsafe()));
-            }
-            return Optional.empty();
-        }
-        return Optional.of(entry);
+        return Optional.ofNullable(liveEntry(key));
     }
 
     @Override
     public Optional<KeyValuePair> delete(String key) {
         validateKey(key);
-        writeWalRecord(WAL_OP_DELETE, key, null, System.currentTimeMillis(), 0);
-        KeyValuePair removed = store.remove(key);
-        if (removed != null) {
-            currentMemoryBytes.addAndGet(-estimateSize(key, removed.getValueUnsafe()));
-        }
-        logger.trace("DELETE key={} -> {}", key, removed != null ? "DELETED" : "NOT_FOUND");
-        return Optional.ofNullable(removed);
+        return mutate(() -> {
+            KeyValuePair[] removed = new KeyValuePair[1];
+            store.compute(key, (k, old) -> {
+                appendToWal(WAL_OP_DELETE, key, null, System.currentTimeMillis(), 0);
+                removed[0] = old;
+                return null;
+            });
+            adjustMemory(key, removed[0], null);
+            return Optional.ofNullable(removed[0]);
+        });
     }
 
     @Override
     public boolean exists(String key) {
-        validateKey(key);
-        KeyValuePair entry = store.get(key);
-        if (entry == null) {
-            return false;
-        }
-        if (entry.isTombstone()) {
-            return false;
-        }
-        if (entry.isExpired()) {
-            if (store.remove(key, entry)) {
-                currentMemoryBytes.addAndGet(-estimateSize(key, entry.getValueUnsafe()));
-            }
-            return false;
-        }
-        return true;
+        return get(key).isPresent();
     }
 
     @Override
@@ -720,24 +537,72 @@ public class InMemoryStore implements KVStore {
                 .collect(Collectors.toSet());
     }
 
+    /**
+     * Visit every unexpired entry, tombstones included. Weakly consistent with concurrent writes.
+     */
+    public void forEachEntry(java.util.function.BiConsumer<String, KeyValuePair> action) {
+        store.forEach((key, value) -> {
+            if (!value.isExpired()) {
+                action.accept(key, value);
+            }
+        });
+    }
+
+    /**
+     * All unexpired keys, including deleted keys whose tombstones are still retained.
+     */
+    public Set<String> keysIncludingTombstones() {
+        return store.entrySet().stream()
+                .filter(e -> !e.getValue().isExpired())
+                .map(e -> e.getKey())
+                .collect(Collectors.toSet());
+    }
+
     @Override
     public int size() {
-        return (int) store.entrySet().stream()
-                .filter(e -> !e.getValue().isExpired() && !e.getValue().isTombstone())
+        return (int) store.values().stream()
+                .filter(v -> !v.isExpired() && !v.isTombstone())
                 .count();
     }
 
     @Override
     public void clear() {
-        writeWalRecord(WAL_OP_CLEAR, "", null, 0, 0);
-        store.clear();
-        currentMemoryBytes.set(0);
-        logger.debug("Store cleared");
+        if (walEnabled) {
+            mutationLock.writeLock().lock();
+        }
+        try {
+            appendToWal(WAL_OP_CLEAR, "", null, 0, 0);
+            awaitDurable();
+            store.clear();
+            currentMemoryBytes.set(0);
+        } finally {
+            if (walEnabled) {
+                mutationLock.writeLock().unlock();
+            }
+        }
     }
 
     /**
-     * Shutdown the cleanup executor.
+     * Number of stored entries including expired ones and tombstones.
      */
+    public int rawSize() {
+        return store.size();
+    }
+
+    /**
+     * @return true if writes are persisted to a write-ahead log
+     */
+    public boolean isWalEnabled() {
+        return walEnabled;
+    }
+
+    /**
+     * Estimated bytes used by stored entries.
+     */
+    public long getMemoryUsedBytes() {
+        return currentMemoryBytes.get();
+    }
+
     public void shutdown() {
         cleanupExecutor.shutdown();
         try {
@@ -748,70 +613,91 @@ public class InMemoryStore implements KVStore {
             cleanupExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
-        if (walChannel != null) {
-            try {
-                walChannel.close();
-            } catch (IOException e) {
-                logger.debug("Error closing WAL: {}", e.getMessage());
+        synchronized (walLock) {
+            if (walChannel != null) {
+                try {
+                    walChannel.close();
+                } catch (IOException e) {
+                    logger.debug("Error closing WAL: {}", e.getMessage());
+                }
             }
         }
         logger.info("InMemoryStore shutdown complete");
     }
 
+    // ==================== Housekeeping ====================
+
     /**
-     * Put with explicit timestamp for replication.
-     * Only updates if the new entry is newer than existing.
-     *
-     * @param key   the key
-     * @param entry the entry with timestamp
-     * @return true if the entry was stored
+     * The entry for a key, removing it first if it has expired.
      */
-    public boolean putIfNewer(String key, KeyValuePair entry) {
-        validateKey(key);
-
-        KeyValuePair existing = store.get(key);
-        if (!entry.isNewerThan(existing)) {
-            return false;
-        }
-
-        long entrySize = estimateSize(key, entry.getValueUnsafe());
-
-        // Try to evict if needed - reusing evictOne logic from other methods
-        while (currentMemoryBytes.get() + entrySize > maxMemoryBytes) {
-            if (!evictOne()) {
-                logger.warn("Memory limit exceeded during replication write for key {}", key);
-                return false;
+    private KeyValuePair liveEntry(String key) {
+        KeyValuePair entry = store.get(key);
+        if (entry != null && entry.isExpired()) {
+            if (store.remove(key, entry)) {
+                adjustMemory(key, entry, null);
             }
+            return null;
         }
-
-        // Track whether entry was actually stored
-        final boolean[] wasStored = { false };
-
-        store.compute(key, (k, current) -> {
-            if (entry.isNewerThan(current)) {
-                writeWalRecord(WAL_OP_PUT, key, entry.getValueUnsafe(), entry.getTimestamp(), entry.getExpiresAt());
-                // Update memory accounting
-                long oldSize = current != null ? estimateSize(k, current.getValueUnsafe()) : 0;
-                long newSize = estimateSize(k, entry.getValueUnsafe());
-                currentMemoryBytes.addAndGet(newSize - oldSize);
-
-                wasStored[0] = true;
-                return entry;
-            }
-            return current;
-        });
-
-        return wasStored[0];
+        return entry;
     }
 
     /**
-     * Get raw entry count including expired (for debugging).
+     * Purge expired entries, and tombstones older than the grace period. Tombstones are kept that
+     * long so a replica that missed the delete gets repaired instead of resurrecting the value.
+     * Purges are not written to the WAL: replay re-derives expiry, and a replayed old tombstone is
+     * purged again on the next run.
      */
-    public int rawSize() {
-        return store.size();
+    private void cleanupExpired() {
+        long tombstoneCutoff = System.currentTimeMillis() - tombstoneGraceMs;
+        int removed = 0;
+        for (var entry : store.entrySet()) {
+            KeyValuePair value = entry.getValue();
+            boolean purge = value.isExpired()
+                    || (value.isTombstone() && HybridLogicalClock.physicalMillis(value.getTimestamp()) < tombstoneCutoff);
+            if (purge && store.remove(entry.getKey(), value)) {
+                adjustMemory(entry.getKey(), value, null);
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            logger.debug("Purged {} expired entries and old tombstones, memoryUsed={}", removed,
+                    currentMemoryBytes.get());
+        }
     }
 
-    private void validateKey(String key) {
+    /**
+     * Reject a write that would exceed the memory limit, after first purging expired entries.
+     * Live data is never evicted: silently dropping acknowledged writes would be data loss.
+     */
+    private void ensureCapacity(String key, KeyValuePair entry) {
+        long needed = estimateSize(key, entry.getValueUnsafe());
+        if (currentMemoryBytes.get() + needed <= maxMemoryBytes) {
+            return;
+        }
+        cleanupExpired();
+        if (currentMemoryBytes.get() + needed > maxMemoryBytes) {
+            throw new IllegalStateException("Store memory limit of " + maxMemoryBytes + " bytes reached");
+        }
+    }
+
+    private void adjustMemory(String key, KeyValuePair removed, KeyValuePair added) {
+        long delta = 0;
+        if (removed != null) {
+            delta -= estimateSize(key, removed.getValueUnsafe());
+        }
+        if (added != null) {
+            delta += estimateSize(key, added.getValueUnsafe());
+        }
+        if (delta != 0) {
+            currentMemoryBytes.addAndGet(delta);
+        }
+    }
+
+    private static long estimateSize(String key, byte[] value) {
+        return key.length() * 2L + (value != null ? value.length : 0) + ENTRY_OVERHEAD_BYTES;
+    }
+
+    private static void validateKey(String key) {
         if (key == null || key.isEmpty()) {
             throw new IllegalArgumentException("Key cannot be null or empty");
         }

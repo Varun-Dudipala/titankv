@@ -35,3 +35,6 @@ logs/
 *.pid
 *.seed
 *.pid.lock
+
+# Node data (WAL, snapshots)
+data/

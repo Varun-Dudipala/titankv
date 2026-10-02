@@ -14,7 +14,6 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Connection pool for client-side connection reuse.
@@ -23,13 +22,6 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ConnectionPool {
 
     private static final Logger logger = LoggerFactory.getLogger(ConnectionPool.class);
-
-    // Shared timeout executor for enforcing read timeouts
-    private static final ScheduledExecutorService TIMEOUT_EXECUTOR = Executors.newScheduledThreadPool(2, r -> {
-        Thread t = new Thread(r, "connection-timeout");
-        t.setDaemon(true);
-        return t;
-    });
 
     private final int maxConnectionsPerHost;
     private final int connectTimeoutMs;
@@ -105,6 +97,16 @@ public class ConnectionPool {
     }
 
     /**
+     * Close every idle connection to a host, e.g. after one turned out to be stale.
+     */
+    public void evictIdle(String host) {
+        HostPool pool = hostPools.get(host);
+        if (pool != null) {
+            pool.evictIdle();
+        }
+    }
+
+    /**
      * Close all connections and clear the pool.
      */
     public void close() {
@@ -112,7 +114,7 @@ public class ConnectionPool {
             pool.close();
         }
         hostPools.clear();
-        logger.info("Connection pool closed");
+        logger.debug("Connection pool closed");
     }
 
     /**
@@ -250,12 +252,11 @@ public class ConnectionPool {
             // Try to get idle connection without blocking
             PooledConnection conn = idle.poll();
             if (conn != null && conn.isOpen()) {
+                conn.markReused();
                 return conn;
             }
-            // Connection from pool was stale, release its permit
             if (conn != null) {
-                permits.release();
-                totalConnections.decrementAndGet();
+                invalidate(conn); // closed while idle
             }
 
             // Try to acquire permit (with timeout)
@@ -286,14 +287,9 @@ public class ConnectionPool {
             channel.socket().setTcpNoDelay(true);
             channel.socket().setKeepAlive(true);
 
-            // Set read timeout (only works for blocking mode)
-            // NOTE: This timeout applies to Socket.getInputStream().read() but NOT to
-            // SocketChannel.read(). For true timeout enforcement with SocketChannel,
-            // use selector-based non-blocking I/O or SO_TIMEOUT before configuring
-            // blocking.
+            // SO_TIMEOUT applies to reads through the socket's input stream, which
+            // PooledConnection.readWithTimeout uses (a plain SocketChannel.read ignores it)
             channel.socket().setSoTimeout(readTimeoutMs);
-
-            // Configure as blocking for simpler client implementation
             channel.configureBlocking(true);
 
             try {
@@ -310,6 +306,13 @@ public class ConnectionPool {
             return connection;
         }
 
+        void evictIdle() {
+            PooledConnection conn;
+            while ((conn = idle.poll()) != null) {
+                invalidate(conn);
+            }
+        }
+
         void release(PooledConnection conn) {
             if (closed) {
                 invalidate(conn);
@@ -324,11 +327,16 @@ public class ConnectionPool {
             }
         }
 
+        /**
+         * Close a connection and give back its permit. Idempotent: a connection invalidated twice
+         * (say, by a failed request and then by a stale-pool eviction) must not free two permits.
+         */
         void invalidate(PooledConnection conn) {
             conn.closeQuietly();
-            totalConnections.decrementAndGet();
-            allConnections.remove(conn);
-            permits.release();
+            if (allConnections.remove(conn)) {
+                totalConnections.decrementAndGet();
+                permits.release();
+            }
         }
 
         void close() {
@@ -364,9 +372,12 @@ public class ConnectionPool {
 
         private final String host;
         private final SocketChannel channel;
+        private java.io.InputStream in;
+        private int soTimeout = -1;
         private ByteBuffer readBuffer; // Mutable for dynamic growth
         private ByteBuffer writeBuffer; // Mutable for dynamic growth
         private boolean authenticated;
+        private boolean reused;
 
         PooledConnection(String host, SocketChannel channel) {
             this.host = host;
@@ -400,6 +411,17 @@ public class ConnectionPool {
         public ByteBuffer getWriteBuffer() {
             writeBuffer.clear();
             return writeBuffer;
+        }
+
+        /**
+         * @return true if this connection was handed out from the idle pool rather than newly opened
+         */
+        public boolean isReused() {
+            return reused;
+        }
+
+        void markReused() {
+            reused = true;
         }
 
         public boolean isAuthenticated() {
@@ -472,75 +494,27 @@ public class ConnectionPool {
             }
         }
 
-        public int read(ByteBuffer buffer) throws IOException {
-            return channel.read(buffer);
-        }
-
         /**
-         * Read from the channel with enforced timeout.
-         * If the read takes longer than timeoutMs, the channel is closed and
-         * SocketTimeoutException is thrown.
+         * Blocking read that fails with {@link SocketTimeoutException} if no data arrives within the
+         * timeout. Uses the socket's own SO_TIMEOUT (honoured by the channel's stream adaptor), so no
+         * timer task is scheduled per read.
          *
-         * @param buffer    the buffer to read into
-         * @param timeoutMs timeout in milliseconds
-         * @return number of bytes read, or -1 if end of stream
-         * @throws SocketTimeoutException if the read times out
-         * @throws IOException            if an I/O error occurs
+         * @return number of bytes read, or -1 if the server closed the connection
          */
         public int readWithTimeout(ByteBuffer buffer, long timeoutMs) throws IOException {
-            if (timeoutMs <= 0) {
-                // No timeout enforcement
-                return channel.read(buffer);
+            int timeout = (int) Math.min(Integer.MAX_VALUE, Math.max(0, timeoutMs));
+            if (timeout != soTimeout) {
+                channel.socket().setSoTimeout(timeout);
+                soTimeout = timeout;
             }
-
-            // Track if timeout fired
-            AtomicReference<ScheduledFuture<?>> timeoutTask = new AtomicReference<>();
-            AtomicReference<IOException> timeoutException = new AtomicReference<>();
-
-            try {
-                // Schedule timeout: if it fires, close the channel
-                ScheduledFuture<?> task = TIMEOUT_EXECUTOR.schedule(() -> {
-                    try {
-                        logger.debug("Read timeout after {}ms, closing connection to {}", timeoutMs, host);
-                        channel.close();
-                        timeoutException.set(new SocketTimeoutException(
-                                "Read timeout after " + timeoutMs + "ms for " + host));
-                    } catch (IOException e) {
-                        logger.debug("Error closing channel on timeout: {}", e.getMessage());
-                    }
-                }, timeoutMs, TimeUnit.MILLISECONDS);
-
-                timeoutTask.set(task);
-
-                // Perform blocking read
-                int bytesRead = channel.read(buffer);
-
-                // Read completed successfully, cancel timeout
-                task.cancel(false);
-
-                // Check if timeout fired before we could cancel
-                IOException timedOut = timeoutException.get();
-                if (timedOut != null) {
-                    throw timedOut;
-                }
-
-                return bytesRead;
-
-            } catch (IOException e) {
-                // Cancel timeout if still pending
-                ScheduledFuture<?> task = timeoutTask.get();
-                if (task != null) {
-                    task.cancel(false);
-                }
-
-                // Check if this was a timeout-induced close
-                IOException timedOut = timeoutException.get();
-                if (timedOut != null) {
-                    throw timedOut;
-                }
-
-                throw e;
+            if (in == null) {
+                in = channel.socket().getInputStream();
             }
+            int read = in.read(buffer.array(), buffer.arrayOffset() + buffer.position(), buffer.remaining());
+            if (read > 0) {
+                buffer.position(buffer.position() + read);
+            }
+            return read;
         }
 
         void closeQuietly() {

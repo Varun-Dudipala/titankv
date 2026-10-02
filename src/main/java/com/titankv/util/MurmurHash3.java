@@ -45,6 +45,7 @@ public final class MurmurHash3 {
      * @param seed   the seed value
      * @return 64-bit hash value
      */
+    @SuppressWarnings("fallthrough") // the tail switch intentionally falls through, as in the reference implementation
     public static long hash64(byte[] data, int offset, int length, int seed) {
         long h1 = seed & 0x00000000FFFFFFFFL;
         long h2 = seed & 0x00000000FFFFFFFFL;

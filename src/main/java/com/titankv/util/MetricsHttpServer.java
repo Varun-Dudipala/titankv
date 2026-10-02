@@ -3,8 +3,10 @@ package com.titankv.util;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
 import com.titankv.core.InMemoryStore;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Meter;
-import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +35,6 @@ public class MetricsHttpServer {
 
     private static final Logger logger = LoggerFactory.getLogger(MetricsHttpServer.class);
 
-    private static final int DEFAULT_PORT = 9091;
     private static final String CRLF = "\r\n";
 
     private final int port;
@@ -44,13 +45,6 @@ public class MetricsHttpServer {
     private final ExecutorService executor;
     private ServerSocket serverSocket;
     private Thread acceptThread;
-
-    /**
-     * Create a metrics HTTP server.
-     */
-    public MetricsHttpServer(MetricsCollector metrics, ClusterManager clusterManager, InMemoryStore store) {
-        this(getConfiguredPort(), metrics, clusterManager, store);
-    }
 
     /**
      * Create a metrics HTTP server on a specific port.
@@ -66,21 +60,6 @@ public class MetricsHttpServer {
             t.setDaemon(true);
             return t;
         });
-    }
-
-    private static int getConfiguredPort() {
-        String value = System.getenv("TITANKV_METRICS_PORT");
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.metrics.port");
-        }
-        if (value != null && !value.isEmpty()) {
-            try {
-                return Integer.parseInt(value.trim());
-            } catch (NumberFormatException e) {
-                logger.warn("Invalid metrics port {}, using default {}", value, DEFAULT_PORT);
-            }
-        }
-        return DEFAULT_PORT;
     }
 
     /**
@@ -217,55 +196,84 @@ public class MetricsHttpServer {
         }
     }
 
+    /**
+     * Prometheus text format: counters end in _total, timers become _seconds_count/_sum/_max, and
+     * every metric family gets one # HELP and # TYPE line.
+     */
     private void handleMetrics(OutputStream out) throws IOException {
         StringBuilder sb = new StringBuilder();
-        MeterRegistry registry = metrics.getRegistry();
-
-        // Export all metrics in Prometheus format
-        for (Meter meter : registry.getMeters()) {
-            String name = meter.getId().getName().replace('.', '_');
-            String tags = formatTags(meter);
-
-            meter.measure().forEach(measurement -> {
-                String statistic = measurement.getStatistic().name().toLowerCase();
-                String metricName = name;
-                if (!statistic.equals("value") && !statistic.equals("count")) {
-                    metricName = name + "_" + statistic;
+        java.util.Map<String, java.util.List<Meter>> families = new java.util.TreeMap<>();
+        for (Meter meter : metrics.getRegistry().getMeters()) {
+            families.computeIfAbsent(meter.getId().getName(), n -> new java.util.ArrayList<>()).add(meter);
+        }
+        for (java.util.List<Meter> family : families.values()) {
+            Meter first = family.get(0);
+            String name = first.getId().getName().replace('.', '_');
+            String help = first.getId().getDescription() != null ? first.getId().getDescription() : name;
+            if (first instanceof Counter || first instanceof FunctionCounter) {
+                header(sb, name + "_total", help, "counter");
+                for (Meter meter : family) {
+                    double count = meter instanceof Counter ? ((Counter) meter).count()
+                            : ((FunctionCounter) meter).count();
+                    sample(sb, name + "_total", formatTags(meter), count);
                 }
-                sb.append(metricName);
-                if (!tags.isEmpty()) {
-                    sb.append("{").append(tags).append("}");
+            } else if (first instanceof Timer) {
+                header(sb, name + "_seconds", help, "summary");
+                for (Meter meter : family) {
+                    Timer timer = (Timer) meter;
+                    String tags = formatTags(meter);
+                    sample(sb, name + "_seconds_count", tags, timer.count());
+                    sample(sb, name + "_seconds_sum", tags, timer.totalTime(TimeUnit.SECONDS));
                 }
-                sb.append(" ").append(measurement.getValue()).append("\n");
-            });
+                header(sb, name + "_seconds_max", help + " (recent maximum)", "gauge");
+                for (Meter meter : family) {
+                    sample(sb, name + "_seconds_max", formatTags(meter), ((Timer) meter).max(TimeUnit.SECONDS));
+                }
+            } else {
+                header(sb, name, help, "gauge");
+                for (Meter meter : family) {
+                    for (io.micrometer.core.instrument.Measurement m : meter.measure()) {
+                        sample(sb, name, formatTags(meter), m.getValue());
+                    }
+                }
+            }
         }
 
-        // Add custom metrics
-        sb.append("# HELP titankv_info TitanKV server info\n");
-        sb.append("# TYPE titankv_info gauge\n");
+        header(sb, "titankv_info", "TitanKV server info", "gauge");
         sb.append("titankv_info{version=\"1.0.0\"} 1\n");
-
         if (clusterManager != null) {
-            sb.append("# HELP titankv_cluster_nodes Number of nodes in cluster\n");
-            sb.append("# TYPE titankv_cluster_nodes gauge\n");
-            sb.append("titankv_cluster_nodes ").append(clusterManager.getNodeCount()).append("\n");
-
-            sb.append("# HELP titankv_cluster_alive_nodes Number of alive nodes\n");
-            sb.append("# TYPE titankv_cluster_alive_nodes gauge\n");
-            sb.append("titankv_cluster_alive_nodes ").append(clusterManager.getAliveNodeCount()).append("\n");
+            header(sb, "titankv_cluster_nodes", "Members of the cluster, including down ones", "gauge");
+            sample(sb, "titankv_cluster_nodes", "", clusterManager.getNodeCount());
+            header(sb, "titankv_cluster_alive_nodes", "Members currently considered up", "gauge");
+            sample(sb, "titankv_cluster_alive_nodes", "", clusterManager.getAliveNodeCount());
         }
-
         if (store != null) {
-            sb.append("# HELP titankv_store_keys Number of keys in store\n");
-            sb.append("# TYPE titankv_store_keys gauge\n");
-            sb.append("titankv_store_keys ").append(store.size()).append("\n");
-
-            sb.append("# HELP titankv_store_keys_raw Total keys including expired/tombstones\n");
-            sb.append("# TYPE titankv_store_keys_raw gauge\n");
-            sb.append("titankv_store_keys_raw ").append(store.rawSize()).append("\n");
+            header(sb, "titankv_store_keys", "Live keys stored on this node", "gauge");
+            sample(sb, "titankv_store_keys", "", store.size());
+            header(sb, "titankv_store_keys_raw", "Stored entries including tombstones and expired entries", "gauge");
+            sample(sb, "titankv_store_keys_raw", "", store.rawSize());
         }
 
         sendResponse(out, 200, "text/plain; version=0.0.4; charset=utf-8", sb.toString());
+    }
+
+    private static void header(StringBuilder sb, String name, String help, String type) {
+        sb.append("# HELP ").append(name).append(' ').append(help.replace("\n", " ")).append('\n');
+        sb.append("# TYPE ").append(name).append(' ').append(type).append('\n');
+    }
+
+    private static void sample(StringBuilder sb, String name, String tags, double value) {
+        sb.append(name);
+        if (!tags.isEmpty()) {
+            sb.append('{').append(tags).append('}');
+        }
+        sb.append(' ');
+        if (value == Math.rint(value) && !Double.isInfinite(value) && Math.abs(value) < 1e15) {
+            sb.append((long) value);
+        } else {
+            sb.append(value);
+        }
+        sb.append('\n');
     }
 
     private String formatTags(Meter meter) {
@@ -291,20 +299,11 @@ public class MetricsHttpServer {
     }
 
     private void handleReady(OutputStream out) throws IOException {
-        // Readiness check - can we serve traffic?
-        boolean ready = true;
-        String reason = "";
-
-        if (clusterManager != null && !clusterManager.isRunning()) {
-            ready = false;
-            reason = "cluster not running";
-        }
-
-        if (ready) {
+        if (clusterManager == null || clusterManager.isReady()) {
             sendResponse(out, 200, "application/json", "{\"status\":\"ready\"}");
         } else {
-            sendResponse(out, 503, "application/json", 
-                "{\"status\":\"not ready\",\"reason\":\"" + reason + "\"}");
+            sendResponse(out, 503, "application/json",
+                    "{\"status\":\"not ready\",\"reason\":\"joining cluster\"}");
         }
     }
 
@@ -330,9 +329,10 @@ public class MetricsHttpServer {
         sb.append("  \"cluster\": {\n");
         if (clusterManager != null) {
             sb.append("    \"running\": ").append(clusterManager.isRunning()).append(",\n");
+            sb.append("    \"ready\": ").append(clusterManager.isReady()).append(",\n");
             sb.append("    \"total_nodes\": ").append(clusterManager.getNodeCount()).append(",\n");
             sb.append("    \"alive_nodes\": ").append(clusterManager.getAliveNodeCount()).append(",\n");
-            sb.append("    \"local_node\": \"").append(clusterManager.getLocalNode().getId()).append("\",\n");
+            sb.append("    \"local_node\": \"").append(jsonEscape(clusterManager.getLocalNode().getId())).append("\",\n");
             sb.append("    \"nodes\": [\n");
             boolean first = true;
             for (Node node : clusterManager.getAllNodes()) {
@@ -340,9 +340,9 @@ public class MetricsHttpServer {
                     sb.append(",\n");
                 }
                 first = false;
-                sb.append("      {\"id\": \"").append(node.getId())
+                sb.append("      {\"id\": \"").append(jsonEscape(node.getId()))
                   .append("\", \"status\": \"").append(node.getStatus())
-                  .append("\", \"address\": \"").append(node.getAddress()).append("\"}");
+                  .append("\", \"address\": \"").append(jsonEscape(node.getAddress())).append("\"}");
             }
             sb.append("\n    ]\n");
         } else {
@@ -366,6 +366,10 @@ public class MetricsHttpServer {
         sb.append("}");
 
         sendResponse(out, 200, "application/json", sb.toString());
+    }
+
+    private static String jsonEscape(String value) {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     private void sendResponse(OutputStream out, int statusCode, String contentType, String body) throws IOException {

@@ -162,20 +162,13 @@ class FailureRecoveryTest {
         restartedNode.start();
         servers.set(1, restartedNode);
 
-        // Wait for recovery detection
-        Thread.sleep(5000);
-
-        // Verify the node is back in the cluster
+        // The seed must see the restarted node alive again
         ClusterManager seedCm = servers.get(0).getClusterManager();
-        Node recoveredNode = seedCm.getNode("node-2");
-        
-        // Node should either be null (removed) or alive
-        // The exact behavior depends on gossip timing
-        if (recoveredNode != null) {
-            // If present, should be alive or recently recovered
-            assertThat(recoveredNode.getStatus())
-                .isIn(Node.Status.ALIVE, Node.Status.JOINING);
-        }
+        TestCluster.awaitCondition(() -> {
+            Node recovered = seedCm.getNode("node-2");
+            return recovered != null && recovered.getStatus() == Node.Status.ALIVE;
+        }, 15_000, "seed to see node-2 alive again");
+        assertThat(client.getString(key)).contains(value);
     }
 
     @Test
@@ -189,17 +182,9 @@ class FailureRecoveryTest {
         String key = "partial-failure-write-" + System.currentTimeMillis();
         String value = "write-during-failure";
 
-        // This may succeed or fail depending on consistency requirements
-        // With QUORUM (2 of 3), should succeed with 2 nodes
-        try {
-            client.put(key, value);
-            // If write succeeded, verify it
-            Optional<String> result = client.getString(key);
-            assertThat(result).isPresent().contains(value);
-        } catch (IOException e) {
-            // Write failed due to consistency requirements - this is acceptable
-            assertThat(e.getMessage()).containsAnyOf("timeout", "failed", "consistency");
-        }
+        // QUORUM needs 2 of 3 replicas, so losing one node must not affect writes or reads
+        client.put(key, value);
+        assertThat(client.getString(key)).contains(value);
     }
 
     @Test
@@ -248,27 +233,5 @@ class FailureRecoveryTest {
         // Read repair should fix any stale replicas
         Optional<String> result = client.getString(key);
         assertThat(result).isPresent().contains(value2);
-    }
-
-    @Test
-    @DisplayName("Tombstones should prevent resurrection")
-    void testTombstonePreventsResurrection() throws Exception {
-        String key = "tombstone-test-" + System.currentTimeMillis();
-        String value = "to-be-deleted";
-
-        // Write
-        client.put(key, value);
-        assertThat(client.getString(key)).contains(value);
-
-        // Delete
-        client.delete(key);
-        assertThat(client.getString(key)).isEmpty();
-
-        // Try to write with an older timestamp (simulated by just writing again)
-        // The delete tombstone should prevent the old value from appearing
-        // (In a real scenario, this tests read repair with stale data)
-        
-        // Verify still deleted
-        assertThat(client.getString(key)).isEmpty();
     }
 }

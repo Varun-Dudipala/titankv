@@ -1,77 +1,45 @@
 package com.titankv.consistency;
 
 /**
- * Tunable consistency levels for reads and writes.
- * Similar to Cassandra's consistency model.
+ * How many of a key's replicas must answer before a read or write succeeds, as in Cassandra.
+ * With replication factor N, QUORUM is N/2 + 1, so QUORUM reads and QUORUM writes always share
+ * at least one replica (R + W > N).
  */
 public enum ConsistencyLevel {
 
-    /**
-     * ONE: Operation succeeds after one node responds.
-     * - Fastest latency
-     * - Risk of reading stale data
-     * - Best for: non-critical data, high throughput requirements
-     */
-    ONE(1),
+    /** One replica: lowest latency and highest availability; reads may be stale. */
+    ONE,
+
+    /** A majority of replicas: tolerates a minority down; QUORUM reads see QUORUM writes. */
+    QUORUM,
+
+    /** Every replica: fails if any replica is down. */
+    ALL;
 
     /**
-     * QUORUM: Majority of replicas must respond.
-     * - Balanced latency and consistency
-     * - Formula: (Replication Factor / 2) + 1
-     * - Best for: most production workloads
-     */
-    QUORUM(-1), // Calculated dynamically
-
-    /**
-     * ALL: All replicas must respond.
-     * - Highest consistency guarantee
-     * - Slowest, vulnerable to single node failure
-     * - Best for: critical data requiring strong consistency
-     */
-    ALL(-1); // All replicas
-
-    private final int fixedCount;
-
-    ConsistencyLevel(int fixedCount) {
-        this.fixedCount = fixedCount;
-    }
-
-    /**
-     * Get the number of nodes required for this consistency level.
-     *
-     * @param replicationFactor the total number of replicas
-     * @return number of nodes required
+     * @param replicationFactor the number of replicas a key has
+     * @return how many of them must answer
      */
     public int getRequired(int replicationFactor) {
         switch (this) {
             case ONE:
                 return 1;
             case QUORUM:
-                return (replicationFactor / 2) + 1;
-            case ALL:
-                return replicationFactor;
+                return replicationFactor / 2 + 1;
             default:
-                return fixedCount > 0 ? fixedCount : 1;
+                return replicationFactor;
         }
     }
 
     /**
-     * Check if this consistency level can tolerate the given number of failures.
-     *
-     * @param replicationFactor total replicas
-     * @param failures          number of failed nodes
-     * @return true if the operation can still succeed
+     * @return whether the level can still be met with this many replicas down
      */
     public boolean canTolerate(int replicationFactor, int failures) {
-        int required = getRequired(replicationFactor);
-        return (replicationFactor - failures) >= required;
+        return replicationFactor - failures >= getRequired(replicationFactor);
     }
 
     /**
-     * Get the maximum number of failures this level can tolerate.
-     *
-     * @param replicationFactor total replicas
-     * @return maximum tolerable failures
+     * @return the most replicas that can be down while the level can still be met
      */
     public int maxTolerableFailures(int replicationFactor) {
         return replicationFactor - getRequired(replicationFactor);
