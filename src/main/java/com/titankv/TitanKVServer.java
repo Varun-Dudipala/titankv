@@ -225,7 +225,7 @@ public class TitanKVServer {
             dataRebalancer.stop();
         }
 
-        // Stop cluster manager (graceful leave)
+        // Stop cluster manager: tells peers this node is shutting down
         clusterManager.stop();
 
         // Stop replication manager

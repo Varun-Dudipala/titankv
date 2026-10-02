@@ -1,190 +1,49 @@
 # Contributing to TitanKV
 
-Thanks for your interest in contributing to TitanKV! This document provides guidelines for contributing to this distributed key-value store project.
+Issues and pull requests are welcome. For a bug, include steps to reproduce, the expected and
+actual behaviour, and logs; for a feature, the use case and how it fits the design in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## How to Contribute
+## Build and test
 
-### Reporting Bugs
-
-If you find a bug, please open an issue with:
-- Clear, descriptive title
-- Steps to reproduce the bug
-- Expected vs actual behavior
-- Environment details (Java version, OS, cluster configuration)
-- Logs or stack traces if applicable
-
-### Suggesting Features
-
-Feature requests are welcome! Please open an issue with:
-- Clear description of the feature
-- Use case explaining why it would be valuable
-- Any implementation ideas you have
-- Consider distributed systems trade-offs (CAP theorem)
-
-### Pull Requests
-
-1. **Fork the repository** and create a new branch from `main`
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-2. **Make your changes** following our code style guidelines
-
-3. **Test your changes**
-   - Run unit and integration tests: `mvn verify`
-   - Test with a local cluster
-   - Keep the build free of compiler warnings (it compiles with `-Xlint:all`)
-   - Test edge cases (network failures, node crashes)
-
-4. **Commit your changes** with clear, descriptive messages
-   ```bash
-   git commit -m "Add: feature description"
-   ```
-
-5. **Push to your fork** and submit a pull request
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-6. **Describe your PR** with:
-   - What changes you made
-   - Why you made them
-   - Any performance implications
-   - Test results or benchmarks
-
-## Development Setup
+Requires Java 17+ and Maven 3.6+.
 
 ```bash
-# Clone your fork
-git clone https://github.com/YOUR_USERNAME/titankv.git
-cd titankv
-
-# Build the project
-mvn clean package
-
-# Run unit tests, then integration tests that start real clusters
-mvn verify
-
-# Start a local 3-node cluster, open a shell on it, stop it
-./scripts/start-cluster.sh
-./scripts/titankv-cli.sh localhost:9001
-./scripts/stop-cluster.sh
-
-# Or run a 3-node cluster in Docker
-docker compose up -d --build
-```
-
-## Code Style Guidelines
-
-### Java
-- Follow standard Java naming conventions
-- Use Java 17 features where appropriate
-- Add Javadoc comments for public APIs
-- Keep methods focused and concise
-- Use meaningful variable names
-
-### Code Organization
-- Core storage logic in `core/`
-- Cluster management in `cluster/`
-- Network protocol in `network/`
-- Consistency logic in `consistency/`
-- Tests mirror main package structure
-
-### Naming Conventions
-- Classes: `PascalCase` (e.g., `ConsistentHashRing`)
-- Methods: `camelCase` (e.g., `getNodeForKey()`)
-- Constants: `UPPER_SNAKE_CASE` (e.g., `MAGIC_NUMBER`)
-- Packages: lowercase (e.g., `com.titankv.cluster`)
-
-### Code Quality
-- Write clean, readable code
-- Add comments for complex algorithms (consistent hashing, gossip)
-- Use appropriate data structures (ConcurrentHashMap, etc.)
-- Handle errors and edge cases gracefully
-- Remove debug print statements before committing
-
-## Testing
-
-### Unit Tests
-```bash
-# Run unit tests
-mvn test
-
-# Run unit and integration tests (integration tests are tagged "integration")
-mvn verify
-
-# Run specific test
+mvn clean package          # build target/titankv-1.0.0.jar and run the unit tests
+mvn verify                 # + integration tests (real in-JVM clusters, including the chaos test)
+                           #   and the 75% line-coverage gate
 mvn test -Dtest=ConsistentHashTest
-
-# Run with coverage
-mvn test jacoco:report
+mvn verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test=ChaosTest
 ```
 
-### Integration Testing
-Test your changes with a real cluster:
-```bash
-# Start 3-node cluster
-./scripts/start-cluster.sh
+Integration tests are tagged `integration` and run under Failsafe. They bind client ports from 19000
+up, plus gossip (port + 1000) and metrics (port + 90).
 
-# Run the benchmark against it, then stop it
-./scripts/run-benchmark.sh --hosts localhost:9001,localhost:9002,localhost:9003
+Try a change on a real cluster:
+
+```bash
+./scripts/start-cluster.sh                 # 3 local nodes; NODES=5 for more
+./scripts/titankv-cli.sh localhost:9001
+./scripts/run-benchmark.sh --hosts localhost:9001,localhost:9002,localhost:9003 --duration 10
 ./scripts/stop-cluster.sh
 ```
 
-### Performance Testing
-If your changes affect performance:
-- Run benchmarks before and after
-- Document performance characteristics
-- Consider trade-offs (latency vs throughput vs consistency)
+## Expectations for a pull request
 
-## Architecture Guidelines
+- `mvn verify` passes, and the build has no compiler warnings (it compiles with `-Xlint:all`).
+- A behaviour change comes with a test. For replication, membership or storage changes, prefer an
+  integration test on a `TestCluster`, and consider whether the chaos test covers the failure mode.
+- A change that may affect performance includes before/after numbers from
+  `./scripts/benchmark-suite.sh` (or the relevant scenario), measured on the same machine.
+- A wire-format change updates the protocol section of the README. The protocol has no version
+  field, so every node and client in a cluster must run the same build.
 
-### Distributed Systems Principles
-- **CAP Theorem**: Consider consistency, availability, partition tolerance trade-offs
-- **Eventual Consistency**: Design for asynchronous replication
-- **Fault Tolerance**: Handle node failures gracefully
-- **Idempotence**: Operations should be safe to retry
+## Layout
 
-### Performance Considerations
-- Use non-blocking I/O where possible
-- Minimize object allocations in hot paths
-- Profile before optimizing
-- Consider network bandwidth and latency
-
-### Protocol Changes
-If modifying the binary protocol:
-1. Document the change in README
-2. Consider backward compatibility
-3. Update protocol version if needed
-4. Test with mixed-version clusters
-
-## Adding New Features
-
-### Storage Features
-- Ensure thread-safety with ConcurrentHashMap
-- Consider memory implications
-- Add appropriate tests
-
-### Cluster Features
-- Test with various cluster sizes
-- Handle network partitions
-- Test failure scenarios
-
-### Protocol Features
-- Update command codes if needed
-- Document new message formats
-- Ensure efficient serialization
-
-## Questions?
-
-Feel free to open an issue with the `question` label, or reach out to [@varun-dudipala](https://github.com/varun-dudipala).
-
-## Code of Conduct
-
-- Be respectful and inclusive
-- Provide constructive feedback
-- Focus on what's best for the project
-- Show empathy towards other contributors
-- Welcome newcomers to distributed systems
-
-Thank you for contributing to TitanKV!
+| Package | Contents |
+|---|---|
+| `core` | In-memory store, write-ahead log, snapshots |
+| `cluster` | Hash ring, gossip, membership, data streaming to joining nodes |
+| `consistency` | Replication, read repair, hinted handoff, anti-entropy |
+| `network` | NIO server, request handling, binary protocol, client connection pool |
+| `util` | Hybrid logical clock, metrics, configuration |
