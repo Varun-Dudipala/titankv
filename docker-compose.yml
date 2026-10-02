@@ -1,7 +1,7 @@
 # Three-node TitanKV cluster with authentication and a durable WAL.
 #   docker compose up -d --build
 #   curl localhost:9091/status
-#   docker compose stop titankv-2 && docker compose start titankv-2   # crash and recover a node
+#   docker compose stop titankv-2 && docker compose start titankv-2   # restart a node; it catches up from hints
 # Clients connect to localhost:9001-9003. Change TITANKV_CLUSTER_SECRET for anything but a demo.
 
 x-node: &node

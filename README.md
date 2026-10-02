@@ -22,20 +22,23 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 **Data distribution and replication**
 - **Consistent hashing** with 150 virtual nodes per node (MurmurHash3) and replication factor 3
 - **Leaderless**: any node coordinates any request, as in Dynamo; clients need no knowledge of placement
-- **Tunable consistency** (ONE / QUORUM / ALL) with **strict quorums**: a key's replicas never change
-  because a node is down, so R + W > N guarantees QUORUM reads see QUORUM writes
+- **Tunable consistency** (ONE / QUORUM / ALL), chosen **per request** by the client, with **strict
+  quorums**: a key's replicas never change because a node is down or restarting, so R + W > N
+  guarantees QUORUM reads see QUORUM writes
 
 **Convergence**
 - **Read repair**: reads return once the consistency level is met, then fix stale replicas in the background
 - **Hinted handoff**: writes for a down replica are kept (persisted, coalesced per key) and delivered when it returns
 - **Merkle-tree anti-entropy**: replica pairs compare 1024-leaf hash trees every minute and sync only the keys that differ
 - **Last-write-wins with hybrid logical clocks**, plus client causal context, so clock skew cannot make a
-  client's later write lose to its earlier one; deletes are tombstones, so nothing is resurrected
+  client's later write lose to its earlier one; equal versions break ties the same way on every node;
+  deletes are tombstones, so nothing is resurrected
 
 **Membership and operations**
 - **Gossip** (UDP, Cassandra-style heartbeat digests) with HMAC-SHA256 authentication and replay
   protection; nodes are SUSPECT after 3s and DEAD after 10s of silence
-- **Admin**: `removenode` for dead nodes, `cleanup` after joins, `status`, rebalancing to joining nodes
+- **Admin**: `removenode` for dead nodes, `cleanup` after joins, `status`, streaming to joining nodes;
+  admin commands require the cluster token
 - **Metrics** over HTTP (`/metrics` in Prometheus text format, `/health`, `/ready`, `/status`)
 
 **Storage and networking**
@@ -103,8 +106,14 @@ try (TitanKVClient client = new TitanKVClient("localhost:9001", "localhost:9002"
     Optional<String> name = client.getString("user:123");
     boolean exists = client.exists("session:abc");
     client.delete("user:123");
+
+    client.put("page-views", "1042", ConsistencyLevel.ONE);         // per request: ONE, QUORUM or ALL
+    client.getString("balance:7", ConsistencyLevel.ALL);
 }
 ```
+
+Without a level, requests use the client's default (`ClientConfig.builder().consistency(...)`), and
+otherwise the server's (QUORUM unless configured).
 
 The client spreads requests across nodes by consistent hashing, pools connections, fails over to
 another node on error, and tracks the newest version it has seen so its writes are always ordered
@@ -126,14 +135,16 @@ With replication factor 3:
 | Failure | What happens |
 |---|---|
 | A node crashes | Marked SUSPECT after 3s, DEAD after 10s. QUORUM continues on the other 2 replicas; writes it misses become hints on the coordinator. |
+| A node shuts down (SIGTERM, rolling restart) | It tells its peers, which mark it DEAD at once. It stays a replica of its keys (a shutdown is not a decommission), so its writes become hints until it is back. |
 | It comes back | Gossip sees a newer heartbeat and hints are delivered; if the process restarted, an immediate Merkle-tree repair sends it only the keys it is missing; read repair fixes anything else it serves. |
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
 | A node is gone for good | `removenode <id>` drops it cluster-wide; anti-entropy re-replicates its keys to their new replicas. |
+| A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
 | A restarted node has not found the cluster yet | It rejects client requests (`/ready` is 503) rather than acting as a one-node cluster. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
 | Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and ignores a torn final record. |
 | Clock skew | Hybrid logical clocks never go backwards past a version already seen; clients carry causal context. |
-| Concurrent writes to one key | Last write wins by (timestamp, value); no conflict is surfaced to the application. |
+| Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
 ## Configuration
 
@@ -144,7 +155,9 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_DEV_MODE` | `false` | Allow running without a cluster secret; disables the WAL by default |
 | `TITANKV_CLUSTER_SECRET` | none | Signs gossip (HMAC) and authenticates node-to-node commands |
 | `TITANKV_CLIENT_TOKEN` | none | If set, clients must authenticate with this token |
-| `TITANKV_READ_CONSISTENCY` / `_WRITE_` / `_DELETE_` | `QUORUM` | `ONE`, `QUORUM` or `ALL` |
+| `TITANKV_INTERNAL_TOKEN` | cluster secret | Token for node-to-node and admin commands |
+| `TITANKV_READ_CONSISTENCY` / `_WRITE_` / `_DELETE_` | `QUORUM` | Default level for requests that do not choose one |
+| `TITANKV_SPECULATIVE_RETRY_MS` | `50` | Also ask a spare replica when one has not answered a read by then; `0` disables |
 | `TITANKV_DATA_DIR` | `data` | WAL, snapshots and hints go in `<dir>/node-<port>` |
 | `TITANKV_WAL_ENABLED` | on unless dev mode | Write-ahead log |
 | `TITANKV_WAL_FSYNC` | `true` | fsync before acknowledging a write (group-committed) |
@@ -165,9 +178,12 @@ Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY][VA
 Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE]
 ```
 
-Big-endian; `VAL_LEN` of -1 means no value (distinct from an empty value). For client PUT/DELETE,
-`TIMESTAMP` is optional causal context and `EXPIRES` carries the TTL in milliseconds; responses to
-PUT/DELETE return the version assigned. Replica messages carry absolute versions and expiry times.
+Big-endian; `VAL_LEN` of -1 means no value (distinct from an empty value). The low 6 bits of `CMD`
+are the command and the top 2 bits an optional consistency level for GET, EXISTS, PUT and DELETE
+(0 = server default, 1 = ONE, 2 = QUORUM, 3 = ALL), so choosing a level costs no bytes. For client
+PUT/DELETE, `TIMESTAMP` is optional causal context and `EXPIRES` carries the TTL in milliseconds;
+responses to PUT/DELETE return the version assigned. Replica messages carry absolute versions and
+expiry times.
 
 | Command | Code | Command | Code | Status | Code |
 |---|---|---|---|---|---|
@@ -179,7 +195,7 @@ PUT/DELETE return the version assigned. Replica messages carry absolute versions
 | AUTH | 0x07 | | | | |
 
 Internal commands (0x11 and up) are node-to-node; they need the cluster token and a connection from
-a cluster member.
+a cluster member. REMOVE_NODE and CLEANUP need the cluster token too.
 
 ## Architecture
 
@@ -205,13 +221,13 @@ Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator togeth
 
 | Setup | 16 clients, 80% reads | 16 clients, writes only |
 |---|---|---|
-| 1 node, in-memory | 61,973 ops/sec | 65,367 ops/sec |
-| 3 nodes, QUORUM, in-memory | 19,101 ops/sec | 16,914 ops/sec |
-| 3 nodes, QUORUM, auth + fsynced WAL | 10,302 ops/sec | 4,207 ops/sec |
+| 1 node, in-memory | 70,106 ops/sec | 70,139 ops/sec |
+| 3 nodes, QUORUM, in-memory | 24,457 ops/sec | 21,068 ops/sec |
+| 3 nodes, QUORUM, auth + fsynced WAL | 12,763 ops/sec | 4,415 ops/sec |
 
 Every read in the benchmark is checked against the client's last acknowledged write: across 80
-runs and 13.7M operations there were 0 errors and 0 stale reads. With a node killed mid-run
-(`scripts/benchmark-failover.sh`), a production cluster served 371K operations in 40 seconds with
+runs and 16.7M operations there were 0 errors and 0 stale reads. With a node killed mid-run
+(`scripts/benchmark-failover.sh`), a production cluster served 474K operations in 40 seconds with
 0 errors, and the node recovered from its WAL plus hints and Merkle repair.
 
 Three nodes do about a third of one node's throughput here because replication triples the work
@@ -227,17 +243,20 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 179 unit tests
-mvn verify     # + 52 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 164 unit tests
+mvn verify     # + 56 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
 
-- **Chaos**: 8 writers at QUORUM on a 5-node production-mode cluster while nodes crash and restart;
-  every key must hold a version between its last acknowledged and last attempted write
+- **Chaos**: 8 writers at QUORUM on a 5-node production-mode cluster while nodes crash and restart,
+  and again with graceful rolling restarts. No read may go back past an acknowledged write, and at
+  the end every key must hold a version between its last acknowledged and last attempted write
 - production mode (auth, signed gossip, fsynced WAL), 32 concurrent clients with read-your-writes checks
-- QUORUM with one and two replicas down, clock skew with and without causal context
-- gossip convergence on 5 nodes, crash detection, restart, graceful leave, `removenode`, join + `cleanup`
+- QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, clock skew with
+  and without causal context, concurrent writes with equal versions
+- gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode`, join + `cleanup`,
+  admin commands requiring the cluster token
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
 
 WAL tests cover crash recovery across snapshots, concurrent writers during snapshots and torn writes.
@@ -248,7 +267,11 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
   discarded rather than surfaced as a conflict (vector clocks with siblings would expose it).
 - **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
 - **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
+- **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is
+  streamed its data in the background, so for that window a QUORUM read can miss a recent write
+  (Cassandra writes to both old and new replicas until bootstrap completes).
 - **Fixed failure-detection timeouts** (3s/10s) rather than an adaptive phi-accrual detector.
+- **Snapshots pause writes** while all entries are written out (when the WAL passes 128 MB).
 - **Hints are not fsynced**; a coordinator crash can lose some, which anti-entropy then repairs.
 - **Gossip digests fit in one UDP packet** (about 30 members with short node IDs; larger clusters
   send a rotating subset each round).

@@ -8,7 +8,7 @@
   workloads, while network latency is not included.
 - fsync on this VM is fast (sub-millisecond); on spinning disks or slower SSDs durable-write
   throughput will be lower.
-- Date: 2026-09-25 (rerun on a different, slower VM than earlier measurements), with all features (strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
+- Date: 2026-10-02, with all features (strict quorum, hinted handoff, anti-entropy, hybrid logical clocks)
 
 ## Method
 
@@ -22,7 +22,8 @@ reports the median, the min–max range, and the spread (half the range as a sha
 - **Reads are checked for correctness.** Each value carries the writing thread's sequence number,
   and a read that returns an older sequence than the thread's last acknowledged write counts as a
   stale read.
-- Cluster runs use QUORUM reads and writes with replication factor 3, unless stated otherwise.
+- Cluster runs use QUORUM reads and writes with replication factor 3, unless stated otherwise. The
+  consistency scenario sets the level per request from the client (`--consistency`).
 
 ```bash
 ./scripts/benchmark-suite.sh        # everything below, about 20 minutes
@@ -35,24 +36,24 @@ Every run's numbers are in [`suite/summary.csv`](suite/summary.csv).
 
 | Scenario | Setup | Clients | Workload | Median ops/sec | Min – max | Spread | p50 ms | p99 ms | Errors | Stale reads |
 |---|---|---|---|---|---|---|---|---|---|---|
-| single | 1 node | 16 | mixed | 61,973 | 61,009 – 67,475 | ±5% | 0.22 | 0.91 | 0 | 0 |
-| single | 1 node | 16 | writes | 65,367 | 63,530 – 66,589 | ±2% | 0.22 | 0.76 | 0 | 0 |
-| scaling | 3 nodes | 16 | mixed | 19,101 | 17,076 – 20,387 | ±9% | 0.72 | 2.73 | 0 | 0 |
-| scaling | 5 nodes | 16 | mixed | 15,982 | 14,038 – 17,215 | ±10% | 0.83 | 4.32 | 0 | 0 |
-| consistency | ONE | 16 | mixed | 39,872 | 36,591 – 40,672 | ±5% | 0.33 | 1.61 | 0 | 0 |
-| consistency | QUORUM | 16 | mixed | 19,310 | 14,290 – 21,325 | ±18% | 0.71 | 2.43 | 0 | 0 |
-| consistency | ALL | 16 | mixed | 14,732 | 13,630 – 16,439 | ±10% | 0.96 | 3.52 | 0 | 0 |
-| value-size | 100 B | 16 | mixed | 18,780 | 15,343 – 20,383 | ±13% | 0.76 | 2.80 | 0 | 0 |
-| value-size | 1000 B | 16 | mixed | 18,629 | 12,934 – 19,547 | ±18% | 0.76 | 2.66 | 0 | 0 |
-| value-size | 10000 B | 16 | mixed | 12,142 | 6,975 – 12,799 | ±24% | 1.08 | 6.19 | 0 | 0 |
-| concurrency | 3 nodes | 1 | writes | 3,408 | 2,268 – 3,516 | ±18% | 0.27 | 0.49 | 0 | 0 |
-| concurrency | 3 nodes | 4 | writes | 10,511 | 10,418 – 10,666 | ±1% | 0.35 | 0.94 | 0 | 0 |
-| concurrency | 3 nodes | 16 | writes | 16,914 | 10,739 – 17,424 | ±20% | 0.86 | 3.04 | 0 | 0 |
-| concurrency | 3 nodes | 64 | writes | 16,690 | 15,269 – 17,370 | ±6% | 3.27 | 12.44 | 0 | 0 |
-| production | 3 nodes prod | 16 | mixed | 10,302 | 8,784 – 10,530 | ±8% | 1.37 | 4.51 | 0 | 0 |
-| production | 3 nodes prod | 16 | writes | 4,207 | 3,599 – 4,402 | ±10% | 3.58 | 8.61 | 0 | 0 |
+| single | 1 node | 16 | mixed | 70,106 | 68,705 – 70,814 | ±2% | 0.20 | 0.69 | 0 | 0 |
+| single | 1 node | 16 | writes | 70,139 | 68,533 – 73,006 | ±3% | 0.20 | 0.66 | 0 | 0 |
+| scaling | 3 nodes | 16 | mixed | 24,457 | 20,512 – 25,469 | ±10% | 0.58 | 2.28 | 0 | 0 |
+| scaling | 5 nodes | 16 | mixed | 19,247 | 16,301 – 21,071 | ±12% | 0.67 | 3.60 | 0 | 0 |
+| consistency | ONE | 16 | mixed | 45,029 | 44,020 – 48,146 | ±5% | 0.28 | 1.55 | 0 | 0 |
+| consistency | QUORUM | 16 | mixed | 24,105 | 22,273 – 24,648 | ±5% | 0.60 | 2.29 | 0 | 0 |
+| consistency | ALL | 16 | mixed | 19,070 | 17,960 – 19,296 | ±4% | 0.76 | 2.39 | 0 | 0 |
+| value-size | 100 B | 16 | mixed | 25,129 | 23,599 – 25,614 | ±4% | 0.57 | 1.96 | 0 | 0 |
+| value-size | 1000 B | 16 | mixed | 23,097 | 22,712 – 23,659 | ±2% | 0.61 | 2.23 | 0 | 0 |
+| value-size | 10000 B | 16 | mixed | 16,469 | 11,509 – 17,207 | ±17% | 0.82 | 4.25 | 0 | 0 |
+| concurrency | 3 nodes | 1 | writes | 3,705 | 3,548 – 3,830 | ±4% | 0.25 | 0.47 | 0 | 0 |
+| concurrency | 3 nodes | 4 | writes | 12,045 | 11,929 – 12,745 | ±3% | 0.30 | 0.82 | 0 | 0 |
+| concurrency | 3 nodes | 16 | writes | 21,068 | 20,192 – 23,123 | ±7% | 0.67 | 2.50 | 0 | 0 |
+| concurrency | 3 nodes | 64 | writes | 28,223 | 22,252 – 29,791 | ±13% | 2.02 | 7.41 | 0 | 0 |
+| production | 3 nodes prod | 16 | mixed | 12,763 | 12,051 – 13,157 | ±4% | 1.10 | 3.66 | 0 | 0 |
+| production | 3 nodes prod | 16 | writes | 4,415 | 4,379 – 4,628 | ±3% | 3.37 | 8.05 | 0 | 0 |
 
-**Correctness:** across all 80 runs (13.7 million operations) there were **0 errors, 0 stale reads
+**Correctness:** across all 80 runs (16.7 million operations) there were **0 errors, 0 stale reads
 and 0 read misses**.
 
 How to read it:
@@ -67,7 +68,7 @@ How to read it:
   the same 4 CPUs. Five JVMs split the same cores five ways. Horizontal scaling needs one machine
   per node; on one box this only shows that adding nodes costs little.
 - **Production mode** adds authentication and an fsync on every replica before acknowledging.
-  Writes-only drops to about 4.2K/sec, bounded by fsyncs even with group commit.
+  Writes-only drops to about 4.4K/sec, bounded by fsyncs even with group commit.
 
 ## Availability under node failure
 
@@ -76,11 +77,12 @@ production-mode cluster for 40 seconds. Node 2 is killed with SIGKILL at 10s and
 
 | Phase | Avg ops/sec | Errors |
 |---|---|---|
-| All 3 nodes up (0–10s) | 10,094 | 0 |
-| Node 2 down (11–25s) | 12,698 | 0 |
-| Node 2 back (30s–end) | 5,591 | 0 |
+| All 3 nodes up (0–10s) | 12,629 | 0 |
+| Node 2 down (11–25s) | 14,039 | 0 |
+| Node 2 back (30s–end) | 10,637 | 0 |
 
-**371,013 operations with 0 errors, 0 stale reads and 0 read misses** (a repeat run: 0 errors).
+**473,802 operations with 0 errors, 0 stale reads and 0 read misses** (a repeat run: 458,484
+operations, also 0 errors).
 Node 2 recovered its keys from its WAL; hints and Merkle anti-entropy sent it the writes it missed.
 
 - **During the outage** QUORUM keeps working on the other two replicas. Throughput even rises,
@@ -91,7 +93,7 @@ Node 2 recovered its keys from its WAL; hints and Merkle anti-entropy sent it th
   outage. The client slept its retry delay before failing over away from the dead node, and kept
   the node's circuit breaker open for 30 seconds. The client now fails over immediately, moves
   nodes with an open breaker to the back of the order, and re-probes them after 5 seconds. The same
-  fix raised the chaos test from about 10K to about 147K acknowledged writes per run.
+  fix raised the chaos test from about 10K acknowledged writes per run to 70–150K, depending on the machine.
 
 Per-second numbers are in [`suite/failover.md`](suite/failover.md).
 
