@@ -3,6 +3,7 @@ package com.titankv;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ConsistentHash;
 import com.titankv.cluster.Node;
+import com.titankv.consistency.ConsistencyLevel;
 import com.titankv.network.ConnectionPool;
 import com.titankv.network.ConnectionPool.PooledConnection;
 import com.titankv.network.protocol.BinaryProtocol;
@@ -14,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -32,13 +34,19 @@ public class TitanKVClient implements AutoCloseable {
 
     // Circuit breaker configuration
     private static final int CIRCUIT_FAILURE_THRESHOLD = 5;
-    private static final long CIRCUIT_RESET_TIMEOUT_MS = 30_000; // 30 seconds
+    // After this long an open breaker lets requests through again, so a recovered node is retried
+    private static final long CIRCUIT_RESET_TIMEOUT_MS = 5_000;
+    // Error a node returns while it is (re)joining the cluster; see ConnectionHandler
+    static final String NOT_READY_PREFIX = "Node is joining the cluster";
 
     private final String[] hosts;
     private final ClientConfig config;
     private final ConnectionPool connectionPool;
     private final ConsistentHash hashRing;
     private volatile boolean closed = false;
+    // Newest version timestamp this client has read or written; sent with every write so the
+    // write is ordered after it even if the coordinating node's clock is behind.
+    private final AtomicLong causalContext = new AtomicLong();
 
     // Circuit breaker state per host
     private final Map<String, CircuitBreaker> circuitBreakers = new ConcurrentHashMap<>();
@@ -114,10 +122,12 @@ public class TitanKVClient implements AutoCloseable {
             Node node = Node.fromAddress(host);
             node.setStatus(Node.Status.ALIVE);
             hashRing.addNode(node);
-            circuitBreakers.put(node.getAddress(), new CircuitBreaker());
+            if (config.isCircuitBreakerEnabled()) {
+                circuitBreakers.put(node.getAddress(), new CircuitBreaker());
+            }
         }
 
-        logger.info("TitanKV client initialized with {} hosts", hosts.length);
+        logger.debug("TitanKV client initialized with {} hosts", hosts.length);
     }
 
     /**
@@ -148,15 +158,25 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Get a value by key with metadata (timestamp, expiration).
+     * Get a value by key with metadata (timestamp, expiration), at the configured consistency level.
      *
      * @param key the key to retrieve
      * @return the value with metadata if found, empty otherwise
      * @throws IOException if the request fails
      */
     public Optional<ValueWithMetadata> getWithMetadata(String key) throws IOException {
+        return getWithMetadata(key, config.getConsistency());
+    }
+
+    /**
+     * Get a value by key with metadata, at the given consistency level.
+     *
+     * @param level how many replicas must answer, or null for the server's default
+     */
+    public Optional<ValueWithMetadata> getWithMetadata(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(Command.get(key), key);
+        Response response = execute(Command.get(key).withConsistency(level), key);
+        observe(response);
 
         if (response.isOk()) {
             return Optional.of(new ValueWithMetadata(
@@ -184,6 +204,10 @@ public class TitanKVClient implements AutoCloseable {
         return getWithMetadata(key).map(ValueWithMetadata::getValue);
     }
 
+    public Optional<byte[]> get(String key, ConsistencyLevel level) throws IOException {
+        return getWithMetadata(key, level).map(ValueWithMetadata::getValue);
+    }
+
     /**
      * Get a value as a string.
      *
@@ -195,6 +219,10 @@ public class TitanKVClient implements AutoCloseable {
         return get(key).map(bytes -> new String(bytes, StandardCharsets.UTF_8));
     }
 
+    public Optional<String> getString(String key, ConsistencyLevel level) throws IOException {
+        return get(key, level).map(bytes -> new String(bytes, StandardCharsets.UTF_8));
+    }
+
     /**
      * Store a value.
      *
@@ -203,12 +231,36 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public void put(String key, byte[] value) throws IOException {
-        validateKey(key);
-        Response response = execute(Command.put(key, value), key);
+        put(key, value, 0);
+    }
 
+    /**
+     * Store a value that expires after the given time-to-live.
+     *
+     * @param ttlMillis time-to-live in milliseconds, measured by the server (0 = never expires)
+     * @throws IOException if the request fails
+     */
+    public void put(String key, byte[] value, long ttlMillis) throws IOException {
+        put(key, value, ttlMillis, config.getConsistency());
+    }
+
+    /**
+     * Store a value at the given consistency level.
+     *
+     * @param ttlMillis time-to-live in milliseconds (0 = never expires)
+     * @param level     how many replicas must acknowledge, or null for the server's default
+     */
+    public void put(String key, byte[] value, long ttlMillis, ConsistencyLevel level) throws IOException {
+        validateKey(key);
+        if (ttlMillis < 0) {
+            throw new IllegalArgumentException("ttlMillis must not be negative");
+        }
+        Command command = new Command(Command.PUT, key, value, causalContext.get(), ttlMillis, level);
+        Response response = execute(command, key);
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
+        observe(response);
     }
 
     /**
@@ -222,6 +274,10 @@ public class TitanKVClient implements AutoCloseable {
         put(key, value.getBytes(StandardCharsets.UTF_8));
     }
 
+    public void put(String key, String value, ConsistencyLevel level) throws IOException {
+        put(key, value.getBytes(StandardCharsets.UTF_8), 0, level);
+    }
+
     /**
      * Delete a key.
      *
@@ -229,11 +285,37 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public void delete(String key) throws IOException {
+        delete(key, config.getConsistency());
+    }
+
+    /**
+     * Delete a key at the given consistency level (null for the server's default).
+     */
+    public void delete(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(Command.delete(key), key);
+        Response response = execute(new Command(Command.DELETE, key, null, causalContext.get(), 0, level), key);
 
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        observe(response);
+    }
+
+    /**
+     * The newest version timestamp this client has seen. Another client (or process) can pass it to
+     * {@link #observeCausalContext(long)} so its writes are ordered after everything this one saw.
+     */
+    public long getCausalContext() {
+        return causalContext.get();
+    }
+
+    public void observeCausalContext(long timestamp) {
+        causalContext.accumulateAndGet(timestamp, Math::max);
+    }
+
+    private void observe(Response response) {
+        if (response.isOk() && response.getTimestamp() > 0) {
+            causalContext.accumulateAndGet(response.getTimestamp(), Math::max);
         }
     }
 
@@ -292,7 +374,8 @@ public class TitanKVClient implements AutoCloseable {
         Command internalGet = new Command(Command.GET_INTERNAL, key, null);
         Response response = execute(internalGet, key);
 
-        if (response.isOk() && response.hasValue()) {
+        // An OK response without a value is a tombstone; its timestamp still matters for conflict resolution
+        if (response.isOk()) {
             return Optional.of(new ValueWithMetadata(
                     response.getValue(),
                     response.getTimestamp(),
@@ -308,15 +391,44 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Get a value from local store only (internal replication, no cascade).
-     * This method is used by ReplicationManager to prevent read recursion.
-     *
-     * @param key the key to retrieve
-     * @return the value if found, empty otherwise
-     * @throws IOException if the request fails
+     * Cluster membership as seen by this client's first host: one line per node.
      */
-    public Optional<byte[]> getInternal(String key) throws IOException {
-        return getInternalWithMetadata(key).map(ValueWithMetadata::getValue);
+    public String clusterStatus() throws IOException {
+        byte[] status = internalRequest(Command.STATUS, null, null);
+        return status != null ? new String(status, StandardCharsets.UTF_8) : "";
+    }
+
+    /**
+     * Permanently remove a DEAD node from the cluster. Its data is re-replicated to the new
+     * replicas by anti-entropy.
+     */
+    public void removeClusterNode(String nodeId) throws IOException {
+        internalRequest(Command.REMOVE_NODE, nodeId, null);
+    }
+
+    /**
+     * Ask this client's first host to drop keys it no longer replicates, after handing each to its
+     * current replicas.
+     *
+     * @return number of keys removed
+     */
+    public int cleanup() throws IOException {
+        return Integer.parseInt(new String(internalRequest(Command.CLEANUP, null, null), StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Send a command to this client's first host, without key routing, and return the response
+     * value. Used for cluster status, admin commands and node-to-node anti-entropy requests.
+     *
+     * @throws IOException if the request fails or the server returns an error
+     */
+    public byte[] internalRequest(byte type, String senderId, byte[] args) throws IOException {
+        ensureOpen();
+        Response response = executeOnHost(new Command(type, senderId, args), Node.fromAddress(hosts[0]).getAddress());
+        if (!response.isOk()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        return response.getValue();
     }
 
     /**
@@ -327,8 +439,15 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public boolean exists(String key) throws IOException {
+        return exists(key, config.getConsistency());
+    }
+
+    /**
+     * Check if a key exists, at the given consistency level (null for the server's default).
+     */
+    public boolean exists(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(Command.exists(key), key);
+        Response response = execute(Command.exists(key).withConsistency(level), key);
 
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
@@ -353,102 +472,109 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Execute a command with retry logic.
+     * Send a command for a key, failing over across nodes. Nodes are tried in ring order for the
+     * key, with nodes whose circuit breaker is open moved to the back. Failing over to a different
+     * node is immediate; the retry delay only applies once every node has been tried.
      */
     private Response execute(Command command, String key) throws IOException {
         ensureOpen();
 
-        // Get the node for this key
-        Node node = hashRing.getNode(key);
-        String host = node.getAddress();
+        List<Node> ringOrder = hashRing.getNodes(key, hashRing.getNodeCount());
+        List<String> candidates = new ArrayList<>(ringOrder.size());
+        List<String> tripped = new ArrayList<>();
+        for (Node node : ringOrder) {
+            CircuitBreaker cb = circuitBreakers.get(node.getAddress());
+            (cb != null && cb.isOpen() ? tripped : candidates).add(node.getAddress());
+        }
+        candidates.addAll(tripped);
+        if (candidates.isEmpty()) {
+            candidates.add(hashRing.getNode(key).getAddress());
+        }
 
-        int retries = config.isRetryOnFailure() ? Math.max(1, config.getMaxRetries()) : 1;
+        int attempts = config.isRetryOnFailure() ? Math.max(1, config.getMaxRetries()) : 1;
         IOException lastException = null;
-
-        for (int attempt = 0; attempt < retries; attempt++) {
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            int round = attempt / candidates.size();
+            if (round > 0 && attempt % candidates.size() == 0) {
+                try {
+                    Thread.sleep(config.getRetryDelayMs() * round);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during retry", ie);
+                }
+            }
+            String host = candidates.get(attempt % candidates.size());
             try {
                 Response response = executeOnHost(command, host);
-                if (response.isError()) {
-                    String error = response.getErrorMessage();
-                    if (error != null && error.startsWith("MOVED ")) {
-                        String movedHost = error.substring("MOVED ".length()).trim();
-                        if (!movedHost.isEmpty()) {
-                            addNode(movedHost);
-                            host = movedHost;
-                            continue;
-                        }
-                    }
+                if (response.isError() && isNodeNotReady(response)) {
+                    // A restarted node refuses clients until it rejoins; another node can serve this
+                    lastException = new IOException(host + ": " + response.getErrorMessage());
+                    continue;
                 }
                 return response;
             } catch (IOException e) {
                 lastException = e;
-                logger.warn("Request failed (attempt {}/{}): {}",
-                        attempt + 1, retries, e.getMessage());
-
-                if (attempt < retries - 1) {
-                    try {
-                        Thread.sleep(config.getRetryDelayMs() * (attempt + 1));
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted during retry", ie);
-                    }
-
-                    // Try next node in the ring
-                    List<Node> nodes = hashRing.getNodes(key, retries);
-                    if (nodes.size() > attempt + 1) {
-                        host = nodes.get(attempt + 1).getAddress();
-                    }
-                }
+                logger.debug("Request to {} failed (attempt {}/{}): {}", host, attempt + 1, attempts, e.getMessage());
             }
         }
-
-        throw new IOException("All retries failed", lastException);
+        throw new IOException("All retries failed: " + (lastException != null ? lastException.getMessage() : ""),
+                lastException);
     }
 
     /**
-     * Execute a command on a specific host with dynamic buffer growth support.
-     * Uses circuit breaker to avoid repeatedly hitting failing hosts.
+     * Execute a command on one host. A pooled connection may have gone stale since it was last used
+     * (for example, the server restarted); if a reused connection fails with anything but a timeout,
+     * idle connections to that host are dropped and the command is retried once on a new connection.
      */
     private Response executeOnHost(Command command, String host) throws IOException {
-        // Check circuit breaker first
         CircuitBreaker cb = circuitBreakers.get(host);
         if (cb != null && cb.isOpen()) {
             throw new IOException("Circuit breaker open for host: " + host);
         }
 
-        PooledConnection conn = null;
-        try {
-            conn = connectionPool.acquire(host);
-            ensureAuthenticated(conn, host);
-
-            Response response = sendCommand(conn, command);
-
-            // Record success for circuit breaker
-            if (cb != null) {
-                cb.recordSuccess();
-            }
-
-            return response;
-
-        } catch (IOException e) {
-            // Record failure for circuit breaker
-            if (cb != null) {
-                cb.recordFailure();
-                if (cb.isOpen()) {
-                    logger.warn("Circuit breaker opened for host {} after {} failures",
-                            host, CIRCUIT_FAILURE_THRESHOLD);
-                }
-            }
-            if (conn != null) {
-                connectionPool.invalidate(conn);
-                conn = null;
-            }
-            throw e;
-        } finally {
-            if (conn != null) {
+        boolean retriedStale = false;
+        while (true) {
+            PooledConnection conn = null;
+            boolean reused = false;
+            try {
+                conn = connectionPool.acquire(host);
+                reused = conn.isReused();
+                ensureAuthenticated(conn, host);
+                Response response = sendCommand(conn, command);
                 connectionPool.release(conn);
+                if (cb != null) {
+                    cb.recordSuccess();
+                }
+                return response;
+            } catch (IOException e) {
+                if (conn != null) {
+                    connectionPool.invalidate(conn);
+                }
+                if (reused && !retriedStale && !(e instanceof java.net.SocketTimeoutException)) {
+                    retriedStale = true;
+                    connectionPool.evictIdle(host);
+                    continue;
+                }
+                if (cb != null) {
+                    cb.recordFailure();
+                    if (cb.isOpen()) {
+                        logger.warn("Circuit breaker opened for host {} after {} failures",
+                                host, CIRCUIT_FAILURE_THRESHOLD);
+                    }
+                }
+                throw e;
+            } catch (RuntimeException e) {
+                if (conn != null) {
+                    connectionPool.invalidate(conn);
+                }
+                throw e;
             }
         }
+    }
+
+    private static boolean isNodeNotReady(Response response) {
+        String message = response.getErrorMessage();
+        return message != null && message.startsWith(NOT_READY_PREFIX);
     }
 
     private void ensureAuthenticated(PooledConnection conn, String host) throws IOException {
@@ -522,7 +648,7 @@ public class TitanKVClient implements AutoCloseable {
         Node node = Node.fromAddress(host);
         node.setStatus(Node.Status.ALIVE);
         hashRing.addNode(node);
-        logger.info("Added node {} to client", host);
+        logger.debug("Added node {} to client", host);
     }
 
     /**
@@ -533,7 +659,7 @@ public class TitanKVClient implements AutoCloseable {
     public void removeNode(String host) {
         Node node = Node.fromAddress(host);
         hashRing.removeNode(node);
-        logger.info("Removed node {} from client", host);
+        logger.debug("Removed node {} from client", host);
     }
 
     /**
@@ -567,7 +693,7 @@ public class TitanKVClient implements AutoCloseable {
         if (!closed) {
             closed = true;
             connectionPool.close();
-            logger.info("TitanKV client closed");
+            logger.debug("TitanKV client closed");
         }
     }
 
@@ -579,68 +705,9 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Command-line interface for testing.
+     * Command-line interface; see {@link com.titankv.cli.TitanKVCli}.
      */
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.out.println("Usage: TitanKVClient <host:port> [command] [args...]");
-            System.out.println("Commands:");
-            System.out.println("  get <key>           - Get a value");
-            System.out.println("  put <key> <value>   - Store a value");
-            System.out.println("  delete <key>        - Delete a value");
-            System.out.println("  ping                - Ping the server");
-            return;
-        }
-
-        String host = args[0];
-
-        try (TitanKVClient client = new TitanKVClient(host)) {
-            if (args.length == 1 || args[1].equals("ping")) {
-                boolean ok = client.ping();
-                System.out.println(ok ? "PONG" : "Connection failed");
-                return;
-            }
-
-            String command = args[1];
-
-            switch (command.toLowerCase()) {
-                case "get":
-                    if (args.length < 3) {
-                        System.out.println("Usage: get <key>");
-                        return;
-                    }
-                    Optional<String> value = client.getString(args[2]);
-                    if (value.isPresent()) {
-                        System.out.println(value.get());
-                    } else {
-                        System.out.println("(nil)");
-                    }
-                    break;
-
-                case "put":
-                    if (args.length < 4) {
-                        System.out.println("Usage: put <key> <value>");
-                        return;
-                    }
-                    client.put(args[2], args[3]);
-                    System.out.println("OK");
-                    break;
-
-                case "delete":
-                    if (args.length < 3) {
-                        System.out.println("Usage: delete <key>");
-                        return;
-                    }
-                    client.delete(args[2]);
-                    System.out.println("OK");
-                    break;
-
-                default:
-                    System.out.println("Unknown command: " + command);
-            }
-        } catch (IOException e) {
-            System.err.println("Error: " + e.getMessage());
-            System.exit(1);
-        }
+        com.titankv.cli.TitanKVCli.main(args);
     }
 }

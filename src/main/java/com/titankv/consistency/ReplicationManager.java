@@ -4,18 +4,26 @@ import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.core.InMemoryStore;
+import com.titankv.core.KVStore;
+import com.titankv.network.protocol.Command;
+import com.titankv.core.KeyValuePair;
+import com.titankv.util.Env;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Manages replication of data across nodes with tunable consistency.
+ * Coordinates replicated reads, writes and deletes with tunable consistency.
+ * Any node can coordinate any key: the request is sent to the key's replicas and
+ * completes once the consistency level is met.
  */
-public class ReplicationManager {
+public final class ReplicationManager implements ReplicaIO {
 
     private static final Logger logger = LoggerFactory.getLogger(ReplicationManager.class);
 
@@ -25,14 +33,18 @@ public class ReplicationManager {
     private final ClusterManager clusterManager;
     private final int replicationFactor;
     private final long timeoutMs;
+    private final int poolSize;
     private final ExecutorService executor;
-    private final ScheduledExecutorService timeoutScheduler;
     private final Map<String, TitanKVClient> nodeClients;
+    private final Map<String, TitanKVClient> backgroundClients = new ConcurrentHashMap<>();
     private final ReadRepairHandler readRepairHandler;
     private final String internalAuthToken;
+    private final KVStore localStore;
+    private final HintedHandoff hintedHandoff;
+    private final AntiEntropy antiEntropy;
 
     /**
-     * Read result with value metadata.
+     * Read result with value metadata. A null value with a non-zero timestamp is a tombstone.
      */
     public static class ReadResult {
         private final byte[] value;
@@ -58,38 +70,42 @@ public class ReplicationManager {
         }
     }
 
-    /**
-     * Create a replication manager with default settings.
-     *
-     * @param clusterManager the cluster manager
-     */
     public ReplicationManager(ClusterManager clusterManager) {
-        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS);
+        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS, null, null);
+    }
+
+    public ReplicationManager(ClusterManager clusterManager, KVStore localStore, Path hintsDir) {
+        this(clusterManager, DEFAULT_REPLICATION_FACTOR, DEFAULT_TIMEOUT_MS, localStore, hintsDir);
+    }
+
+    public ReplicationManager(ClusterManager clusterManager, int replicationFactor, long timeoutMs) {
+        this(clusterManager, replicationFactor, timeoutMs, null, null);
     }
 
     /**
-     * Create a replication manager with custom settings.
-     *
-     * @param clusterManager    the cluster manager
-     * @param replicationFactor number of replicas per key
-     * @param timeoutMs         timeout for replica operations
+     * @param localStore this node's store; the local replica is read and written directly
+     *                   instead of over the network. Null sends every replica request over TCP.
+     * @param hintsDir   where to persist hints for unreachable replicas, or null for memory only
      */
-    public ReplicationManager(ClusterManager clusterManager, int replicationFactor, long timeoutMs) {
+    public ReplicationManager(ClusterManager clusterManager, int replicationFactor, long timeoutMs,
+            KVStore localStore, Path hintsDir) {
         this.clusterManager = clusterManager;
         this.replicationFactor = replicationFactor;
         this.timeoutMs = timeoutMs;
+        this.localStore = localStore;
 
-        // Use a bounded pool size to avoid thread explosion under load
-        int poolSize = Math.max(16, Runtime.getRuntime().availableProcessors() * 4);
-        String envThreads = System.getenv("TITANKV_REPLICATION_THREADS");
-        if (envThreads != null && !envThreads.isEmpty()) {
+        int threads = Math.max(16, Runtime.getRuntime().availableProcessors() * 4);
+        String configured = Env.get("TITANKV_REPLICATION_THREADS", "titankv.replication.threads");
+        if (configured != null) {
             try {
-                poolSize = Integer.parseInt(envThreads);
+                threads = Integer.parseInt(configured.trim());
             } catch (NumberFormatException e) {
-                logger.warn("Invalid TITANKV_REPLICATION_THREADS, using default {}", poolSize);
+                logger.warn("Invalid TITANKV_REPLICATION_THREADS, using default {}", threads);
             }
         }
+        this.poolSize = threads;
 
+        // Replica calls use blocking sockets, so this pool is sized for I/O wait, not CPU.
         this.executor = new ThreadPoolExecutor(
                 poolSize,
                 poolSize,
@@ -102,259 +118,325 @@ public class ReplicationManager {
                     return t;
                 },
                 new ThreadPoolExecutor.CallerRunsPolicy());
-        this.timeoutScheduler = Executors.newScheduledThreadPool(2, r -> {
-            Thread t = new Thread(r, "replication-timeout");
-            t.setDaemon(true);
-            return t;
-        });
         this.nodeClients = new ConcurrentHashMap<>();
-        this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor);
-        this.internalAuthToken = readInternalToken();
+        this.internalAuthToken = Env.internalToken();
+        this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this, executor);
+        this.hintedHandoff = new HintedHandoff(clusterManager, backgroundIO, hintsDir);
+        this.antiEntropy = localStore instanceof InMemoryStore
+                ? new AntiEntropy(clusterManager, (InMemoryStore) localStore, replicationFactor, backgroundIO,
+                        new AntiEntropy.PeerTransport() {
+                            @Override
+                            public byte[] merkleTree(Node peer, byte mode) throws IOException {
+                                return client(peer, true).internalRequest(Command.MERKLE_TREE,
+                                        clusterManager.getLocalNode().getId(), new byte[] {mode});
+                            }
+
+                            @Override
+                            public byte[] merkleLeaves(Node peer, int[] leaves) throws IOException {
+                                java.nio.ByteBuffer args = java.nio.ByteBuffer.allocate(4 * leaves.length);
+                                for (int leaf : leaves) {
+                                    args.putInt(leaf);
+                                }
+                                return client(peer, true).internalRequest(Command.MERKLE_LEAF,
+                                        clusterManager.getLocalNode().getId(), args.array());
+                            }
+                        },
+                        antiEntropyIntervalMs())
+                : null;
+    }
+
+    private static long antiEntropyIntervalMs() {
+        String configured = Env.get("TITANKV_ANTI_ENTROPY_INTERVAL_MS", "titankv.anti.entropy.interval.ms");
+        if (configured != null) {
+            try {
+                return Long.parseLong(configured.trim());
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid TITANKV_ANTI_ENTROPY_INTERVAL_MS {}, using 60000", configured);
+            }
+        }
+        return 60_000;
     }
 
     /**
-     * Write to replicas with the specified consistency level.
+     * @return Merkle-tree repair with other replicas, or null if there is no local InMemoryStore
+     */
+    public AntiEntropy getAntiEntropy() {
+        return antiEntropy;
+    }
+
+    /**
+     * Number of replicas a key should have: the replication factor, capped by the number of
+     * cluster members. Members that are down still count, so losing replicas makes QUORUM and
+     * ALL fail rather than quietly requiring fewer acknowledgements.
+     */
+    int effectiveReplicationFactor() {
+        return Math.max(1, Math.min(replicationFactor, clusterManager.getNodeCount()));
+    }
+
+    /**
+     * Write to the key's replicas and complete once the consistency level is met.
      *
-     * @param key         the key to write
-     * @param value       the value to write
-     * @param timestamp   the authoritative timestamp for conflict resolution
-     * @param expiresAt   the expiration timestamp (0 = no expiration)
-     * @param consistency the consistency level required
-     * @return CompletableFuture that completes when consistency is met
+     * The replica set is fixed (strict quorum): replicas that are down are not replaced by other
+     * nodes. They get a hint instead, as does any replica whose write fails, and hints never count
+     * toward the consistency level.
      */
     public CompletableFuture<Boolean> write(String key, byte[] value, long timestamp, long expiresAt,
             ConsistencyLevel consistency) {
-        List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
-        int required = consistency.getRequired(replicas.size());
+        return replicate(key, value, timestamp, expiresAt, consistency, "Write");
+    }
 
-        if (replicas.size() < required) {
-            return CompletableFuture.failedFuture(
-                    new ConsistencyException("Not enough replicas available", consistency, required, replicas.size()));
+    /**
+     * Delete from replicas by writing a tombstone with the given timestamp, which
+     * prevents stale replicas from resurrecting the value.
+     */
+    public CompletableFuture<Boolean> delete(String key, long timestamp, long expiresAt,
+            ConsistencyLevel consistency) {
+        return replicate(key, null, timestamp, expiresAt, consistency, "Delete");
+    }
+
+    private CompletableFuture<Boolean> replicate(String key, byte[] value, long timestamp, long expiresAt,
+            ConsistencyLevel consistency, String name) {
+        int required = consistency.getRequired(effectiveReplicationFactor());
+        List<Node> replicas = clusterManager.getReplicasForKey(key, replicationFactor);
+        List<Node> live = new ArrayList<>();
+        List<Node> down = new ArrayList<>();
+        for (Node replica : replicas) {
+            (replica.isAvailable() ? live : down).add(replica);
+        }
+        if (live.size() < required) {
+            return CompletableFuture.failedFuture(new ConsistencyException(
+                    "Not enough replicas available", consistency, required, live.size()));
+        }
+        for (Node replica : down) {
+            hintedHandoff.store(replica, key, value, timestamp, expiresAt);
         }
 
         CompletableFuture<Boolean> result = new CompletableFuture<>();
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failureCount = new AtomicInteger(0);
-        int totalReplicas = replicas.size();
+        AtomicInteger successes = new AtomicInteger();
+        AtomicInteger failures = new AtomicInteger();
+        int allowedFailures = live.size() - required;
 
-        for (Node replica : replicas) {
-            executor.submit(() -> {
+        Runnable localWrite = null;
+        for (Node replica : live) {
+            Runnable task = () -> {
                 try {
-                    writeToNode(replica, key, value, timestamp, expiresAt);
-                    int successes = successCount.incrementAndGet();
-                    if (successes >= required && !result.isDone()) {
+                    write(replica, key, value, timestamp, expiresAt);
+                    if (successes.incrementAndGet() >= required) {
                         result.complete(true);
                     }
                 } catch (IOException | RuntimeException e) {
-                    logger.warn("Write to {} failed: {}", replica.getId(), e.getMessage());
-                    int failures = failureCount.incrementAndGet();
-                    if (failures > (totalReplicas - required) && !result.isDone()) {
-                        result.completeExceptionally(
-                                new ConsistencyException("Cannot meet consistency level",
-                                        consistency, required, successCount.get()));
+                    logger.warn("{} to {} failed, storing hint: {}", name, replica.getId(), e.getMessage());
+                    hintedHandoff.store(replica, key, value, timestamp, expiresAt);
+                    if (failures.incrementAndGet() > allowedFailures) {
+                        result.completeExceptionally(new ConsistencyException(
+                                "Cannot meet consistency level", consistency, required, successes.get()));
                     }
                 }
-            });
+            };
+            if (isLocal(replica) && !localWritesWait()) {
+                localWrite = task;
+            } else {
+                executor.execute(task);
+            }
         }
-
-        // Add timeout
-        scheduleTimeout(result, consistency, required);
-
+        // The local replica is written on this thread, after the remote writes are on their way:
+        // an in-memory update is cheaper than handing it to another thread.
+        if (localWrite != null) {
+            localWrite.run();
+        }
+        // No timer here: every replica call ends within the socket timeout, and the caller bounds
+        // the whole request.
         return result;
     }
 
     /**
-     * Read from replicas with the specified consistency level.
-     * For QUORUM/ALL, uses ReadRepairHandler to compare timestamps and repair stale
-     * replicas.
+     * Whether a local write can block (it waits for a WAL fsync), in which case it goes to the
+     * replication pool rather than running on the caller's thread.
+     */
+    private boolean localWritesWait() {
+        return localStore instanceof InMemoryStore && ((InMemoryStore) localStore).isWalEnabled();
+    }
+
+    /**
+     * Drop local keys this node no longer replicates (after nodes joined and took over ranges),
+     * like Cassandra's nodetool cleanup. Each key is first written to all of its current replicas,
+     * and only removed locally if every one of them accepted it, so no copy is lost.
      *
-     * @param key         the key to read
-     * @param consistency the consistency level required
-     * @return CompletableFuture with the value and metadata
+     * @return number of keys removed from this node
+     */
+    public int cleanup() {
+        if (localStore == null) {
+            return 0;
+        }
+        Node local = clusterManager.getLocalNode();
+        int removed = 0;
+        for (String key : localStore instanceof InMemoryStore
+                ? ((InMemoryStore) localStore).keysIncludingTombstones() : localStore.keys()) {
+            List<Node> replicas = clusterManager.getReplicasForKey(key, replicationFactor);
+            if (replicas.contains(local)) {
+                continue;
+            }
+            Optional<KeyValuePair> entry = localStore.getRaw(key);
+            if (entry.isEmpty()) {
+                continue;
+            }
+            KeyValuePair kv = entry.get();
+            try {
+                for (Node replica : replicas) {
+                    write(replica, key, kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
+                }
+                localStore.delete(key);
+                removed++;
+            } catch (IOException e) {
+                logger.warn("Cleanup kept {}: could not hand it to every replica: {}", key, e.getMessage());
+            }
+        }
+        logger.info("Cleanup removed {} keys this node no longer replicates", removed);
+        return removed;
+    }
+
+    /**
+     * @return hints this node holds for replicas that missed writes, per target node id
+     */
+    public HintedHandoff getHintedHandoff() {
+        return hintedHandoff;
+    }
+
+    /**
+     * Read from replicas with the specified consistency level. Returns the newest version among
+     * the first responses that satisfy the level, and repairs stale replicas in the background.
+     *
+     * @return the newest version found, or empty if no replica has the key. A tombstone is
+     *         returned as a result with a null value.
      */
     public CompletableFuture<Optional<ReadResult>> read(String key, ConsistencyLevel consistency) {
-        List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
-        int required = consistency.getRequired(replicas.size());
-
-        if (replicas.size() < required) {
-            return CompletableFuture.failedFuture(
-                    new ConsistencyException("Not enough replicas available", consistency, required, replicas.size()));
-        }
-
-        // ONE: just read from first replica (no repair)
-        if (consistency == ConsistencyLevel.ONE) {
-            return readFromNode(replicas.get(0), key);
-        }
-
-        // QUORUM/ALL: use read repair to get most recent value and fix stale replicas
+        int required = consistency.getRequired(effectiveReplicationFactor());
         return readRepairHandler.readWithRepair(key, required, timeoutMs)
                 .thenApply(result -> {
-                    if (result.isRepairNeeded()) {
-                        logger.info("Read repair performed for key {} on {} stale nodes",
-                                key, result.getRepairedNodes().size());
-                    }
                     if (result.getTimestamp() == 0) {
                         return Optional.empty();
                     }
-                    return Optional.of(new ReadResult(result.getValue(),
-                            result.getTimestamp(),
+                    return Optional.of(new ReadResult(result.getValue(), result.getTimestamp(),
                             result.getExpiresAt()));
                 });
     }
 
+    @Override
+    public Optional<ReadResult> read(Node replica, String key) throws IOException {
+        return read(replica, key, false);
+    }
+
+    @Override
+    public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt) throws IOException {
+        write(replica, key, value, timestamp, expiresAt, false);
+    }
+
     /**
-     * Delete from replicas with the specified consistency level.
-     * Writes tombstones with the provided timestamp to prevent resurrection.
-     *
-     * @param key         the key to delete
-     * @param timestamp   the authoritative timestamp for the tombstone
-     * @param expiresAt   the expiration timestamp (0 = no expiration)
-     * @param consistency the consistency level required
-     * @return CompletableFuture that completes when consistency is met
+     * @param background use the separate, small connection pool for repair traffic (hints,
+     *                   anti-entropy), so it cannot hold up client requests
      */
-    public CompletableFuture<Boolean> delete(String key, long timestamp, long expiresAt, ConsistencyLevel consistency) {
-        List<Node> replicas = clusterManager.getNodesForKey(key, replicationFactor);
-        int required = consistency.getRequired(replicas.size());
+    private Optional<ReadResult> read(Node replica, String key, boolean background) throws IOException {
+        if (isLocal(replica)) {
+            Optional<KeyValuePair> entry = localStore.getRaw(key);
+            return entry.map(kv -> new ReadResult(kv.getValue(), kv.getTimestamp(), kv.getExpiresAt()));
+        }
+        return client(replica, background).getInternalWithMetadata(key)
+                .map(m -> new ReadResult(m.getValue(), m.getTimestamp(), m.getExpiresAt()));
+    }
 
-        if (replicas.size() < required) {
-            return CompletableFuture.failedFuture(
-                    new ConsistencyException("Not enough replicas available", consistency, required, replicas.size()));
+    private void write(Node replica, String key, byte[] value, long timestamp, long expiresAt, boolean background)
+            throws IOException {
+        if (isLocal(replica)) {
+            localStore.putIfNewer(key, value, timestamp, expiresAt);
+            return;
+        }
+        TitanKVClient client = client(replica, background);
+        if (value == null) {
+            client.deleteInternal(key, timestamp, expiresAt);
+        } else {
+            client.putInternal(key, value, timestamp, expiresAt);
+        }
+    }
+
+    /**
+     * Replica access for background repair (hinted handoff, anti-entropy).
+     */
+    private final ReplicaIO backgroundIO = new ReplicaIO() {
+        @Override
+        public Optional<ReadResult> read(Node replica, String key) throws IOException {
+            return ReplicationManager.this.read(replica, key, true);
         }
 
-        CompletableFuture<Boolean> result = new CompletableFuture<>();
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failureCount = new AtomicInteger(0);
-        int totalReplicas = replicas.size();
-
-        for (Node replica : replicas) {
-            executor.submit(() -> {
-                try {
-                    deleteFromNode(replica, key, timestamp, expiresAt);
-                    int successes = successCount.incrementAndGet();
-                    if (successes >= required && !result.isDone()) {
-                        result.complete(true);
-                    }
-                } catch (IOException | RuntimeException e) {
-                    logger.warn("Delete from {} failed: {}", replica.getId(), e.getMessage());
-                    int failures = failureCount.incrementAndGet();
-                    if (failures > (totalReplicas - required) && !result.isDone()) {
-                        result.completeExceptionally(
-                                new ConsistencyException("Cannot meet consistency level",
-                                        consistency, required, successCount.get()));
-                    }
-                }
-            });
+        @Override
+        public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt)
+                throws IOException {
+            ReplicationManager.this.write(replica, key, value, timestamp, expiresAt, true);
         }
 
-        scheduleTimeout(result, consistency, required);
+        @Override
+        public boolean isInProcess(Node replica) {
+            return isLocal(replica);
+        }
+    };
 
-        return result;
+    @Override
+    public boolean isInProcess(Node replica) {
+        return isLocal(replica);
     }
 
-    private void writeToNode(Node node, String key, byte[] value, long timestamp, long expiresAt) throws IOException {
-        TitanKVClient client = getClient(node);
-        // Use internal put to prevent replication cascade
-        // Pass timestamp and expiresAt to maintain newest-wins semantics across
-        // replicas
-        client.putInternal(key, value, timestamp, expiresAt);
+    private boolean isLocal(Node replica) {
+        return localStore != null && replica.equals(clusterManager.getLocalNode());
     }
 
-    private CompletableFuture<Optional<ReadResult>> readFromNode(Node node, String key) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                TitanKVClient client = getClient(node);
-                // Use internal get to prevent replication recursion and get timestamps
-                Optional<TitanKVClient.ValueWithMetadata> result = client.getInternalWithMetadata(key);
-                if (result.isPresent()) {
-                    TitanKVClient.ValueWithMetadata metadata = result.get();
-                    return Optional.of(new ReadResult(
-                            metadata.getValue(),
-                            metadata.getTimestamp(),
-                            metadata.getExpiresAt()));
-                }
-                return Optional.empty();
-            } catch (IOException e) {
-                throw new CompletionException(e);
-            }
-        }, executor);
-    }
-
-    private void deleteFromNode(Node node, String key, long timestamp, long expiresAt) throws IOException {
-        TitanKVClient client = getClient(node);
-        // Use internal delete to prevent replication cascade
-        // Pass timestamp and expiresAt to write tombstone with proper versioning
-        client.deleteInternal(key, timestamp, expiresAt);
-    }
-
-    private TitanKVClient getClient(Node node) {
-        return nodeClients.computeIfAbsent(node.getAddress(), addr -> {
+    private TitanKVClient client(Node node, boolean background) {
+        Map<String, TitanKVClient> clients = background ? backgroundClients : nodeClients;
+        // Repair traffic gets at most 2 connections per node, which also throttles it
+        int connections = background ? 2 : poolSize;
+        return clients.computeIfAbsent(node.getAddress(), addr -> {
             ClientConfig config = ClientConfig.builder()
                     .connectTimeoutMs((int) timeoutMs)
                     .readTimeoutMs((int) timeoutMs)
+                    .maxConnectionsPerHost(connections)
                     .retryOnFailure(false)
+                    .circuitBreaker(false)
                     .authToken(internalAuthToken)
                     .build();
             return new TitanKVClient(config, addr);
         });
     }
 
-    private static String readInternalToken() {
-        String value = System.getenv("TITANKV_INTERNAL_TOKEN");
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.internal.token");
-        }
-        if (value == null || value.isEmpty()) {
-            value = System.getenv("TITANKV_CLUSTER_SECRET");
-        }
-        if (value == null || value.isEmpty()) {
-            value = System.getProperty("titankv.cluster.secret");
-        }
-        return (value != null && !value.isEmpty()) ? value : null;
+    public ReadRepairHandler getReadRepairHandler() {
+        return readRepairHandler;
     }
 
-    private <T> void scheduleTimeout(CompletableFuture<T> future, ConsistencyLevel level, int required) {
-        timeoutScheduler.schedule(() -> {
-            if (!future.isDone()) {
-                future.completeExceptionally(
-                        new ConsistencyException("Timeout waiting for consistency",
-                                level, required, 0));
-            }
-        }, timeoutMs, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * Get the replication factor.
-     */
     public int getReplicationFactor() {
         return replicationFactor;
     }
 
-    /**
-     * Shutdown the replication manager and read repair handler.
-     */
     public void shutdown() {
-        executor.shutdown();
-        timeoutScheduler.shutdown();
+        if (antiEntropy != null) {
+            antiEntropy.shutdown();
+        }
+        hintedHandoff.shutdown();
         readRepairHandler.shutdown();
-
+        executor.shutdown();
         try {
             if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                 executor.shutdownNow();
             }
-            if (!timeoutScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                timeoutScheduler.shutdownNow();
-            }
         } catch (InterruptedException e) {
             executor.shutdownNow();
-            timeoutScheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
 
-        // Close all node clients
         for (TitanKVClient client : nodeClients.values()) {
             client.close();
         }
         nodeClients.clear();
+        for (TitanKVClient client : backgroundClients.values()) {
+            client.close();
+        }
+        backgroundClients.clear();
 
         logger.info("Replication manager shutdown complete");
     }

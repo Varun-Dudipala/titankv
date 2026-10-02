@@ -1,5 +1,7 @@
 package com.titankv.cluster;
 
+import com.titankv.util.Env;
+import com.titankv.util.HybridLogicalClock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,9 +25,16 @@ public class ClusterManager {
     private final List<Consumer<ClusterEvent>> eventListeners;
     private final ScheduledExecutorService scheduler;
     private final String clusterSecret;
+    private final Map<String, Long> departedGenerations = new ConcurrentHashMap<>();
+    // Generation of each node that announced a graceful shutdown; its heartbeats from that
+    // generation no longer count, so stale gossip about it cannot mark it alive again
+    private final Map<String, Long> shutdownGenerations = new ConcurrentHashMap<>();
+    private final HybridLogicalClock clock = new HybridLogicalClock();
 
     private GossipProtocol gossipProtocol;
     private volatile boolean running;
+    private volatile boolean seedsConfigured;
+    private volatile boolean membershipLearned;
 
     /**
      * Create a new cluster manager.
@@ -76,24 +85,14 @@ public class ClusterManager {
      * This prevents accidentally deploying clusters without authentication.
      */
     private static String getDefaultClusterSecret() {
-        String secret = System.getenv("TITANKV_CLUSTER_SECRET");
-        if (secret == null || secret.isEmpty()) {
-            secret = System.getProperty("titankv.cluster.secret");
-        }
-
-        // Check if dev mode is explicitly enabled
-        boolean devMode = "true".equalsIgnoreCase(System.getenv("TITANKV_DEV_MODE"))
-            || "true".equalsIgnoreCase(System.getProperty("titankv.dev.mode"));
-
-        // In production mode, require a secret
-        if (!devMode && (secret == null || secret.isEmpty())) {
+        String secret = Env.clusterSecret();
+        if (secret == null && !Env.isDevMode()) {
             throw new IllegalStateException(
                 "Cluster secret is required for production deployment. " +
                 "Set TITANKV_CLUSTER_SECRET environment variable or titankv.cluster.secret property. " +
                 "To run in development mode without authentication (UNSAFE), set TITANKV_DEV_MODE=true."
             );
         }
-
         return secret;
     }
 
@@ -108,23 +107,26 @@ public class ClusterManager {
         }
         running = true;
 
-        // Start gossip protocol with authentication
         gossipProtocol = new GossipProtocol(localNode, this, clusterSecret);
-        gossipProtocol.start();
 
         // Join cluster via seed nodes
         // Note: Don't call addNode() here - we don't know the real node IDs yet.
         // The seed nodes will respond with JOIN messages containing their real IDs,
         // or send us membership lists with all known nodes.
+        // Gossip keeps re-sending JOIN to the seeds until it learns about another node,
+        // so a lost UDP packet or a seed that starts late does not leave this node isolated.
+        List<Node> seeds = new ArrayList<>();
         if (seedNodes != null && !seedNodes.isEmpty()) {
             for (String seed : seedNodes.split(",")) {
                 String trimmed = seed.trim();
                 if (!trimmed.isEmpty() && !trimmed.equals(localNode.getAddress())) {
-                    Node seedNode = Node.fromAddress(trimmed);
-                    gossipProtocol.sendJoin(seedNode);
+                    seeds.add(Node.fromAddress(trimmed));
                 }
             }
         }
+        seedsConfigured = !seeds.isEmpty();
+        gossipProtocol.setSeeds(seeds);
+        gossipProtocol.start();
 
         // Start health check task
         scheduler.scheduleAtFixedRate(this::checkHealth,
@@ -137,15 +139,22 @@ public class ClusterManager {
      * Stop the cluster manager.
      */
     public void stop() {
+        stop(true);
+    }
+
+    /**
+     * @param announce tell the other members this node is shutting down, so they mark it down at
+     *                 once; false leaves them to detect it, as after a crash
+     */
+    public void stop(boolean announce) {
         if (!running) {
             return;
         }
         running = false;
 
-        // Notify cluster we're leaving
         localNode.setStatus(Node.Status.LEAVING);
         if (gossipProtocol != null) {
-            gossipProtocol.stop();
+            gossipProtocol.stop(announce);
         }
 
         scheduler.shutdown();
@@ -185,8 +194,9 @@ public class ClusterManager {
             node.setStatus(Node.Status.ALIVE);
         }
         node.updateHeartbeat();
+        departedGenerations.remove(node.getId());
         nodes.put(node.getId(), node);
-        hashRing.addNode(node);
+        hashRing.addNode(node); // down members are replicas too (strict quorum)
 
         fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_JOINED, node));
         logger.info("Node {} joined the cluster", node.getId());
@@ -204,10 +214,77 @@ public class ClusterManager {
 
         Node removed = nodes.remove(node.getId());
         if (removed != null) {
+            departedGenerations.put(removed.getId(), removed.getGeneration());
             hashRing.removeNode(removed);
             fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_LEFT, removed));
             logger.info("Node {} left the cluster", node.getId());
         }
+    }
+
+    /**
+     * Permanently remove a dead node from the cluster (like Cassandra's removenode), on this node
+     * and, through gossip, on every other node. Its keys move to other replicas, which
+     * anti-entropy then fills in.
+     *
+     * @return null on success, otherwise why the node cannot be removed
+     */
+    public String removeDeadNode(String nodeId) {
+        Node node = nodes.get(nodeId);
+        if (node == null) {
+            return "Unknown node " + nodeId;
+        }
+        if (node.equals(localNode)) {
+            return "A node cannot remove itself; stop it to leave the cluster";
+        }
+        if (node.getStatus() != Node.Status.DEAD) {
+            return "Node " + nodeId + " is " + node.getStatus() + "; only DEAD nodes can be removed";
+        }
+        removeNode(node);
+        if (gossipProtocol != null) {
+            gossipProtocol.broadcastRemoval(node);
+        }
+        return null;
+    }
+
+    /**
+     * Apply a removal gossiped by another node. The generation is remembered even if the node is
+     * unknown here, so stale gossip about it is ignored.
+     */
+    void markRemoved(String nodeId, long generation) {
+        Node node = nodes.get(nodeId);
+        if (node != null && node.getGeneration() <= generation) {
+            removeNode(node);
+        }
+        departedGenerations.merge(nodeId, generation, Math::max);
+    }
+
+    /**
+     * Apply a peer's announcement that it is shutting down. It is marked DEAD right away, rather
+     * than after the failure detector's 10 seconds, but it stays a member and stays on the ring,
+     * as in Cassandra: a shutdown is usually a restart, and taking the node off the ring would
+     * hand its keys to nodes that do not have them. Writes for it become hints until it returns
+     * (with a newer generation). Removing a node for good is {@link #removeDeadNode}.
+     */
+    void markShutdown(String nodeId) {
+        Node node = nodes.get(nodeId);
+        if (node == null || node.equals(localNode)) {
+            return;
+        }
+        shutdownGenerations.merge(nodeId, node.getGeneration(), Math::max);
+        if (node.getStatus() != Node.Status.DEAD) {
+            node.setStatus(Node.Status.DEAD);
+            fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_DEAD, node));
+            logger.info("Node {} shut down", nodeId);
+        }
+    }
+
+    /**
+     * Whether a node with this id was removed from the cluster and this generation of it
+     * should not be re-added from stale gossip.
+     */
+    public boolean hasDeparted(String nodeId, long generation) {
+        Long departed = departedGenerations.get(nodeId);
+        return departed != null && generation <= departed;
     }
 
     /**
@@ -218,6 +295,10 @@ public class ClusterManager {
     public void updateHeartbeat(String nodeId) {
         Node node = nodes.get(nodeId);
         if (node != null) {
+            Long shutdownGeneration = shutdownGenerations.get(nodeId);
+            if (shutdownGeneration != null && node.getGeneration() <= shutdownGeneration) {
+                return; // gossip about a process that has already shut down
+            }
             Node.Status oldStatus = node.getStatus();
             node.updateHeartbeat();
 
@@ -236,23 +317,21 @@ public class ClusterManager {
      * Check health of all nodes.
      */
     private void checkHealth() {
-        long now = System.currentTimeMillis();
-
         for (Node node : nodes.values()) {
             if (node.equals(localNode)) {
                 continue;
             }
 
-            long lastHeartbeat = node.getLastHeartbeat();
-            long elapsed = now - lastHeartbeat;
+            long elapsed = node.getMillisSinceLastHeartbeat();
 
             if (node.getStatus() == Node.Status.ALIVE && elapsed > SUSPECT_THRESHOLD_MS) {
                 node.setStatus(Node.Status.SUSPECT);
                 fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_SUSPECT, node));
                 logger.warn("Node {} is suspect (no heartbeat for {}ms)", node.getId(), elapsed);
             } else if (node.getStatus() == Node.Status.SUSPECT && elapsed > DEAD_THRESHOLD_MS) {
+                // Stays on the ring: its keys keep the same replicas, and writes meant for it
+                // are kept as hints until it returns.
                 node.setStatus(Node.Status.DEAD);
-                hashRing.removeNode(node);
                 fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_DEAD, node));
                 logger.error("Node {} is dead (no heartbeat for {}ms)", node.getId(), elapsed);
             }
@@ -278,6 +357,23 @@ public class ClusterManager {
      */
     public List<Node> getNodesForKey(String key, int count) {
         return hashRing.getNodes(key, count);
+    }
+
+    /**
+     * The key's replicas, including ones that are currently down. Dead nodes stay on the ring
+     * until they leave, so this set is stable across failures.
+     */
+    public List<Node> getReplicasForKey(String key, int count) {
+        return hashRing.getReplicas(key, count);
+    }
+
+    /**
+     * Called by gossip when a known node reports a newer generation, meaning its process restarted
+     * and may have lost data that was not on disk.
+     */
+    public void nodeRestarted(Node node) {
+        fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_RESTARTED, node));
+        logger.info("Node {} restarted", node.getId());
     }
 
     /**
@@ -349,6 +445,35 @@ public class ClusterManager {
     }
 
     /**
+     * This node's clock for versioning writes.
+     */
+    public HybridLogicalClock getClock() {
+        return clock;
+    }
+
+    /**
+     * Whether this node may serve client requests. A node started with seeds belongs to a cluster,
+     * so until it has learned the cluster's membership from a peer it must not serve: as a one-node
+     * cluster it would accept writes with a single copy, and with a partial ring it would send keys
+     * to the wrong replicas.
+     */
+    public boolean isReady() {
+        return running && (!seedsConfigured || membershipLearned);
+    }
+
+    /**
+     * Called when a peer's membership digest has been applied. Hearing from one member is not
+     * enough to serve: until the full membership is known, this node's ring may miss replicas.
+     */
+    void membershipLearned() {
+        membershipLearned = true;
+    }
+
+    boolean hasLearnedMembership() {
+        return membershipLearned;
+    }
+
+    /**
      * Check if the cluster manager is running.
      */
     public boolean isRunning() {
@@ -364,7 +489,8 @@ public class ClusterManager {
             NODE_LEFT,
             NODE_SUSPECT,
             NODE_DEAD,
-            NODE_RECOVERED
+            NODE_RECOVERED,
+            NODE_RESTARTED
         }
 
         private final Type type;

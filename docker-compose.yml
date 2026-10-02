@@ -1,0 +1,38 @@
+# Three-node TitanKV cluster with authentication and a durable WAL.
+#   docker compose up -d --build
+#   curl localhost:9091/status
+#   docker compose stop titankv-2 && docker compose start titankv-2   # restart a node; it catches up from hints
+# Clients connect to localhost:9001-9003. Change TITANKV_CLUSTER_SECRET for anything but a demo.
+
+x-node: &node
+  build: .
+  environment:
+    TITANKV_CLUSTER_SECRET: change-me-demo-secret
+  restart: unless-stopped
+
+services:
+  titankv-1:
+    <<: *node
+    hostname: titankv-1
+    command: ["--port", "9001", "--node-id", "titankv-1:9001", "--seeds", "titankv-2:9001,titankv-3:9001"]
+    ports: ["9001:9001", "9091:9091"]
+    volumes: ["titankv-1:/var/lib/titankv"]
+
+  titankv-2:
+    <<: *node
+    hostname: titankv-2
+    command: ["--port", "9001", "--node-id", "titankv-2:9001", "--seeds", "titankv-1:9001,titankv-3:9001"]
+    ports: ["9002:9001", "9092:9091"]
+    volumes: ["titankv-2:/var/lib/titankv"]
+
+  titankv-3:
+    <<: *node
+    hostname: titankv-3
+    command: ["--port", "9001", "--node-id", "titankv-3:9001", "--seeds", "titankv-1:9001,titankv-2:9001"]
+    ports: ["9003:9001", "9093:9091"]
+    volumes: ["titankv-3:/var/lib/titankv"]
+
+volumes:
+  titankv-1:
+  titankv-2:
+  titankv-3:

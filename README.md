@@ -1,185 +1,282 @@
 # TitanKV
 
+[![CI](https://github.com/Varun-Dudipala/titankv/actions/workflows/ci.yml/badge.svg)](https://github.com/Varun-Dudipala/titankv/actions/workflows/ci.yml)
 [![Java](https://img.shields.io/badge/Java-17+-orange?logo=openjdk)](https://openjdk.org/)
-[![Maven](https://img.shields.io/badge/Maven-3.6+-red?logo=apachemaven)](https://maven.apache.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-170%20passing-brightgreen)]()
 
-A distributed key-value store built in Java, implementing core concepts from Amazon DynamoDB and Apache Cassandra.
+A distributed key-value store in Java, built from the designs of Amazon's Dynamo and Apache
+Cassandra: consistent hashing, leaderless replication with tunable consistency, gossip membership,
+hinted handoff, Merkle-tree anti-entropy, hybrid logical clocks, and a write-ahead log. A chaos test
+crashes nodes under load and checks that no acknowledged write is lost.
 
 ## Scope
 
-**What this is:** An educational implementation of distributed systems concepts including consistent hashing, quorum replication, gossip protocols, and read repair.
+**What this is:** a working implementation of the core techniques of a Dynamo-style database, with
+integration tests that run real multi-node clusters and benchmarks you can reproduce.
 
-**What this is not:** A production-ready database. This project has not been externally audited and should not be used to store sensitive data.
+**What this is not:** a production database. It has not been externally audited; see
+[Known limitations](#known-limitations).
 
 ## Features
 
-- **Consistent Hashing** with 150 virtual nodes per physical node
-- **Binary Protocol** with 29-byte request headers (vs ~100+ bytes for JSON/HTTP)
-- **NIO TCP Server** using selector-based event loop
-- **Tunable Consistency** (ONE / QUORUM / ALL)
-- **Gossip Protocol** for cluster membership with HMAC authentication
-- **Read Repair** to fix stale replicas automatically
-- **Circuit Breaker** pattern for fault tolerance
-- **Write-Ahead Log** for crash recovery
+**Data distribution and replication**
+- **Consistent hashing** with 150 virtual nodes per node (MurmurHash3) and replication factor 3
+- **Leaderless**: any node coordinates any request, as in Dynamo; clients need no knowledge of placement
+- **Tunable consistency** (ONE / QUORUM / ALL), chosen **per request** by the client, with **strict
+  quorums**: a key's replicas never change because a node is down or restarting, so R + W > N
+  guarantees QUORUM reads see QUORUM writes
 
-## Quick Start
+**Convergence**
+- **Read repair**: reads return once the consistency level is met, then fix stale replicas in the background
+- **Hinted handoff**: writes for a down replica are kept (persisted, coalesced per key) and delivered when it returns
+- **Merkle-tree anti-entropy**: replica pairs compare 1024-leaf hash trees every minute and sync only the keys that differ
+- **Last-write-wins with hybrid logical clocks**, plus client causal context, so clock skew cannot make a
+  client's later write lose to its earlier one; equal versions break ties the same way on every node;
+  deletes are tombstones, so nothing is resurrected
 
-### Prerequisites
+**Membership and operations**
+- **Gossip** (UDP, Cassandra-style heartbeat digests) with HMAC-SHA256 authentication and replay
+  protection; nodes are SUSPECT after 3s and DEAD after 10s of silence
+- **Admin**: `removenode` for dead nodes, `cleanup` after joins, `status`, streaming to joining nodes;
+  admin commands require the cluster token
+- **Metrics** over HTTP (`/metrics` in Prometheus text format, `/health`, `/ready`, `/status`)
 
-- Java 17+
-- Maven 3.6+
+**Storage and networking**
+- **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync
+- **Non-blocking NIO server**; worker threads never wait on replicas
+- **Binary protocol** over TCP with 29-byte request headers: 46–49% fewer bytes per round trip than
+  JSON over HTTP for 100-byte values ([measured](benchmark/results/benchmark_results.md#protocol-size-vs-json-over-http))
+- **TTL** per key, **client circuit breaker**, connection pooling
 
-### Build and Test
+## Quick start
 
-```bash
-git clone https://github.com/Varun-Dudipala/titankv.git
-cd titankv
-mvn clean package
-
-# Run tests
-mvn test
-```
-
-### Run Single Node
-
-```bash
-TITANKV_DEV_MODE=true java -jar target/titankv-1.0.0.jar --port 9001
-```
-
-### Run 3-Node Cluster
+### Docker (3-node cluster)
 
 ```bash
-# Terminal 1 - Seed node
-TITANKV_DEV_MODE=true java -jar target/titankv-1.0.0.jar --port 9001
+git clone https://github.com/Varun-Dudipala/titankv.git && cd titankv
+docker compose up -d --build            # nodes on localhost:9001-9003, metrics on 9091-9093
+curl localhost:9091/status
 
-# Terminal 2
-TITANKV_DEV_MODE=true java -jar target/titankv-1.0.0.jar --port 9002 --seeds localhost:9001
-
-# Terminal 3
-TITANKV_DEV_MODE=true java -jar target/titankv-1.0.0.jar --port 9003 --seeds localhost:9001
+docker compose kill titankv-2           # writes and reads keep working with a node down
+docker compose start titankv-2          # it catches up from hints
+docker compose down -v
 ```
 
-Or use: `./scripts/start-cluster.sh`
+### Local
 
-### Client Usage
+Requires Java 17+ and Maven 3.6+.
+
+```bash
+mvn clean package                       # builds target/titankv-1.0.0.jar, runs unit tests
+./scripts/start-cluster.sh              # 3 nodes on 9001-9003 (dev mode); waits until the cluster forms
+./scripts/titankv-cli.sh localhost:9001 # interactive shell
+./scripts/stop-cluster.sh
+```
+
+```
+titankv> put user:1 Ada
+OK
+titankv> put session:9 abc 30000        # expires in 30 seconds
+OK
+titankv> get user:1
+Ada
+titankv> status
+vm:9001                  ALIVE    vm:9001                  (this node)
+vm:9002                  ALIVE    vm:9002                  last heard 0.8s ago
+vm:9003                  ALIVE    vm:9003                  last heard 0.8s ago
+```
+
+Run nodes by hand (every node lists the others as seeds so any node can restart and rejoin):
+
+```bash
+export TITANKV_CLUSTER_SECRET="$(openssl rand -base64 32)"
+java -jar target/titankv-1.0.0.jar --port 9001 --seeds localhost:9002,localhost:9003
+java -jar target/titankv-1.0.0.jar --port 9002 --seeds localhost:9001,localhost:9003
+java -jar target/titankv-1.0.0.jar --port 9003 --seeds localhost:9001,localhost:9002
+```
+
+Without a cluster secret a node refuses to start unless run with `--dev` / `TITANKV_DEV_MODE=true`.
+
+### Client library
 
 ```java
-try (TitanKVClient client = new TitanKVClient("localhost:9001")) {
-    client.put("user:123", "John Doe");
-    Optional<String> value = client.getString("user:123");
+try (TitanKVClient client = new TitanKVClient("localhost:9001", "localhost:9002", "localhost:9003")) {
+    client.put("user:123", "Ada Lovelace");
+    client.put("session:abc", token, 30_000);          // expires after 30 seconds
+    Optional<String> name = client.getString("user:123");
+    boolean exists = client.exists("session:abc");
     client.delete("user:123");
+
+    client.put("page-views", "1042", ConsistencyLevel.ONE);         // per request: ONE, QUORUM or ALL
+    client.getString("balance:7", ConsistencyLevel.ALL);
 }
 ```
+
+Without a level, requests use the client's default (`ClientConfig.builder().consistency(...)`), and
+otherwise the server's (QUORUM unless configured).
+
+The client spreads requests across nodes by consistent hashing, pools connections, fails over to
+another node on error, and tracks the newest version it has seen so its writes are always ordered
+after what it has read or written (see [clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
+
+## Consistency and failure behaviour
+
+TitanKV is an **AP** system with tunable consistency: during a partition, each side keeps serving the
+keys for which it can reach enough replicas, and replicas converge afterwards.
+
+With replication factor 3:
+
+| Level | Acknowledgements | Keeps working with |
+|---|---|---|
+| ONE | 1 | 2 replicas down; may read stale data |
+| QUORUM | 2 | 1 replica down; 2 + 2 > 3, so every QUORUM read overlaps every acknowledged QUORUM write |
+| ALL | 3 | no replica down |
+
+| Failure | What happens |
+|---|---|
+| A node crashes | Marked SUSPECT after 3s, DEAD after 10s. QUORUM continues on the other 2 replicas; writes it misses become hints on the coordinator. |
+| A node shuts down (SIGTERM, rolling restart) | It tells its peers, which mark it DEAD at once. It stays a replica of its keys (a shutdown is not a decommission), so its writes become hints until it is back. |
+| It comes back | Gossip sees a newer heartbeat and hints are delivered; if the process restarted, an immediate Merkle-tree repair sends it only the keys it is missing; read repair fixes anything else it serves. |
+| Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
+| A node is gone for good | `removenode <id>` drops it cluster-wide; anti-entropy re-replicates its keys to their new replicas. |
+| A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
+| A restarted node has not learned the membership yet | It rejects client requests (`/ready` is 503) until a peer's digest has given it every member, down ones included, rather than serving with a partial ring. |
+| Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
+| Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and ignores a torn final record. |
+| Clock skew | Hybrid logical clocks never go backwards past a version already seen; clients carry causal context. |
+| Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
+
+## Configuration
+
+Every setting is an environment variable or the equivalent system property (`titankv.dev.mode`, ...).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TITANKV_DEV_MODE` | `false` | Allow running without a cluster secret; disables the WAL by default |
+| `TITANKV_CLUSTER_SECRET` | none | Signs gossip (HMAC) and authenticates node-to-node commands |
+| `TITANKV_CLIENT_TOKEN` | none | If set, clients must authenticate with this token |
+| `TITANKV_INTERNAL_TOKEN` | cluster secret | Token for node-to-node and admin commands |
+| `TITANKV_READ_CONSISTENCY` / `_WRITE_` / `_DELETE_` | `QUORUM` | Default level for requests that do not choose one |
+| `TITANKV_SPECULATIVE_RETRY_MS` | `50` | Also ask a spare replica when one has not answered a read by then; `0` disables |
+| `TITANKV_DATA_DIR` | `data` | WAL, snapshots and hints go in `<dir>/node-<port>` |
+| `TITANKV_WAL_ENABLED` | on unless dev mode | Write-ahead log |
+| `TITANKV_WAL_FSYNC` | `true` | fsync before acknowledging a write (group-committed) |
+| `TITANKV_WAL_MAX_MB` | `128` | WAL size that triggers a snapshot |
+| `TITANKV_MAX_MEMORY_MB` | `512` | Writes beyond this are rejected (never silently evicted) |
+| `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long deleted-key tombstones are kept |
+| `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
+| `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
+| `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
+| `TITANKV_REPLICATION_THREADS` | max(16, 4 × CPUs) | Threads for replica I/O |
+
+Ports per node: client TCP on `--port`, gossip UDP on port + 1000, metrics HTTP on port + 90.
+
+## Binary protocol
+
+```
+Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY][VALUE]
+Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE]
+```
+
+Big-endian; `VAL_LEN` of -1 means no value (distinct from an empty value). The low 6 bits of `CMD`
+are the command and the top 2 bits an optional consistency level for GET, EXISTS, PUT and DELETE
+(0 = server default, 1 = ONE, 2 = QUORUM, 3 = ALL), so choosing a level costs no bytes. For client
+PUT/DELETE, `TIMESTAMP` is optional causal context and `EXPIRES` carries the TTL in milliseconds;
+responses to PUT/DELETE return the version assigned. Replica messages carry absolute versions and
+expiry times.
+
+| Command | Code | Command | Code | Status | Code |
+|---|---|---|---|---|---|
+| GET | 0x01 | STATUS | 0x08 | OK | 0x00 |
+| PUT | 0x02 | REMOVE_NODE | 0x09 | NOT_FOUND | 0x01 |
+| DELETE | 0x03 | CLEANUP | 0x0A | ERROR | 0x02 |
+| PING | 0x04 | GET/PUT/DELETE_INTERNAL | 0x11–0x13 | PONG | 0x03 |
+| EXISTS | 0x05 | MERKLE_TREE / MERKLE_LEAF | 0x14–0x15 | EXISTS_TRUE / _FALSE | 0x04 / 0x05 |
+| AUTH | 0x07 | | | | |
+
+Internal commands (0x11 and up) are node-to-node; they need the cluster token and a connection from
+a cluster member. REMOVE_NODE and CLEANUP need the cluster token too.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      TitanKV Cluster                        │
-├───────────────────┬───────────────────┬─────────────────────┤
-│      Node A       │      Node B       │      Node C         │
-│    Port: 9001     │    Port: 9002     │    Port: 9003       │
-├───────────────────┼───────────────────┼─────────────────────┤
-│   Hash Ring       │   Hash Ring       │   Hash Ring         │
-│   Storage Engine  │   Storage Engine  │   Storage Engine    │
-└─────────┬─────────┴─────────┬─────────┴──────────┬──────────┘
-          │                   │                    │
-          └───────── Gossip Protocol ──────────────┘
+          client ──► any node (coordinator)
+                         │  hash ring → the key's 3 replicas
+           ┌─────────────┼─────────────┐
+           ▼             ▼             ▼
+        replica A     replica B     replica C       reply after 2 acks (QUORUM)
+        WAL + map     WAL + map     (down: hint kept on coordinator)
+           ▲             ▲             ▲
+           ├── read repair, hinted handoff, Merkle-tree anti-entropy ──┤
+           └────────── UDP gossip: membership and failure detection ───┘
 ```
 
-## Configuration
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the request paths, threading model, gossip,
+clocks, the three convergence mechanisms, WAL recovery and the design trade-offs.
 
-### Security
+## Performance
 
-**Never commit secrets.** Use environment variables:
+Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator together
+([method, spreads and all scenarios](benchmark/results/benchmark_results.md)):
+
+| Setup | 16 clients, 80% reads | 16 clients, writes only |
+|---|---|---|
+| 1 node, in-memory | 70,106 ops/sec | 70,139 ops/sec |
+| 3 nodes, QUORUM, in-memory | 24,457 ops/sec | 21,068 ops/sec |
+| 3 nodes, QUORUM, auth + fsynced WAL | 12,763 ops/sec | 4,415 ops/sec |
+
+Every read in the benchmark is checked against the client's last acknowledged write: across 80
+runs and 16.7M operations there were 0 errors and 0 stale reads. With a node killed mid-run
+(`scripts/benchmark-failover.sh`), a production cluster served 474K operations in 40 seconds with
+0 errors, and the node recovered from its WAL plus hints and Merkle repair.
+
+Three nodes do about a third of one node's throughput here because replication triples the work
+and all nodes share one 4-core machine. Profiling cut system calls per operation from 13 to 9, a
+59% gain for 3 nodes ([details](benchmark/results/benchmark_results.md#profiling-the-replicated-path)).
 
 ```bash
-export TITANKV_CLUSTER_SECRET="$(openssl rand -base64 32)"
-export TITANKV_CLIENT_TOKEN="your-client-token"
+./scripts/benchmark-suite.sh      # every scenario, 5 runs each
+./scripts/benchmark-failover.sh   # kill -9 a node under load
+./scripts/run-benchmark.sh --protocol
 ```
-
-### Consistency Levels
-
-| Level | Required Responses | Trade-off |
-|-------|-------------------|-----------|
-| ONE | 1 | Fast, eventual consistency |
-| QUORUM | (RF/2) + 1 | Balanced |
-| ALL | All replicas | Strong consistency, lower availability |
-
-```bash
-export TITANKV_READ_CONSISTENCY=QUORUM
-export TITANKV_WRITE_CONSISTENCY=QUORUM
-```
-
-## Binary Protocol
-
-```
-Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][TS:8][EXP:8][KEY][VALUE]
-Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TS:8][EXP:8][VALUE]
-```
-
-| Command | Code | | Status | Code |
-|---------|------|-|--------|------|
-| GET | 0x01 | | OK | 0x00 |
-| PUT | 0x02 | | NOT_FOUND | 0x01 |
-| DELETE | 0x03 | | ERROR | 0x02 |
-| PING | 0x04 | | PONG | 0x03 |
-
-## Project Structure
-
-```
-titankv/
-├── src/main/java/com/titankv/
-│   ├── TitanKVServer.java        # Server entry point
-│   ├── TitanKVClient.java        # Client library
-│   ├── core/                     # Storage engine
-│   ├── cluster/                  # Gossip, consistent hashing
-│   ├── network/                  # NIO server, binary protocol
-│   └── consistency/              # Replication, read repair
-├── src/test/java/                # 170 tests
-├── benchmark/                    # Load generator
-└── scripts/                      # Cluster management
-```
-
-## Benchmarking
-
-```bash
-./scripts/run-benchmark.sh --single --threads 20 --ops 2000
-```
-
-See `benchmark/results/` for methodology and raw output.
 
 ## Testing
 
 ```bash
-# All tests
-mvn test
-
-# Specific test
-mvn test -Dtest=ConsistentHashTest
-
-# With coverage report
-mvn test jacoco:report
-# Report: target/site/jacoco/index.html
+mvn test       # 164 unit tests
+mvn verify     # + 57 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
-## Design Decisions
+The integration suite includes:
 
-**Why Consistent Hashing?** Traditional `hash(key) % N` remaps all keys when N changes. Consistent hashing only remaps K/N keys on average.
+- **Chaos**: 8 writers at QUORUM on a 5-node production-mode cluster while nodes crash and restart,
+  and again with graceful rolling restarts. No read may go back past an acknowledged write, and at
+  the end every key must hold a version between its last acknowledged and last attempted write
+- production mode (auth, signed gossip, fsynced WAL), 32 concurrent clients with read-your-writes checks
+- QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, clock skew with
+  and without causal context, concurrent writes with equal versions
+- gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode`, join + `cleanup`,
+  admin commands requiring the cluster token
+- read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
 
-**Why Binary Protocol?** Lower serialization overhead and persistent connections vs HTTP/JSON.
+WAL tests cover crash recovery across snapshots, concurrent writers during snapshots and torn writes.
 
-**Why NIO?** Single thread handles thousands of connections without thread-per-connection overhead.
+## Known limitations
 
-## Future Work
-
-- [ ] LSM tree for persistent storage
-- [ ] Bloom filters for negative lookups
-- [ ] Merkle trees for anti-entropy
-- [ ] Kubernetes operator
+- **Last write wins.** Concurrent writes to the same key resolve by version; the losing write is
+  discarded rather than surfaced as a conflict (vector clocks with siblings would expose it).
+- **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
+- **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
+- **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is
+  streamed its data in the background, so for that window a QUORUM read can miss a recent write
+  (Cassandra writes to both old and new replicas until bootstrap completes).
+- **Fixed failure-detection timeouts** (3s/10s) rather than an adaptive phi-accrual detector.
+- **Snapshots pause writes** while all entries are written out (when the WAL passes 128 MB).
+- **Hints are not fsynced**; a coordinator crash can lose some, which anti-entropy then repairs.
+- **Gossip digests fit in one UDP packet** (about 30 members with short node IDs; larger clusters
+  send a rotating subset each round).
+- Traffic is not encrypted (no TLS).
 
 ## License
 
-MIT License - See [LICENSE](LICENSE)
+MIT License - see [LICENSE](LICENSE)

@@ -7,118 +7,71 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Metrics collector for TitanKV performance monitoring.
- * Tracks throughput, latency, and operational statistics.
+ * Request metrics for one node: client operation counts and latencies, read hits and misses,
+ * errors, open connections, and replica traffic from other nodes. Exported in Prometheus format
+ * by {@link MetricsHttpServer}.
  */
 public class MetricsCollector {
 
     private final MeterRegistry registry;
 
-    // Counters
     private final Counter getOps;
     private final Counter putOps;
     private final Counter deleteOps;
-    private final Counter getHits;
-    private final Counter getMisses;
+    private final Counter readHits;
+    private final Counter readMisses;
     private final Counter errors;
+    private final Counter internalGets;
+    private final Counter internalWrites;
 
-    // Timers
     private final Timer getLatency;
     private final Timer putLatency;
     private final Timer deleteLatency;
 
-    // Gauges
-    private final LongAdder activeConnections;
-    private final LongAdder storeSize;
+    private final LongAdder activeConnections = new LongAdder();
 
-    /**
-     * Create a metrics collector with a simple registry.
-     */
     public MetricsCollector() {
         this(new SimpleMeterRegistry());
     }
 
-    /**
-     * Create a metrics collector with a custom registry.
-     *
-     * @param registry the Micrometer registry to use
-     */
     public MetricsCollector(MeterRegistry registry) {
         this.registry = registry;
-
-        // Initialize counters
-        this.getOps = Counter.builder("titankv.ops")
-            .tag("operation", "get")
-            .description("Total GET operations")
-            .register(registry);
-
-        this.putOps = Counter.builder("titankv.ops")
-            .tag("operation", "put")
-            .description("Total PUT operations")
-            .register(registry);
-
-        this.deleteOps = Counter.builder("titankv.ops")
-            .tag("operation", "delete")
-            .description("Total DELETE operations")
-            .register(registry);
-
-        this.getHits = Counter.builder("titankv.cache")
-            .tag("result", "hit")
-            .description("Cache hits")
-            .register(registry);
-
-        this.getMisses = Counter.builder("titankv.cache")
-            .tag("result", "miss")
-            .description("Cache misses")
-            .register(registry);
-
+        this.getOps = operations("get");
+        this.putOps = operations("put");
+        this.deleteOps = operations("delete");
+        this.readHits = Counter.builder("titankv.reads").tag("result", "hit")
+                .description("Client reads that found the key").register(registry);
+        this.readMisses = Counter.builder("titankv.reads").tag("result", "miss")
+                .description("Client reads that did not find the key").register(registry);
         this.errors = Counter.builder("titankv.errors")
-            .description("Total errors")
-            .register(registry);
-
-        // Initialize timers
-        this.getLatency = Timer.builder("titankv.latency")
-            .tag("operation", "get")
-            .description("GET operation latency")
-            .publishPercentiles(0.5, 0.95, 0.99)
-            .register(registry);
-
-        this.putLatency = Timer.builder("titankv.latency")
-            .tag("operation", "put")
-            .description("PUT operation latency")
-            .publishPercentiles(0.5, 0.95, 0.99)
-            .register(registry);
-
-        this.deleteLatency = Timer.builder("titankv.latency")
-            .tag("operation", "delete")
-            .description("DELETE operation latency")
-            .publishPercentiles(0.5, 0.95, 0.99)
-            .register(registry);
-
-        // Initialize gauge backing values
-        this.activeConnections = new LongAdder();
-        this.storeSize = new LongAdder();
-
-        // Register gauges
+                .description("Requests answered with an error").register(registry);
+        this.internalGets = Counter.builder("titankv.replica.ops").tag("operation", "read")
+                .description("Replica reads served for other coordinators").register(registry);
+        this.internalWrites = Counter.builder("titankv.replica.ops").tag("operation", "write")
+                .description("Replica writes applied for other coordinators").register(registry);
+        this.getLatency = latency("get");
+        this.putLatency = latency("put");
+        this.deleteLatency = latency("delete");
         Gauge.builder("titankv.connections", activeConnections, LongAdder::sum)
-            .description("Active connections")
-            .register(registry);
-
-        Gauge.builder("titankv.store.size", storeSize, LongAdder::sum)
-            .description("Number of entries in store")
-            .register(registry);
+                .description("Open client and node connections").register(registry);
     }
 
-    // Operation recording methods
+    private Counter operations(String operation) {
+        return Counter.builder("titankv.ops").tag("operation", operation)
+                .description("Client operations coordinated by this node").register(registry);
+    }
+
+    private Timer latency(String operation) {
+        return Timer.builder("titankv.latency").tag("operation", operation)
+                .description("Client operation latency, including replication")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+    }
 
     public void recordGet(long durationNanos, boolean hit) {
         getOps.increment();
         getLatency.record(durationNanos, TimeUnit.NANOSECONDS);
-        if (hit) {
-            getHits.increment();
-        } else {
-            getMisses.increment();
-        }
+        (hit ? readHits : readMisses).increment();
     }
 
     public void recordPut(long durationNanos) {
@@ -131,11 +84,21 @@ public class MetricsCollector {
         deleteLatency.record(durationNanos, TimeUnit.NANOSECONDS);
     }
 
+    /**
+     * Count a replica read or write sent by another node's coordinator. Kept apart from client
+     * operations so they are not counted twice across the cluster.
+     */
+    public void recordReplicaRead() {
+        internalGets.increment();
+    }
+
+    public void recordReplicaWrite() {
+        internalWrites.increment();
+    }
+
     public void recordError() {
         errors.increment();
     }
-
-    // Connection tracking
 
     public void connectionOpened() {
         activeConnections.increment();
@@ -144,16 +107,6 @@ public class MetricsCollector {
     public void connectionClosed() {
         activeConnections.decrement();
     }
-
-    // Store size tracking
-
-    public void setStoreSize(int size) {
-        // Reset and set to new value
-        long current = storeSize.sum();
-        storeSize.add(size - current);
-    }
-
-    // Getters for metrics values
 
     public long getTotalGetOps() {
         return (long) getOps.count();
@@ -175,21 +128,13 @@ public class MetricsCollector {
         return activeConnections.sum();
     }
 
+    /**
+     * @return the share of client reads that found their key
+     */
     public double getHitRate() {
-        double hits = getHits.count();
-        double misses = getMisses.count();
-        double total = hits + misses;
+        double hits = readHits.count();
+        double total = hits + readMisses.count();
         return total > 0 ? hits / total : 0.0;
-    }
-
-    @SuppressWarnings("deprecation") // Using deprecated percentile API for simplicity
-    public double getGetP99LatencyMs() {
-        return getLatency.percentile(0.99, TimeUnit.MILLISECONDS);
-    }
-
-    @SuppressWarnings("deprecation") // Using deprecated percentile API for simplicity
-    public double getPutP99LatencyMs() {
-        return putLatency.percentile(0.99, TimeUnit.MILLISECONDS);
     }
 
     public double getGetMeanLatencyMs() {
@@ -200,50 +145,7 @@ public class MetricsCollector {
         return putLatency.mean(TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Get the underlying registry.
-     *
-     * @return the MeterRegistry
-     */
     public MeterRegistry getRegistry() {
         return registry;
-    }
-
-    /**
-     * Print a summary of current metrics.
-     *
-     * @return formatted metrics string
-     */
-    public String summary() {
-        return String.format(
-            "TitanKV Metrics Summary%n" +
-            "=======================-%n" +
-            "Operations: GET=%d, PUT=%d, DELETE=%d%n" +
-            "Cache: hits=%d, misses=%d, hitRate=%.2f%%%n" +
-            "Errors: %d%n" +
-            "Connections: %d active%n" +
-            "Latency (mean): GET=%.3fms, PUT=%.3fms%n" +
-            "Latency (p99):  GET=%.3fms, PUT=%.3fms",
-            getTotalGetOps(), getTotalPutOps(), getTotalDeleteOps(),
-            (long) getHits.count(), (long) getMisses.count(), getHitRate() * 100,
-            getTotalErrors(),
-            getActiveConnections(),
-            getGetMeanLatencyMs(), getPutMeanLatencyMs(),
-            getGetP99LatencyMs(), getPutP99LatencyMs()
-        );
-    }
-
-    /**
-     * Shared instance for common use.
-     */
-    private static final MetricsCollector SHARED = new MetricsCollector();
-
-    /**
-     * Get the shared metrics instance.
-     *
-     * @return the shared MetricsCollector
-     */
-    public static MetricsCollector shared() {
-        return SHARED;
     }
 }

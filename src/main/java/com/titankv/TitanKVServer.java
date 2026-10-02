@@ -2,12 +2,12 @@ package com.titankv;
 
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.DataRebalancer;
-import com.titankv.cluster.HintedHandoff;
 import com.titankv.cluster.Node;
 import com.titankv.consistency.ReplicationManager;
 import com.titankv.core.InMemoryStore;
 import com.titankv.core.KVStore;
 import com.titankv.network.TcpServer;
+import com.titankv.util.Env;
 import com.titankv.util.MetricsCollector;
 import com.titankv.util.MetricsHttpServer;
 import org.slf4j.Logger;
@@ -39,76 +39,65 @@ public class TitanKVServer {
     private final ReplicationManager replicationManager;
     private final CountDownLatch shutdownLatch;
     private final String seedNodes;
+    private final java.util.concurrent.atomic.AtomicBoolean stopped = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile Thread shutdownHook;
     private MetricsHttpServer metricsHttpServer;
-    private HintedHandoff hintedHandoff;
     private DataRebalancer dataRebalancer;
 
     /**
-     * Create a new TitanKV server.
-     *
-     * @param port the port to listen on
+     * Create a single-node server (no seeds) with a node id of hostname:port.
      */
     public TitanKVServer(int port) {
-        this.port = port;
-        this.seedNodes = null;
-        this.store = new InMemoryStore();
-        this.metrics = new MetricsCollector();
-        this.shutdownLatch = new CountDownLatch(1);
-        this.nodeId = generateNodeId(port);
-
-        Node localNode = new Node(this.nodeId, "localhost", port);
-        this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager);
-        this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
+        this(port, null, null);
     }
 
     /**
-     * Create a new TitanKV server with cluster configuration.
-     *
      * @param port      the port to listen on
-     * @param nodeId    optional node identifier (defaults to host:port)
-     * @param seedNodes comma-separated seed node addresses for cluster join
+     * @param nodeId    node identifier, host:port (defaults to hostname:port)
+     * @param seedNodes comma-separated addresses of other members to join through, or null
      */
     public TitanKVServer(int port, String nodeId, String seedNodes) {
         this.port = port;
         this.seedNodes = seedNodes;
-        this.store = new InMemoryStore();
+        this.nodeId = nodeId == null || nodeId.isEmpty() ? generateNodeId(port) : nodeId;
+        this.store = new InMemoryStore(nodeDataDir(port));
         this.metrics = new MetricsCollector();
         this.shutdownLatch = new CountDownLatch(1);
-
-        // Generate node ID if not provided
-        if (nodeId == null || nodeId.isEmpty()) {
-            this.nodeId = generateNodeId(port);
-        } else {
-            this.nodeId = nodeId;
-        }
-
-        // Create the local node and cluster manager
-        Node localNode = new Node(this.nodeId, getHostFromId(this.nodeId), port);
-        this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager);
+        this.clusterManager = new ClusterManager(new Node(this.nodeId, getHostFromId(this.nodeId), port));
+        this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
 
     /**
-     * Create a server with custom store and metrics.
-     *
-     * @param port    the port to listen on
-     * @param store   the key-value store to use
-     * @param metrics the metrics collector to use
+     * Each node keeps its WAL in its own subdirectory, so several nodes can share a machine
+     * and a base directory (TITANKV_DATA_DIR, default "data").
      */
-    public TitanKVServer(int port, KVStore store, MetricsCollector metrics) {
-        this.port = port;
-        this.nodeId = "localhost:" + port;
-        this.seedNodes = null;
-        this.store = store;
-        this.metrics = metrics;
-        this.shutdownLatch = new CountDownLatch(1);
+    private static Path nodeDataDir(int port) {
+        String base = Env.get("TITANKV_DATA_DIR", "titankv.data.dir");
+        return Path.of(base != null ? base : "data").resolve("node-" + port);
+    }
 
-        Node localNode = new Node(this.nodeId, "localhost", port);
-        this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager);
-        this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
+    /**
+     * Hints are persisted next to the WAL when the store is durable, otherwise kept in memory.
+     */
+    private static Path hintsDir(KVStore store, int port) {
+        boolean durable = store instanceof InMemoryStore && ((InMemoryStore) store).isWalEnabled();
+        return durable ? nodeDataDir(port).resolve("hints") : null;
+    }
+
+    /**
+     * TITANKV_METRICS_PORT if set, otherwise the node's port + 90 (9001 serves metrics on 9091).
+     */
+    private static int metricsPort(int port) {
+        String configured = Env.get("TITANKV_METRICS_PORT", "titankv.metrics.port");
+        if (configured != null) {
+            try {
+                return Integer.parseInt(configured.trim());
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid TITANKV_METRICS_PORT {}, using port + 90", configured);
+            }
+        }
+        return port + 90;
     }
 
     private static String generateNodeId(int port) {
@@ -121,7 +110,7 @@ public class TitanKVServer {
         }
     }
 
-    private String getHostFromId(String nodeId) {
+    private static String getHostFromId(String nodeId) {
         if (nodeId.contains(":")) {
             return nodeId.substring(0, nodeId.lastIndexOf(':'));
         }
@@ -137,11 +126,9 @@ public class TitanKVServer {
         logger.info("Node ID: {}", nodeId);
         logger.info("Port: {}", port);
 
-        // Register shutdown hook
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            logger.info("Shutdown signal received");
-            stop();
-        }, "titankv-shutdown"));
+        // On SIGTERM, shut down gracefully: peers are told this node is going down
+        shutdownHook = new Thread(this::stop, "titankv-shutdown");
+        Runtime.getRuntime().addShutdownHook(shutdownHook);
 
         // Start TCP server
         tcpServer.start();
@@ -154,20 +141,14 @@ public class TitanKVServer {
 
         // Initialize and start metrics HTTP server
         if (store instanceof InMemoryStore) {
-            metricsHttpServer = new MetricsHttpServer(metrics, clusterManager, (InMemoryStore) store);
+            registerReplicationMetrics();
+            metricsHttpServer = new MetricsHttpServer(metricsPort(port), metrics, clusterManager, (InMemoryStore) store);
             try {
                 metricsHttpServer.start();
                 logger.info("Metrics HTTP server started on port {}", metricsHttpServer.getPort());
             } catch (IOException e) {
                 logger.warn("Failed to start metrics HTTP server: {}", e.getMessage());
             }
-
-            // Initialize hinted handoff
-            Path dataDir = Path.of(System.getProperty("titankv.data.dir", 
-                System.getenv().getOrDefault("TITANKV_DATA_DIR", "data")));
-            hintedHandoff = new HintedHandoff(clusterManager, dataDir);
-            hintedHandoff.start();
-            logger.info("Hinted handoff started");
 
             // Initialize data rebalancer
             dataRebalancer = new DataRebalancer(clusterManager, (InMemoryStore) store, 
@@ -177,6 +158,36 @@ public class TitanKVServer {
         }
 
         logger.info("TitanKV Server started successfully");
+    }
+
+    private void registerReplicationMetrics() {
+        io.micrometer.core.instrument.MeterRegistry registry = metrics.getRegistry();
+        io.micrometer.core.instrument.Gauge.builder("titankv.hints.pending", replicationManager,
+                rm -> rm.getHintedHandoff().totalPendingHints())
+                .description("Writes waiting to be handed off to replicas that missed them")
+                .register(registry);
+        io.micrometer.core.instrument.FunctionCounter.builder("titankv.read.repairs", replicationManager,
+                rm -> rm.getReadRepairHandler().getReplicasRepaired())
+                .description("Stale replica copies repaired by reads")
+                .register(registry);
+        io.micrometer.core.instrument.FunctionCounter.builder("titankv.read.speculative", replicationManager,
+                rm -> rm.getReadRepairHandler().getSpeculativeReads())
+                .description("Reads that also asked a spare replica because one was slow")
+                .register(registry);
+        if (replicationManager.getAntiEntropy() != null) {
+            io.micrometer.core.instrument.FunctionCounter.builder("titankv.antientropy.keys.synced",
+                    replicationManager, rm -> rm.getAntiEntropy().getKeysSynced())
+                    .description("Keys copied between replicas by Merkle-tree repair")
+                    .register(registry);
+            io.micrometer.core.instrument.FunctionCounter.builder("titankv.antientropy.rounds",
+                    replicationManager, rm -> rm.getAntiEntropy().getRounds())
+                    .description("Merkle-tree repair rounds started by this node")
+                    .register(registry);
+        }
+        io.micrometer.core.instrument.Gauge.builder("titankv.store.memory.bytes", store,
+                s -> ((InMemoryStore) s).getMemoryUsedBytes())
+                .description("Estimated bytes used by stored entries")
+                .register(registry);
     }
 
     /**
@@ -191,6 +202,17 @@ public class TitanKVServer {
      * Stop the server.
      */
     public void stop() {
+        if (!stopped.compareAndSet(false, true)) {
+            return;
+        }
+        Thread hook = shutdownHook;
+        if (hook != null && Thread.currentThread() != hook) {
+            try {
+                Runtime.getRuntime().removeShutdownHook(hook);
+            } catch (IllegalStateException e) {
+                // the JVM is already shutting down
+            }
+        }
         logger.info("Stopping TitanKV Server");
 
         // Stop metrics HTTP server
@@ -203,12 +225,7 @@ public class TitanKVServer {
             dataRebalancer.stop();
         }
 
-        // Stop hinted handoff
-        if (hintedHandoff != null) {
-            hintedHandoff.stop();
-        }
-
-        // Stop cluster manager (graceful leave)
+        // Stop cluster manager: tells peers this node is shutting down
         clusterManager.stop();
 
         // Stop replication manager
@@ -224,6 +241,16 @@ public class TitanKVServer {
 
         shutdownLatch.countDown();
         logger.info("TitanKV Server stopped");
+    }
+
+    /**
+     * Fault injection for tests: stop as if the process had been killed. Client connections are
+     * dropped first and the other members are not told, so they have to detect the failure.
+     */
+    public void crash() {
+        tcpServer.stop();
+        clusterManager.stop(false);
+        stop();
     }
 
     /**
@@ -259,6 +286,13 @@ public class TitanKVServer {
      */
     public MetricsCollector getMetrics() {
         return metrics;
+    }
+
+    /**
+     * Get the replication manager (hinted handoff, anti-entropy).
+     */
+    public ReplicationManager getReplicationManager() {
+        return replicationManager;
     }
 
     /**

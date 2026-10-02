@@ -5,6 +5,8 @@ package com.titankv.consistency;
  */
 public class ConsistencyException extends RuntimeException {
 
+    private static final long serialVersionUID = 1L;
+
     private final ConsistencyLevel requestedLevel;
     private final int requiredResponses;
     private final int actualResponses;

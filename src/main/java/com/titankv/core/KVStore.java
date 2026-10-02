@@ -48,6 +48,18 @@ public interface KVStore {
     }
 
     /**
+     * Store a value with an explicit version, only if it is newer than the current entry.
+     * Used for replication so every replica resolves conflicts the same way (last write wins).
+     *
+     * @param key       the key
+     * @param value     the value, or null to write a tombstone
+     * @param timestamp the version timestamp assigned by the coordinator
+     * @param expiresAt absolute expiration time in epoch millis (0 = never)
+     * @return true if the value was stored, false if the existing entry is newer
+     */
+    boolean putIfNewer(String key, byte[] value, long timestamp, long expiresAt);
+
+    /**
      * Delete a key-value pair.
      *
      * @param key the key to delete
