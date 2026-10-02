@@ -34,6 +34,7 @@ public class ClusterManager {
     private GossipProtocol gossipProtocol;
     private volatile boolean running;
     private volatile boolean seedsConfigured;
+    private volatile boolean membershipLearned;
 
     /**
      * Create a new cluster manager.
@@ -138,15 +139,22 @@ public class ClusterManager {
      * Stop the cluster manager.
      */
     public void stop() {
+        stop(true);
+    }
+
+    /**
+     * @param announce tell the other members this node is shutting down, so they mark it down at
+     *                 once; false leaves them to detect it, as after a crash
+     */
+    public void stop(boolean announce) {
         if (!running) {
             return;
         }
         running = false;
 
-        // Notify cluster we're leaving
         localNode.setStatus(Node.Status.LEAVING);
         if (gossipProtocol != null) {
-            gossipProtocol.stop();
+            gossipProtocol.stop(announce);
         }
 
         scheduler.shutdown();
@@ -188,9 +196,7 @@ public class ClusterManager {
         node.updateHeartbeat();
         departedGenerations.remove(node.getId());
         nodes.put(node.getId(), node);
-        if (node.isAvailable()) {
-            hashRing.addNode(node);
-        }
+        hashRing.addNode(node); // down members are replicas too (strict quorum)
 
         fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_JOINED, node));
         logger.info("Node {} joined the cluster", node.getId());
@@ -447,11 +453,24 @@ public class ClusterManager {
 
     /**
      * Whether this node may serve client requests. A node started with seeds belongs to a cluster,
-     * so until it has found another member it must not act as a one-node cluster: it would accept
-     * writes with a single copy and serve reads that miss data held by the rest of the cluster.
+     * so until it has learned the cluster's membership from a peer it must not serve: as a one-node
+     * cluster it would accept writes with a single copy, and with a partial ring it would send keys
+     * to the wrong replicas.
      */
     public boolean isReady() {
-        return running && (!seedsConfigured || nodes.size() > 1);
+        return running && (!seedsConfigured || membershipLearned);
+    }
+
+    /**
+     * Called when a peer's membership digest has been applied. Hearing from one member is not
+     * enough to serve: until the full membership is known, this node's ring may miss replicas.
+     */
+    void membershipLearned() {
+        membershipLearned = true;
+    }
+
+    boolean hasLearnedMembership() {
+        return membershipLearned;
     }
 
     /**

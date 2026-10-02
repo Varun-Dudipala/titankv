@@ -140,10 +140,19 @@ public class GossipProtocol {
     }
 
     public void stop() {
+        stop(true);
+    }
+
+    /**
+     * @param announce tell the other members this node is shutting down (false simulates a crash)
+     */
+    public void stop(boolean announce) {
         if (!running) {
             return;
         }
-        broadcastLeave();
+        if (announce) {
+            broadcastLeave();
+        }
         running = false;
 
         shutdown(scheduler);
@@ -365,7 +374,14 @@ public class GossipProtocol {
                     clusterManager.markShutdown(senderId);
                     break;
                 case MSG_DIGEST:
+                    boolean firstDigest = !clusterManager.hasLearnedMembership();
                     handleDigest(buffer);
+                    Node sender = clusterManager.getNode(senderId);
+                    if (firstDigest && sender != null) {
+                        // Answer with ours, so a peer that has only seen our JOIN learns the
+                        // membership now rather than on its next gossip round
+                        send(createDigest(), sender);
+                    }
                     break;
                 case MSG_REMOVE:
                     String removedId = readString(buffer);
@@ -397,6 +413,12 @@ public class GossipProtocol {
     }
 
     private void handleDigest(ByteBuffer buffer) {
+        handleMembers(buffer);
+        // A digest lists the sender's whole membership, so this node now knows the ring
+        clusterManager.membershipLearned();
+    }
+
+    private void handleMembers(ByteBuffer buffer) {
         int count = buffer.getInt();
         if (count < 0 || count > MAX_MEMBERS_COUNT) {
             throw new IllegalArgumentException("Invalid member count: " + count);
@@ -434,15 +456,16 @@ public class GossipProtocol {
             }
             return;
         }
-        // Only adopt members someone currently believes are up, and never resurrect a node
-        // that was removed unless it has restarted since (newer generation).
-        boolean reportedUp = reportedStatus == Node.Status.ALIVE || reportedStatus == Node.Status.JOINING;
-        if (!reportedUp || clusterManager.hasDeparted(id, memberGeneration)) {
+        // Adopt every member, including ones reported down: a down member is still a replica of
+        // its keys, so a ring without it would route them to the wrong nodes. Never resurrect a
+        // node that was removed unless it has restarted since (newer generation).
+        if (clusterManager.hasDeparted(id, memberGeneration)) {
             return;
         }
+        boolean reportedUp = reportedStatus == Node.Status.ALIVE || reportedStatus == Node.Status.JOINING;
         Node node = new Node(id, host, port);
         node.advanceHeartbeat(memberGeneration, memberVersion);
-        node.setStatus(Node.Status.ALIVE);
+        node.setStatus(reportedUp ? Node.Status.ALIVE : Node.Status.DEAD);
         clusterManager.addNode(node);
     }
 

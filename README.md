@@ -140,7 +140,7 @@ With replication factor 3:
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
 | A node is gone for good | `removenode <id>` drops it cluster-wide; anti-entropy re-replicates its keys to their new replicas. |
 | A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
-| A restarted node has not found the cluster yet | It rejects client requests (`/ready` is 503) rather than acting as a one-node cluster. |
+| A restarted node has not learned the membership yet | It rejects client requests (`/ready` is 503) until a peer's digest has given it every member, down ones included, rather than serving with a partial ring. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
 | Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and ignores a torn final record. |
 | Clock skew | Hybrid logical clocks never go backwards past a version already seen; clients carry causal context. |
@@ -244,7 +244,7 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 
 ```bash
 mvn test       # 164 unit tests
-mvn verify     # + 56 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn verify     # + 57 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:

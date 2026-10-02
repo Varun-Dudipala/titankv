@@ -63,17 +63,11 @@ public final class TestCluster implements AutoCloseable {
     }
 
     /**
-     * Stop a node without the LEAVE broadcast a graceful shutdown sends, so the other nodes
-     * still consider it a member and have to detect the failure from missing heartbeats.
+     * Stop a node as if it crashed: no LEAVE is sent, so the other nodes have to detect the
+     * failure from missing heartbeats.
      */
     public void crashNode(int index) {
-        ClusterManager crashed = servers.get(index).getClusterManager();
-        for (Node peer : crashed.getAllNodes()) {
-            if (!peer.equals(crashed.getLocalNode())) {
-                crashed.removeNode(peer);
-            }
-        }
-        servers.get(index).stop();
+        servers.get(index).crash();
     }
 
     public TitanKVServer node(int index) {
@@ -121,8 +115,8 @@ public final class TestCluster implements AutoCloseable {
 
     public void awaitConverged(long timeoutMs) {
         awaitCondition(() -> servers.stream().allMatch(s ->
-                s.getClusterManager().getAliveNodeCount() == servers.size()),
-                timeoutMs, "all " + servers.size() + " nodes to see each other alive");
+                s.getClusterManager().getAliveNodeCount() == servers.size() && s.getClusterManager().isReady()),
+                timeoutMs, "all " + servers.size() + " nodes to see each other alive and be ready");
     }
 
     public static void awaitCondition(BooleanSupplier condition, long timeoutMs, String description) {

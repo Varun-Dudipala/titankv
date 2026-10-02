@@ -62,6 +62,30 @@ class MembershipTest {
         }
     }
 
+    /**
+     * A restarted node must learn every member, including ones that are down, before it serves
+     * clients. Down members are still replicas, so leaving one out of its ring would send reads
+     * and writes for its keys to the wrong nodes.
+     */
+    @Test
+    void restartedNodeLearnsDownMembersBeforeServing() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 30, 4)) {
+            String downId = cluster.node(3).getNodeId();
+            cluster.crashNode(3);
+            TestCluster.awaitCondition(() -> allOthersSee(cluster, 3, downId, Node.Status.DEAD),
+                    20_000, "peers to mark " + downId + " DEAD");
+
+            cluster.crashNode(0);
+            cluster.startNode(0);
+            ClusterManager restarted = cluster.node(0).getClusterManager();
+            TestCluster.awaitCondition(restarted::isReady, 10_000, "the restarted node to become ready");
+
+            assertThat(restarted.getHashRing().getNodeCount()).isEqualTo(4);
+            assertThat(restarted.getNode(downId)).isNotNull();
+            assertThat(restarted.getNode(downId).getStatus()).isEqualTo(Node.Status.DEAD);
+        }
+    }
+
     private static boolean allOthersSee(TestCluster cluster, int excluded, String nodeId, Node.Status status) {
         for (int i = 0; i < cluster.size(); i++) {
             if (i == excluded) {
