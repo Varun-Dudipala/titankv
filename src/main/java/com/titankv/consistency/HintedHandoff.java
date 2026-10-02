@@ -27,8 +27,10 @@ import java.util.zip.CRC32;
  * Hints are kept per target node and coalesced per key: only the newest version matters under
  * last-write-wins. When a hints directory is given they are also appended to
  * {@code <dir>/<node>.hints} (CRC-checked records) and reloaded on startup; a node's file is
- * truncated once all its hints are delivered. Hints are not stored for a node that has been down
- * longer than the hint window; anti-entropy repair covers those.
+ * truncated once all its hints are delivered, and rewritten from memory when overwrites of the same
+ * keys have made it much larger than the pending hints. Hints are not stored for a node that has
+ * been down longer than the hint window; anti-entropy repair covers those. Hints for a node that
+ * is removed from the cluster are dropped.
  */
 public final class HintedHandoff {
 
@@ -37,6 +39,9 @@ public final class HintedHandoff {
     static final long HINT_WINDOW_MS = 3 * 60 * 60 * 1000L;
     static final int MAX_HINTS_PER_NODE = 100_000;
     private static final long DELIVERY_INTERVAL_MS = 2_000;
+    // A hint file is rewritten once it holds this many times more records than pending hints
+    private static final int COMPACTION_RATIO = 4;
+    private static final int MIN_RECORDS_BEFORE_COMPACTION = 10_000;
 
     private record Hint(String key, byte[] value, long timestamp, long expiresAt) {
     }
@@ -47,8 +52,10 @@ public final class HintedHandoff {
     private final Map<String, ConcurrentHashMap<String, Hint>> pending = new ConcurrentHashMap<>();
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
     private final Map<String, FileChannel> files = new ConcurrentHashMap<>();
+    private final Map<String, Integer> recordsInFile = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler;
     private final Set<String> delivering = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicLong droppedHints = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * @param hintsDir directory to persist hints in, or null to keep them in memory only
@@ -74,6 +81,10 @@ public final class HintedHandoff {
                 case NODE_RESTARTED:
                     scheduler.execute(() -> deliver(event.getNode()));
                     break;
+                case NODE_LEFT:
+                    // Removed for good: its keys have new replicas, which anti-entropy fills
+                    scheduler.execute(() -> discard(event.getNode().getId()));
+                    break;
                 default:
                     break;
             }
@@ -86,7 +97,7 @@ public final class HintedHandoff {
      * @param value the value, or null for a delete (tombstone)
      */
     public void store(Node target, String key, byte[] value, long timestamp, long expiresAt) {
-        if (System.currentTimeMillis() - target.getLastHeartbeat() > HINT_WINDOW_MS) {
+        if (target.getMillisSinceLastHeartbeat() > HINT_WINDOW_MS) {
             logger.debug("Not storing hint for {}: down longer than the hint window", target.getId());
             return;
         }
@@ -95,12 +106,18 @@ public final class HintedHandoff {
             ConcurrentHashMap<String, Hint> hints = pending.computeIfAbsent(target.getId(),
                     id -> new ConcurrentHashMap<>());
             if (hints.size() >= MAX_HINTS_PER_NODE && !hints.containsKey(key)) {
-                logger.warn("Hint limit reached for {}, dropping hint (anti-entropy will repair it)",
-                        target.getId());
+                if (droppedHints.getAndIncrement() % 10_000 == 0) {
+                    logger.warn("Hint limit reached for {}, dropping hints (anti-entropy will repair them)",
+                            target.getId());
+                }
                 return;
             }
             hints.merge(key, hint, (old, fresh) -> fresh.timestamp > old.timestamp ? fresh : old);
             persist(target.getId(), hint);
+            int records = recordsInFile.merge(target.getId(), 1, Integer::sum);
+            if (records >= MIN_RECORDS_BEFORE_COMPACTION && records > COMPACTION_RATIO * hints.size()) {
+                compact(target.getId(), hints);
+            }
         }
     }
 
@@ -178,12 +195,51 @@ public final class HintedHandoff {
 
     private void truncate(String nodeId) {
         FileChannel channel = files.get(nodeId);
+        recordsInFile.remove(nodeId);
         if (channel != null) {
             try {
                 channel.truncate(0);
                 writeHeader(channel, nodeId);
             } catch (IOException e) {
                 logger.warn("Failed to truncate hints for {}: {}", nodeId, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Rewrite a node's hint file with only its pending hints, dropping records for keys that were
+     * overwritten since. Caller holds the node's lock.
+     */
+    private void compact(String nodeId, Map<String, Hint> hints) {
+        if (hintsDir == null) {
+            return;
+        }
+        truncate(nodeId);
+        for (Hint hint : hints.values()) {
+            persist(nodeId, hint);
+        }
+        recordsInFile.put(nodeId, hints.size());
+        logger.debug("Compacted hint file for {} to {} records", nodeId, hints.size());
+    }
+
+    /**
+     * Forget every hint for a node that left the cluster for good, and delete its file.
+     */
+    private void discard(String nodeId) {
+        synchronized (lockFor(nodeId)) {
+            Map<String, Hint> dropped = pending.remove(nodeId);
+            recordsInFile.remove(nodeId);
+            FileChannel channel = files.remove(nodeId);
+            if (channel != null) {
+                try {
+                    channel.close();
+                    Files.deleteIfExists(hintFile(nodeId));
+                } catch (IOException e) {
+                    logger.warn("Failed to delete hints for {}: {}", nodeId, e.getMessage());
+                }
+            }
+            if (dropped != null && !dropped.isEmpty()) {
+                logger.info("Dropped {} hints for removed node {}", dropped.size(), nodeId);
             }
         }
     }
@@ -230,9 +286,11 @@ public final class HintedHandoff {
                     continue;
                 }
                 ConcurrentHashMap<String, Hint> hints = pending.computeIfAbsent(nodeId, id -> new ConcurrentHashMap<>());
-                for (Hint hint : readAll(file)) {
+                java.util.List<Hint> records = readAll(file);
+                for (Hint hint : records) {
                     hints.merge(hint.key, hint, (old, fresh) -> fresh.timestamp > old.timestamp ? fresh : old);
                 }
+                recordsInFile.put(nodeId, records.size());
                 logger.info("Loaded {} hints from {}", hints.size(), fileName);
             }
         } catch (IOException e) {

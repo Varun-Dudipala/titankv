@@ -157,12 +157,11 @@ class ReplicationManagerTest {
         Node node = new Node("test-node", "localhost", 9999);
         node.updateHeartbeat();
 
-        long initial = node.getLastHeartbeat();
-        Thread.sleep(10);
+        Thread.sleep(50);
+        assertThat(node.getMillisSinceLastHeartbeat()).isGreaterThanOrEqualTo(50);
 
         node.updateHeartbeat();
-        assertThat(node.getLastHeartbeat()).isGreaterThan(initial);
-        assertThat(node.getMillisSinceLastHeartbeat()).isLessThan(100);
+        assertThat(node.getMillisSinceLastHeartbeat()).isLessThan(50);
     }
 
     @Test

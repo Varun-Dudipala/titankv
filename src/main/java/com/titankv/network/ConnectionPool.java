@@ -287,14 +287,9 @@ public class ConnectionPool {
             channel.socket().setTcpNoDelay(true);
             channel.socket().setKeepAlive(true);
 
-            // Set read timeout (only works for blocking mode)
-            // NOTE: This timeout applies to Socket.getInputStream().read() but NOT to
-            // SocketChannel.read(). For true timeout enforcement with SocketChannel,
-            // use selector-based non-blocking I/O or SO_TIMEOUT before configuring
-            // blocking.
+            // SO_TIMEOUT applies to reads through the socket's input stream, which
+            // PooledConnection.readWithTimeout uses (a plain SocketChannel.read ignores it)
             channel.socket().setSoTimeout(readTimeoutMs);
-
-            // Configure as blocking for simpler client implementation
             channel.configureBlocking(true);
 
             try {
@@ -332,11 +327,16 @@ public class ConnectionPool {
             }
         }
 
+        /**
+         * Close a connection and give back its permit. Idempotent: a connection invalidated twice
+         * (say, by a failed request and then by a stale-pool eviction) must not free two permits.
+         */
         void invalidate(PooledConnection conn) {
             conn.closeQuietly();
-            totalConnections.decrementAndGet();
-            allConnections.remove(conn);
-            permits.release();
+            if (allConnections.remove(conn)) {
+                totalConnections.decrementAndGet();
+                permits.release();
+            }
         }
 
         void close() {
@@ -492,10 +492,6 @@ public class ConnectionPool {
             while (buffer.hasRemaining()) {
                 channel.write(buffer);
             }
-        }
-
-        public int read(ByteBuffer buffer) throws IOException {
-            return channel.read(buffer);
         }
 
         /**

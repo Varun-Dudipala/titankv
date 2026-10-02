@@ -3,6 +3,7 @@ package com.titankv;
 import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ConsistentHash;
 import com.titankv.cluster.Node;
+import com.titankv.consistency.ConsistencyLevel;
 import com.titankv.network.ConnectionPool;
 import com.titankv.network.ConnectionPool.PooledConnection;
 import com.titankv.network.protocol.BinaryProtocol;
@@ -157,15 +158,24 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Get a value by key with metadata (timestamp, expiration).
+     * Get a value by key with metadata (timestamp, expiration), at the configured consistency level.
      *
      * @param key the key to retrieve
      * @return the value with metadata if found, empty otherwise
      * @throws IOException if the request fails
      */
     public Optional<ValueWithMetadata> getWithMetadata(String key) throws IOException {
+        return getWithMetadata(key, config.getConsistency());
+    }
+
+    /**
+     * Get a value by key with metadata, at the given consistency level.
+     *
+     * @param level how many replicas must answer, or null for the server's default
+     */
+    public Optional<ValueWithMetadata> getWithMetadata(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(Command.get(key), key);
+        Response response = execute(Command.get(key).withConsistency(level), key);
         observe(response);
 
         if (response.isOk()) {
@@ -194,6 +204,10 @@ public class TitanKVClient implements AutoCloseable {
         return getWithMetadata(key).map(ValueWithMetadata::getValue);
     }
 
+    public Optional<byte[]> get(String key, ConsistencyLevel level) throws IOException {
+        return getWithMetadata(key, level).map(ValueWithMetadata::getValue);
+    }
+
     /**
      * Get a value as a string.
      *
@@ -203,6 +217,10 @@ public class TitanKVClient implements AutoCloseable {
      */
     public Optional<String> getString(String key) throws IOException {
         return get(key).map(bytes -> new String(bytes, StandardCharsets.UTF_8));
+    }
+
+    public Optional<String> getString(String key, ConsistencyLevel level) throws IOException {
+        return get(key, level).map(bytes -> new String(bytes, StandardCharsets.UTF_8));
     }
 
     /**
@@ -223,11 +241,22 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public void put(String key, byte[] value, long ttlMillis) throws IOException {
+        put(key, value, ttlMillis, config.getConsistency());
+    }
+
+    /**
+     * Store a value at the given consistency level.
+     *
+     * @param ttlMillis time-to-live in milliseconds (0 = never expires)
+     * @param level     how many replicas must acknowledge, or null for the server's default
+     */
+    public void put(String key, byte[] value, long ttlMillis, ConsistencyLevel level) throws IOException {
         validateKey(key);
         if (ttlMillis < 0) {
             throw new IllegalArgumentException("ttlMillis must not be negative");
         }
-        Response response = execute(new Command(Command.PUT, key, value, causalContext.get(), ttlMillis), key);
+        Command command = new Command(Command.PUT, key, value, causalContext.get(), ttlMillis, level);
+        Response response = execute(command, key);
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
@@ -245,6 +274,10 @@ public class TitanKVClient implements AutoCloseable {
         put(key, value.getBytes(StandardCharsets.UTF_8));
     }
 
+    public void put(String key, String value, ConsistencyLevel level) throws IOException {
+        put(key, value.getBytes(StandardCharsets.UTF_8), 0, level);
+    }
+
     /**
      * Delete a key.
      *
@@ -252,8 +285,15 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public void delete(String key) throws IOException {
+        delete(key, config.getConsistency());
+    }
+
+    /**
+     * Delete a key at the given consistency level (null for the server's default).
+     */
+    public void delete(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(new Command(Command.DELETE, key, null, causalContext.get(), 0), key);
+        Response response = execute(new Command(Command.DELETE, key, null, causalContext.get(), 0, level), key);
 
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
@@ -392,18 +432,6 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * Get a value from local store only (internal replication, no cascade).
-     * This method is used by ReplicationManager to prevent read recursion.
-     *
-     * @param key the key to retrieve
-     * @return the value if found, empty otherwise
-     * @throws IOException if the request fails
-     */
-    public Optional<byte[]> getInternal(String key) throws IOException {
-        return getInternalWithMetadata(key).map(ValueWithMetadata::getValue);
-    }
-
-    /**
      * Check if a key exists.
      *
      * @param key the key to check
@@ -411,8 +439,15 @@ public class TitanKVClient implements AutoCloseable {
      * @throws IOException if the request fails
      */
     public boolean exists(String key) throws IOException {
+        return exists(key, config.getConsistency());
+    }
+
+    /**
+     * Check if a key exists, at the given consistency level (null for the server's default).
+     */
+    public boolean exists(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(Command.exists(key), key);
+        Response response = execute(Command.exists(key).withConsistency(level), key);
 
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
@@ -436,9 +471,6 @@ public class TitanKVClient implements AutoCloseable {
         }
     }
 
-    /**
-     * Execute a command with retry logic.
-     */
     /**
      * Send a command for a key, failing over across nodes. Nodes are tried in ring order for the
      * key, with nodes whose circuit breaker is open moved to the back. Failing over to a different

@@ -7,7 +7,7 @@ import java.nio.charset.StandardCharsets;
 import static org.assertj.core.api.Assertions.*;
 
 /**
- * Tests for KeyValuePair to boost core package coverage.
+ * Tests for KeyValuePair: copying, expiry and version ordering.
  */
 class KeyValuePairTest {
 
@@ -253,5 +253,21 @@ class KeyValuePairTest {
 
         byte[] retrieved = pair.getValue();
         assertThat(retrieved).containsExactly(0x00, 0x01, (byte) 0xFF, 0x7F, (byte) 0x80);
+    }
+
+    @Test
+    void versionsAreOrderedByTimestampThenTombstoneThenValue() {
+        byte[] a = "a".getBytes();
+        byte[] b = "b".getBytes();
+        assertThat(KeyValuePair.compareVersions(2, a, 1, b)).isPositive();
+        assertThat(KeyValuePair.compareVersions(1, b, 2, a)).isNegative();
+        assertThat(KeyValuePair.compareVersions(1, b, 1, a)).isPositive();
+        assertThat(KeyValuePair.compareVersions(1, null, 1, b)).isPositive(); // a delete wins a tie
+        assertThat(KeyValuePair.compareVersions(1, a, 1, a.clone())).isZero();
+        assertThat(KeyValuePair.compareVersions(1, null, 1, null)).isZero();
+
+        assertThat(new KeyValuePair(b, 5, 0).isNewerThan(new KeyValuePair(a, 5, 0))).isTrue();
+        assertThat(new KeyValuePair(a, 5, 0).isNewerThan(new KeyValuePair(b, 5, 0))).isFalse();
+        assertThat(new KeyValuePair(a, 5, 0).isNewerThan(new KeyValuePair(a, 5, 0))).isFalse();
     }
 }

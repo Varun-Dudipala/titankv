@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Wire format (big endian), optionally followed by a 32-byte HMAC-SHA256 of the message:
  *   header:  [type:1][sentAt:8][senderId:str]
  *   JOIN:    header [host:str][port:4][generation:8][version:8]
- *   LEAVE:   header
+ *   LEAVE:   header                                     (the sender is shutting down)
  *   REMOVE:  header [removed id:str][removed generation:8]   (an operator removed a dead node)
  *   DIGEST:  header [count:4] then per member [id:str][host:str][port:4][status:1][generation:8][version:8]
  * where str is [length:2][UTF-8 bytes]. sentAt strictly increases per sender, which lets the
@@ -362,10 +362,7 @@ public class GossipProtocol {
                     handleJoin(buffer, senderId);
                     break;
                 case MSG_LEAVE:
-                    Node leaving = clusterManager.getNode(senderId);
-                    if (leaving != null) {
-                        clusterManager.removeNode(leaving);
-                    }
+                    clusterManager.markShutdown(senderId);
                     break;
                 case MSG_DIGEST:
                     handleDigest(buffer);
@@ -438,7 +435,7 @@ public class GossipProtocol {
             return;
         }
         // Only adopt members someone currently believes are up, and never resurrect a node
-        // that has gracefully left unless it has restarted since (newer generation).
+        // that was removed unless it has restarted since (newer generation).
         boolean reportedUp = reportedStatus == Node.Status.ALIVE || reportedStatus == Node.Status.JOINING;
         if (!reportedUp || clusterManager.hasDeparted(id, memberGeneration)) {
             return;

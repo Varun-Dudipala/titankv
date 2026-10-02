@@ -1,5 +1,7 @@
 package com.titankv.client;
 
+import com.titankv.consistency.ConsistencyLevel;
+
 /**
  * Configuration for TitanKV client.
  */
@@ -13,6 +15,7 @@ public class ClientConfig {
     private boolean retryOnFailure = true;
     private String authToken = null;
     private boolean circuitBreakerEnabled = true;
+    private ConsistencyLevel consistency = null;
 
     public ClientConfig() {
         String token = System.getenv("TITANKV_CLIENT_TOKEN");
@@ -115,6 +118,18 @@ public class ClientConfig {
     }
 
     /**
+     * @return the consistency level requested for reads and writes that do not name one, or null
+     *         to use the server's default (QUORUM unless configured otherwise)
+     */
+    public ConsistencyLevel getConsistency() {
+        return consistency;
+    }
+
+    public void setConsistency(ConsistencyLevel consistency) {
+        this.consistency = consistency;
+    }
+
+    /**
      * Builder for ClientConfig.
      */
     public static class Builder {
@@ -157,6 +172,11 @@ public class ClientConfig {
 
         public Builder authToken(String token) {
             config.setAuthToken(token);
+            return this;
+        }
+
+        public Builder consistency(ConsistencyLevel level) {
+            config.setConsistency(level);
             return this;
         }
 

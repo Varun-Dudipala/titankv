@@ -116,6 +116,40 @@ class HintedHandoffTest {
         assertThat(replicas.writes.get("k2").expiresAt).isEqualTo(5_000);
     }
 
+    @Test
+    void hintFileIsCompactedWhenOverwritesMakeItLarge() throws Exception {
+        HintedHandoff handoff = handoff(hintsDir);
+        for (int i = 0; i < 50_000; i++) {
+            handoff.store(replica, "hot-" + (i % 10), bytes("v" + i), 1_000 + i, 0);
+        }
+        long size = java.nio.file.Files.size(hintsDir.resolve("replica.hints"));
+        assertThat(handoff.pendingHints(replica.getId())).isEqualTo(10);
+        assertThat(size).as("hint file bytes").isLessThan(1_000_000);
+        handoff.shutdown();
+
+        HintedHandoff reloaded = handoff(hintsDir);
+        assertThat(reloaded.pendingHints(replica.getId())).isEqualTo(10);
+        recover();
+        awaitDelivered(reloaded);
+        assertThat(replicas.writes.get("hot-9").timestamp).isEqualTo(1_000 + 49_999);
+    }
+
+    @Test
+    void hintsForARemovedNodeAreDropped() throws Exception {
+        HintedHandoff handoff = handoff(hintsDir);
+        handoff.store(replica, "k", bytes("v"), 100, 0);
+        assertThat(hintsDir.resolve("replica.hints")).exists();
+
+        clusterManager.removeDeadNode(replica.getId()); // fires NODE_LEFT
+
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (handoff.pendingHints(replica.getId()) > 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(handoff.totalPendingHints()).isZero();
+        assertThat(hintsDir.resolve("replica.hints")).doesNotExist();
+    }
+
     /**
      * Records writes, or fails them all while {@code failing} is set.
      */

@@ -1,9 +1,8 @@
 package com.titankv.consistency;
 
-import com.titankv.TitanKVClient;
-import com.titankv.client.ClientConfig;
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.core.KeyValuePair;
 import com.titankv.util.Env;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,7 +24,6 @@ public class ReadRepairHandler {
     private final ReplicaIO replicaIO;
     private final ExecutorService executor;
     private final boolean ownsExecutor;
-    private final Map<String, TitanKVClient> ownedClients = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong replicasRepaired = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong speculativeReads = new java.util.concurrent.atomic.AtomicLong();
 
@@ -35,21 +33,14 @@ public class ReadRepairHandler {
     private final ScheduledExecutorService speculationSweeper;
 
     /**
-     * Create a standalone handler with its own threads and authenticated node connections.
-     */
-    public ReadRepairHandler(ClusterManager clusterManager, int replicationFactor) {
-        this(clusterManager, replicationFactor, null, null);
-    }
-
-    /**
-     * @param replicaIO how to reach replicas, or null to connect over TCP with the internal token
+     * @param replicaIO how to read and write individual replicas
      * @param executor  pool for blocking replica calls, or null to create a private one
      */
     public ReadRepairHandler(ClusterManager clusterManager, int replicationFactor,
             ReplicaIO replicaIO, ExecutorService executor) {
         this.clusterManager = clusterManager;
         this.replicationFactor = replicationFactor;
-        this.replicaIO = replicaIO != null ? replicaIO : new TcpReplicaIO();
+        this.replicaIO = Objects.requireNonNull(replicaIO);
         this.ownsExecutor = executor == null;
         this.executor = executor != null ? executor : Executors.newFixedThreadPool(4, r -> {
             Thread t = new Thread(r, "read-repair");
@@ -285,29 +276,6 @@ public class ReadRepairHandler {
     }
 
     /**
-     * Write the given version to every replica of the key.
-     *
-     * @return number of replicas that accepted the write
-     */
-    public CompletableFuture<Integer> forceRepair(String key, byte[] value, long timestamp, long expiresAt) {
-        List<Node> replicas = liveReplicas(key);
-        List<CompletableFuture<Boolean>> writes = new ArrayList<>();
-        for (Node node : replicas) {
-            writes.add(CompletableFuture.supplyAsync(() -> {
-                try {
-                    replicaIO.write(node, key, value, timestamp, expiresAt);
-                    return true;
-                } catch (IOException | RuntimeException e) {
-                    logger.warn("Failed to repair {} on {}: {}", key, node.getId(), e.getMessage());
-                    return false;
-                }
-            }, executor));
-        }
-        return CompletableFuture.allOf(writes.toArray(new CompletableFuture<?>[0]))
-                .thenApply(v -> (int) writes.stream().filter(CompletableFuture::join).count());
-    }
-
-    /**
      * The key's replicas that are currently up. Down replicas are not substituted by other nodes.
      */
     private List<Node> liveReplicas(String key) {
@@ -363,8 +331,7 @@ public class ReadRepairHandler {
     }
 
     /**
-     * Last write wins. Ties on timestamp are broken by comparing values so every
-     * coordinator picks the same winner.
+     * The winning version under last-write-wins, ignoring replicas that have no entry.
      */
     private static NodeValue findNewest(List<NodeValue> results) {
         NodeValue newest = null;
@@ -372,25 +339,12 @@ public class ReadRepairHandler {
             if (nv.timestamp <= 0) {
                 continue;
             }
-            if (newest == null || nv.timestamp > newest.timestamp
-                    || (nv.timestamp == newest.timestamp && compareValues(nv.value, newest.value) > 0)) {
+            if (newest == null
+                    || KeyValuePair.compareVersions(nv.timestamp, nv.value, newest.timestamp, newest.value) > 0) {
                 newest = nv;
             }
         }
         return newest;
-    }
-
-    private static int compareValues(byte[] a, byte[] b) {
-        if (a == b) {
-            return 0;
-        }
-        if (a == null) {
-            return -1;
-        }
-        if (b == null) {
-            return 1;
-        }
-        return Arrays.compare(a, b);
     }
 
     private static List<Node> findStaleNodes(List<NodeValue> results, NodeValue newest) {
@@ -432,43 +386,6 @@ public class ReadRepairHandler {
                 executor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
-        }
-        for (TitanKVClient client : ownedClients.values()) {
-            client.close();
-        }
-        ownedClients.clear();
-    }
-
-    /**
-     * Reaches replicas over TCP using internal commands, for handlers not given a ReplicaIO.
-     */
-    private class TcpReplicaIO implements ReplicaIO {
-        @Override
-        public Optional<ReplicationManager.ReadResult> read(Node replica, String key) throws IOException {
-            return client(replica).getInternalWithMetadata(key)
-                    .map(m -> new ReplicationManager.ReadResult(m.getValue(), m.getTimestamp(), m.getExpiresAt()));
-        }
-
-        @Override
-        public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt)
-                throws IOException {
-            if (value == null) {
-                client(replica).deleteInternal(key, timestamp, expiresAt);
-            } else {
-                client(replica).putInternal(key, value, timestamp, expiresAt);
-            }
-        }
-
-        private TitanKVClient client(Node node) {
-            return ownedClients.computeIfAbsent(node.getAddress(), addr -> new TitanKVClient(
-                    ClientConfig.builder()
-                            .connectTimeoutMs(5000)
-                            .readTimeoutMs(5000)
-                            .retryOnFailure(false)
-                            .circuitBreaker(false)
-                            .authToken(Env.internalToken())
-                            .build(),
-                    addr));
         }
     }
 

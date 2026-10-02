@@ -28,36 +28,21 @@ public class TcpServer {
     private static final int DEFAULT_WORKER_THREADS = Math.max(4, Runtime.getRuntime().availableProcessors());
 
     /**
-     * Get worker thread count from environment/system property, or use default.
-     * Checks: TITANKV_WORKER_THREADS env var, titankv.worker.threads property
+     * TITANKV_WORKER_THREADS / titankv.worker.threads, or max(4, CPUs).
      */
     private static int getConfiguredWorkerThreads() {
-        String envValue = System.getenv("TITANKV_WORKER_THREADS");
-        if (envValue != null && !envValue.isEmpty()) {
+        String configured = com.titankv.util.Env.get("TITANKV_WORKER_THREADS", "titankv.worker.threads");
+        if (configured != null) {
             try {
-                int threads = Integer.parseInt(envValue.trim());
+                int threads = Integer.parseInt(configured.trim());
                 if (threads > 0) {
-                    logger.info("Using TITANKV_WORKER_THREADS={}", threads);
                     return threads;
                 }
             } catch (NumberFormatException e) {
-                logger.warn("Invalid TITANKV_WORKER_THREADS value: {}, using default", envValue);
+                // fall through
             }
+            logger.warn("Invalid TITANKV_WORKER_THREADS value {}, using {}", configured, DEFAULT_WORKER_THREADS);
         }
-
-        String propValue = System.getProperty("titankv.worker.threads");
-        if (propValue != null && !propValue.isEmpty()) {
-            try {
-                int threads = Integer.parseInt(propValue.trim());
-                if (threads > 0) {
-                    logger.info("Using titankv.worker.threads={}", threads);
-                    return threads;
-                }
-            } catch (NumberFormatException e) {
-                logger.warn("Invalid titankv.worker.threads value: {}, using default", propValue);
-            }
-        }
-
         return DEFAULT_WORKER_THREADS;
     }
 
@@ -131,27 +116,6 @@ public class TcpServer {
         serverThread.start();
 
         logger.info("TitanKV server started on port {}", port);
-    }
-
-    /**
-     * Start the server and block until it's stopped.
-     *
-     * @throws IOException if the server cannot be started
-     */
-    public void startAndBlock() throws IOException {
-        if (running.getAndSet(true)) {
-            throw new IllegalStateException("Server already running");
-        }
-
-        selector = Selector.open();
-        serverChannel = ServerSocketChannel.open();
-        serverChannel.configureBlocking(false);
-        serverChannel.socket().setReuseAddress(true);
-        serverChannel.bind(new InetSocketAddress(port));
-        serverChannel.register(selector, SelectionKey.OP_ACCEPT);
-
-        logger.info("TitanKV server started on port {}", port);
-        eventLoop();
     }
 
     private void eventLoop() {

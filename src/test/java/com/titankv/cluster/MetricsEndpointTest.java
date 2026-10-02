@@ -54,10 +54,13 @@ class MetricsEndpointTest {
         assertThat(metrics.statusCode()).isEqualTo(200);
         assertThat(metrics.headers().firstValue("Content-Type").orElse("")).startsWith("text/plain");
         assertThat(metrics.body())
-                .contains("titankv_ops{operation=\"put\"}")
+                .contains("# TYPE titankv_ops_total counter")
+                .contains("titankv_ops_total{operation=\"put\"}")
+                .contains("titankv_latency_seconds_count{operation=\"get\"}")
                 .contains("titankv_hints_pending")
-                .contains("titankv_read_repairs")
-                .contains("titankv_antientropy_keys_synced")
+                .contains("titankv_read_repairs_total")
+                .contains("titankv_antientropy_keys_synced_total")
+                .contains("titankv_replica_ops_total{operation=\"write\"}")
                 .contains("titankv_cluster_alive_nodes 3");
     }
 

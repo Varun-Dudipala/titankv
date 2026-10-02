@@ -239,6 +239,13 @@ public class ConnectionHandler {
             }
             return null;
         }
+        if (type == Command.REMOVE_NODE || type == Command.CLEANUP) {
+            // Operator commands change the cluster, so they need the cluster's own token
+            if (internalAuthRequired && !internalAuthenticated) {
+                return Response.error("Admin commands require the cluster token");
+            }
+            return null;
+        }
         if (clientAuthRequired && !clientAuthenticated) {
             return Response.error("AUTH required");
         }
@@ -461,8 +468,6 @@ public class ConnectionHandler {
                 // Scans the whole store, so it runs off the worker pool
                 return CompletableFuture.supplyAsync(() -> Response.ok(
                         Integer.toString(replicationManager.cleanup()).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-            case Command.KEYS:
-                return done(Response.error("KEYS command is disabled in distributed mode for performance reasons"));
             default:
                 logger.warn("Unknown command type: {}", command.getType());
                 return done(Response.error("Unknown command"));
@@ -493,16 +498,20 @@ public class ConnectionHandler {
     private void recordMetrics(Command command, Response response, long durationNanos) {
         switch (command.getType()) {
             case Command.GET:
-            case Command.GET_INTERNAL:
                 metrics.recordGet(durationNanos, response.getStatus() == Response.OK);
                 break;
             case Command.PUT:
-            case Command.PUT_INTERNAL:
                 metrics.recordPut(durationNanos);
                 break;
             case Command.DELETE:
-            case Command.DELETE_INTERNAL:
                 metrics.recordDelete(durationNanos);
+                break;
+            case Command.GET_INTERNAL:
+                metrics.recordReplicaRead();
+                break;
+            case Command.PUT_INTERNAL:
+            case Command.DELETE_INTERNAL:
+                metrics.recordReplicaWrite();
                 break;
             default:
                 break;
@@ -510,6 +519,13 @@ public class ConnectionHandler {
         if (response.isError()) {
             metrics.recordError();
         }
+    }
+
+    /**
+     * The consistency level the client asked for on this request, else the server's default.
+     */
+    private static ConsistencyLevel level(Command command, ConsistencyLevel serverDefault) {
+        return command.getConsistency() != null ? command.getConsistency() : serverDefault;
     }
 
     /**
@@ -546,7 +562,7 @@ public class ConnectionHandler {
             return done(Response.error("Key required for GET"));
         }
         if (isDistributed()) {
-            return replicated(replicationManager.read(command.getKey(), readConsistency), "Read", command.getKey(),
+            return replicated(replicationManager.read(command.getKey(), level(command, readConsistency)), "Read", command.getKey(),
                     result -> {
                         result.ifPresent(r -> clock().observe(r.getTimestamp()));
                         return result.filter(r -> r.getValue() != null)
@@ -567,7 +583,7 @@ public class ConnectionHandler {
             return done(Response.error("Key required for EXISTS"));
         }
         if (isDistributed()) {
-            return replicated(replicationManager.read(command.getKey(), readConsistency), "Read", command.getKey(),
+            return replicated(replicationManager.read(command.getKey(), level(command, readConsistency)), "Read", command.getKey(),
                     result -> Response.exists(result.filter(r -> r.getValue() != null).isPresent()));
         }
         return done(Response.exists(store.exists(command.getKey())));
@@ -602,10 +618,20 @@ public class ConnectionHandler {
             return Response.error("Anti-entropy not available");
         }
         java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(args);
-        byte[] result = command.getType() == Command.MERKLE_TREE
-                ? antiEntropy.handleTreeRequest(command.getKey(), buffer.get())
-                : antiEntropy.handleLeafRequest(command.getKey(), buffer.getInt());
-        return Response.ok(result);
+        if (command.getType() == Command.MERKLE_TREE) {
+            if (args.length != 1) {
+                return Response.error("MERKLE_TREE takes a 1-byte mode");
+            }
+            return Response.ok(antiEntropy.handleTreeRequest(command.getKey(), buffer.get()));
+        }
+        if (args.length == 0 || args.length % 4 != 0) {
+            return Response.error("MERKLE_LEAF takes a list of 4-byte leaf numbers");
+        }
+        int[] leaves = new int[args.length / 4];
+        for (int i = 0; i < leaves.length; i++) {
+            leaves[i] = buffer.getInt();
+        }
+        return Response.ok(antiEntropy.handleLeafRequest(command.getKey(), leaves));
     }
 
     /**
@@ -616,13 +642,12 @@ public class ConnectionHandler {
             return Response.ok("single node, no cluster manager\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
         }
         StringBuilder sb = new StringBuilder();
-        long now = System.currentTimeMillis();
         java.util.List<com.titankv.cluster.Node> members = new java.util.ArrayList<>(clusterManager.getAllNodes());
         members.sort(java.util.Comparator.comparing(com.titankv.cluster.Node::getId));
         for (com.titankv.cluster.Node node : members) {
             boolean local = node.equals(clusterManager.getLocalNode());
             sb.append(String.format("%-24s %-8s %-24s %s%n", node.getId(), node.getStatus(), node.getAddress(),
-                    local ? "(this node)" : String.format("last heard %.1fs ago", (now - node.getLastHeartbeat()) / 1000.0)));
+                    local ? "(this node)" : String.format("last heard %.1fs ago", node.getMillisSinceLastHeartbeat() / 1000.0)));
         }
         return Response.ok(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
@@ -652,7 +677,7 @@ public class ConnectionHandler {
 
         if (isDistributed()) {
             return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
-                    expiresAt, writeConsistency), "Write", command.getKey(), ok -> written);
+                    expiresAt, level(command, writeConsistency)), "Write", command.getKey(), ok -> written);
         }
         store.putIfNewer(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt);
         return done(written);
@@ -692,7 +717,7 @@ public class ConnectionHandler {
         Response deleted = Response.ok(null, timestamp, 0);
 
         if (isDistributed()) {
-            return replicated(replicationManager.delete(command.getKey(), timestamp, 0, deleteConsistency),
+            return replicated(replicationManager.delete(command.getKey(), timestamp, 0, level(command, deleteConsistency)),
                     "Delete", command.getKey(), ok -> deleted);
         }
         store.putIfNewer(command.getKey(), null, timestamp, 0);

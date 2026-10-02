@@ -50,7 +50,7 @@ public final class BinaryProtocol {
         ByteBuffer buffer = ByteBuffer.allocate(totalSize);
 
         buffer.putInt(MAGIC);
-        buffer.put(command.getType());
+        buffer.put(command.wireType());
         buffer.putInt(keyBytes.length);
         buffer.putInt(valueLen);
         buffer.putLong(command.getTimestamp());
@@ -79,7 +79,7 @@ public final class BinaryProtocol {
         int valueLen = valueBytes != null ? valueBytes.length : -1;  // -1 = null
 
         buffer.putInt(MAGIC);
-        buffer.put(command.getType());
+        buffer.put(command.wireType());
         buffer.putInt(keyBytes.length);
         buffer.putInt(valueLen);
         buffer.putLong(command.getTimestamp());
@@ -161,7 +161,8 @@ public final class BinaryProtocol {
                 "Invalid magic bytes: expected 0x%08X, got 0x%08X", MAGIC, magic));
         }
 
-        byte cmdType = buffer.get();
+        byte wireType = buffer.get();
+        byte cmdType = (byte) (wireType & Command.TYPE_MASK);
         int keyLength = buffer.getInt();
         int valueLength = buffer.getInt();
         long timestamp = buffer.getLong();
@@ -190,7 +191,7 @@ public final class BinaryProtocol {
             }
         }
 
-        return new Command(cmdType, key, value, timestamp, expiresAt);
+        return new Command(cmdType, key, value, timestamp, expiresAt, Command.consistencyOf(wireType));
     }
 
     /**

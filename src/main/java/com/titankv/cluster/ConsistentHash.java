@@ -295,22 +295,4 @@ public class ConsistentHash {
             lock.readLock().unlock();
         }
     }
-
-    /**
-     * Get statistics about the hash ring.
-     */
-    public String getStats() {
-        Map<String, Double> dist = getDistribution();
-        StringBuilder sb = new StringBuilder();
-        sb.append("ConsistentHash Stats:\n");
-        sb.append("  Physical nodes: ").append(getNodeCount()).append("\n");
-        sb.append("  Virtual nodes: ").append(getVirtualNodeCount()).append("\n");
-        sb.append("  Distribution:\n");
-        for (Map.Entry<String, Double> entry : dist.entrySet()) {
-            sb.append("    ").append(entry.getKey())
-              .append(": ").append(String.format("%.2f%%", entry.getValue()))
-              .append("\n");
-        }
-        return sb.toString();
-    }
 }

@@ -39,73 +39,31 @@ public class TitanKVServer {
     private final ReplicationManager replicationManager;
     private final CountDownLatch shutdownLatch;
     private final String seedNodes;
+    private final java.util.concurrent.atomic.AtomicBoolean stopped = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile Thread shutdownHook;
     private MetricsHttpServer metricsHttpServer;
     private DataRebalancer dataRebalancer;
 
     /**
-     * Create a new TitanKV server.
-     *
-     * @param port the port to listen on
+     * Create a single-node server (no seeds) with a node id of hostname:port.
      */
     public TitanKVServer(int port) {
-        this.port = port;
-        this.seedNodes = null;
-        this.store = new InMemoryStore(nodeDataDir(port));
-        this.metrics = new MetricsCollector();
-        this.shutdownLatch = new CountDownLatch(1);
-        this.nodeId = generateNodeId(port);
-
-        Node localNode = new Node(this.nodeId, "localhost", port);
-        this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
-        this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
+        this(port, null, null);
     }
 
     /**
-     * Create a new TitanKV server with cluster configuration.
-     *
      * @param port      the port to listen on
-     * @param nodeId    optional node identifier (defaults to host:port)
-     * @param seedNodes comma-separated seed node addresses for cluster join
+     * @param nodeId    node identifier, host:port (defaults to hostname:port)
+     * @param seedNodes comma-separated addresses of other members to join through, or null
      */
     public TitanKVServer(int port, String nodeId, String seedNodes) {
         this.port = port;
         this.seedNodes = seedNodes;
+        this.nodeId = nodeId == null || nodeId.isEmpty() ? generateNodeId(port) : nodeId;
         this.store = new InMemoryStore(nodeDataDir(port));
         this.metrics = new MetricsCollector();
         this.shutdownLatch = new CountDownLatch(1);
-
-        // Generate node ID if not provided
-        if (nodeId == null || nodeId.isEmpty()) {
-            this.nodeId = generateNodeId(port);
-        } else {
-            this.nodeId = nodeId;
-        }
-
-        // Create the local node and cluster manager
-        Node localNode = new Node(this.nodeId, getHostFromId(this.nodeId), port);
-        this.clusterManager = new ClusterManager(localNode);
-        this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
-        this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
-    }
-
-    /**
-     * Create a server with custom store and metrics.
-     *
-     * @param port    the port to listen on
-     * @param store   the key-value store to use
-     * @param metrics the metrics collector to use
-     */
-    public TitanKVServer(int port, KVStore store, MetricsCollector metrics) {
-        this.port = port;
-        this.nodeId = "localhost:" + port;
-        this.seedNodes = null;
-        this.store = store;
-        this.metrics = metrics;
-        this.shutdownLatch = new CountDownLatch(1);
-
-        Node localNode = new Node(this.nodeId, "localhost", port);
-        this.clusterManager = new ClusterManager(localNode);
+        this.clusterManager = new ClusterManager(new Node(this.nodeId, getHostFromId(this.nodeId), port));
         this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
@@ -152,7 +110,7 @@ public class TitanKVServer {
         }
     }
 
-    private String getHostFromId(String nodeId) {
+    private static String getHostFromId(String nodeId) {
         if (nodeId.contains(":")) {
             return nodeId.substring(0, nodeId.lastIndexOf(':'));
         }
@@ -168,11 +126,9 @@ public class TitanKVServer {
         logger.info("Node ID: {}", nodeId);
         logger.info("Port: {}", port);
 
-        // Register shutdown hook
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            logger.info("Shutdown signal received");
-            stop();
-        }, "titankv-shutdown"));
+        // On SIGTERM, shut down gracefully: peers are told this node is going down
+        shutdownHook = new Thread(this::stop, "titankv-shutdown");
+        Runtime.getRuntime().addShutdownHook(shutdownHook);
 
         // Start TCP server
         tcpServer.start();
@@ -223,6 +179,10 @@ public class TitanKVServer {
                     replicationManager, rm -> rm.getAntiEntropy().getKeysSynced())
                     .description("Keys copied between replicas by Merkle-tree repair")
                     .register(registry);
+            io.micrometer.core.instrument.FunctionCounter.builder("titankv.antientropy.rounds",
+                    replicationManager, rm -> rm.getAntiEntropy().getRounds())
+                    .description("Merkle-tree repair rounds started by this node")
+                    .register(registry);
         }
         io.micrometer.core.instrument.Gauge.builder("titankv.store.memory.bytes", store,
                 s -> ((InMemoryStore) s).getMemoryUsedBytes())
@@ -242,6 +202,17 @@ public class TitanKVServer {
      * Stop the server.
      */
     public void stop() {
+        if (!stopped.compareAndSet(false, true)) {
+            return;
+        }
+        Thread hook = shutdownHook;
+        if (hook != null && Thread.currentThread() != hook) {
+            try {
+                Runtime.getRuntime().removeShutdownHook(hook);
+            } catch (IllegalStateException e) {
+                // the JVM is already shutting down
+            }
+        }
         logger.info("Stopping TitanKV Server");
 
         // Stop metrics HTTP server
