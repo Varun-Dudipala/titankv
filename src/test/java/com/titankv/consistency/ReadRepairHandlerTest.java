@@ -2,252 +2,197 @@ package com.titankv.consistency;
 
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.core.KeyValuePair;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.*;
 
 /**
- * Tests for ReadRepairHandler to boost consistency package coverage.
+ * Read coordination against three in-memory replicas: newest version wins, stale contacted
+ * replicas are repaired, failed replicas are replaced by spares, and too few answers fail the read.
  */
 class ReadRepairHandlerTest {
 
-    private ReadRepairHandler handler;
+    private final FakeReplicas replicas = new FakeReplicas();
     private ClusterManager clusterManager;
-    private Node localNode;
+    private Node local;
+    private Node peer1;
+    private Node peer2;
+    private ExecutorService executor;
+    private ReadRepairHandler handler;
 
     @BeforeEach
     void setUp() {
-        localNode = new Node("test-node", "localhost", 19300);
-        clusterManager = new ClusterManager(localNode);
-        clusterManager.start(null);
-
-        handler = new ReadRepairHandler(clusterManager, 3);
+        local = new Node("local", "localhost", 19301);
+        peer1 = new Node("peer1", "localhost", 19302);
+        peer2 = new Node("peer2", "localhost", 19303);
+        clusterManager = new ClusterManager(local);
+        clusterManager.addNode(peer1);
+        clusterManager.addNode(peer2);
+        executor = Executors.newFixedThreadPool(4);
+        handler = new ReadRepairHandler(clusterManager, 3, replicas, executor);
     }
 
     @AfterEach
     void tearDown() {
-        if (handler != null) {
-            handler.shutdown();
-        }
-        if (clusterManager != null) {
-            clusterManager.stop();
-        }
+        handler.shutdown();
+        executor.shutdownNow();
+    }
+
+    private ReadRepairHandler.RepairResult read(int required) throws Exception {
+        return handler.readWithRepair("k", required, 2_000).get(3, TimeUnit.SECONDS);
     }
 
     @Test
-    void readWithRepair_noReplicasAvailable_failsGracefully() {
-        // Empty cluster - no replicas
-        CompletableFuture<ReadRepairHandler.RepairResult> future =
-            handler.readWithRepair("nonexistent-key", 1, 1000);
+    void returnsTheNewestVersionAndRepairsTheStaleReplicaItContacted() throws Exception {
+        replicas.put(local, "k", "old", 1);
+        replicas.put(peer1, "k", "new", 2);
+        replicas.put(peer2, "k", "new", 2);
 
-        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
-            .hasCauseInstanceOf(ConsistencyException.class)
-            .hasMessageContaining("Not enough replicas");
+        ReadRepairHandler.RepairResult result = read(2);
+
+        assertThat(string(result.getValue())).isEqualTo("new");
+        assertThat(result.getRepairedNodes()).containsExactly(local);
+        awaitValue(local, "new");
+        assertThat(handler.getReplicasRepaired()).isEqualTo(1);
     }
 
     @Test
-    void readWithRepair_timeoutExceeded_fails() {
-        // Add a node that won't respond (port 60000 is safe, won't conflict with gossip)
-        Node unreachableNode = new Node("unreachable", "localhost", 60000);
-        unreachableNode.setStatus(Node.Status.ALIVE);
-        clusterManager.addNode(unreachableNode);
+    void equalVersionsResolveToTheSameWinnerAndRepairConverges() throws Exception {
+        replicas.put(local, "k", "apple", 5);
+        replicas.put(peer1, "k", "banana", 5);
+        replicas.put(peer2, "k", "banana", 5);
 
-        CompletableFuture<ReadRepairHandler.RepairResult> future =
-            handler.readWithRepair("test-key", 1, 100); // 100ms timeout
-
-        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
-            .isInstanceOf(ExecutionException.class);
+        assertThat(string(read(3).getValue())).isEqualTo("banana");
+        awaitValue(local, "banana");
     }
 
     @Test
-    void repairResult_constructorAndGetters() {
-        byte[] value = "test-value".getBytes();
-        long timestamp = System.currentTimeMillis();
-        long expiresAt = timestamp + 10000;
-        Node node1 = new Node("node1", "localhost", 9001);
-        Node node2 = new Node("node2", "localhost", 9002);
+    void aTombstoneIsTheNewestVersion() throws Exception {
+        replicas.put(local, "k", "value", 1);
+        replicas.store(peer1).put("k", new KeyValuePair(null, 2, 0));
+        replicas.store(peer2).put("k", new KeyValuePair(null, 2, 0));
 
-        ReadRepairHandler.RepairResult result = new ReadRepairHandler.RepairResult(
-            value, timestamp, expiresAt,
-            java.util.List.of(node1, node2),
-            true
-        );
-
-        assertThat(result.getValue()).isEqualTo(value);
-        assertThat(result.getTimestamp()).isEqualTo(timestamp);
-        assertThat(result.getExpiresAt()).isEqualTo(expiresAt);
-        assertThat(result.getRepairedNodes()).containsExactly(node1, node2);
-        assertThat(result.isRepairNeeded()).isTrue();
-    }
-
-    @Test
-    void repairResult_noRepairNeeded() {
-        byte[] value = "test-value".getBytes();
-        long timestamp = System.currentTimeMillis();
-
-        ReadRepairHandler.RepairResult result = new ReadRepairHandler.RepairResult(
-            value, timestamp, 0,
-            java.util.List.of(),
-            false
-        );
-
-        assertThat(result.isRepairNeeded()).isFalse();
-        assertThat(result.getRepairedNodes()).isEmpty();
-    }
-
-    @Test
-    void repairResult_nullValue() {
-        ReadRepairHandler.RepairResult result = new ReadRepairHandler.RepairResult(
-            null, 0, 0,
-            java.util.List.of(),
-            false
-        );
+        ReadRepairHandler.RepairResult result = read(3);
 
         assertThat(result.getValue()).isNull();
-        assertThat(result.getTimestamp()).isZero();
-        assertThat(result.isRepairNeeded()).isFalse();
+        assertThat(result.getTimestamp()).isEqualTo(2);
     }
 
     @Test
-    void forceRepair_emptyCluster_returnsZero() throws Exception {
-        byte[] value = "force-repair-value".getBytes();
-        long timestamp = System.currentTimeMillis();
-
-        CompletableFuture<Integer> future = handler.forceRepair(
-            "test-key", value, timestamp, 0
-        );
-
-        // Should complete even with no nodes to repair
-        Integer repaired = future.get(1, TimeUnit.SECONDS);
-        assertThat(repaired).isGreaterThanOrEqualTo(0);
+    void aKeyNoReplicaHasReadsAsVersionZero() throws Exception {
+        assertThat(read(2).getTimestamp()).isZero();
     }
 
     @Test
-    void forceRepair_withUnreachableNode_handlesFailure() throws Exception {
-        // Add unreachable node (port 60001 is safe)
-        Node unreachableNode = new Node("unreachable", "localhost", 60001);
-        unreachableNode.setStatus(Node.Status.ALIVE);
-        clusterManager.addNode(unreachableNode);
+    void aFailedReplicaIsReplacedByTheSpare() throws Exception {
+        replicas.put(local, "k", "v", 1);
+        replicas.put(peer1, "k", "v", 1);
+        replicas.put(peer2, "k", "v", 1);
+        replicas.failing.add(peer1);
 
-        byte[] value = "test-value".getBytes();
-        long timestamp = System.currentTimeMillis();
-
-        CompletableFuture<Integer> future = handler.forceRepair(
-            "test-key", value, timestamp, 0
-        );
-
-        // Should complete even if repair fails on some nodes
-        Integer repaired = future.get(2, TimeUnit.SECONDS);
-        assertThat(repaired).isGreaterThanOrEqualTo(0);
+        assertThat(string(read(2).getValue())).isEqualTo("v");
     }
 
     @Test
-    void shutdown_stopsGracefully() {
-        handler.shutdown();
+    void tooFewAnswersFailTheRead() {
+        replicas.failing.add(peer1);
+        replicas.failing.add(peer2);
 
-        // Second shutdown should be safe
-        assertThatCode(() -> handler.shutdown()).doesNotThrowAnyException();
+        assertThatThrownBy(() -> read(2)).hasCauseInstanceOf(ConsistencyException.class)
+                .hasMessageContaining("Not enough replicas");
     }
 
     @Test
-    void shutdown_withPendingOperations_waits() {
-        // Start a long operation
-        CompletableFuture<ReadRepairHandler.RepairResult> future =
-            handler.readWithRepair("test-key", 1, 5000);
+    void downReplicasAreNotAskedAndAllFailsAtOnce() {
+        peer2.setStatus(Node.Status.DEAD);
 
-        // Shutdown should wait for termination
-        long start = System.currentTimeMillis();
-        handler.shutdown();
-        long elapsed = System.currentTimeMillis() - start;
-
-        // Should complete relatively quickly (within 6 seconds)
-        assertThat(elapsed).isLessThan(6000);
+        assertThatThrownBy(() -> read(3)).hasCauseInstanceOf(ConsistencyException.class);
+        assertThat(replicas.reads.getOrDefault(peer2, 0)).isZero();
     }
 
     @Test
-    void readWithRepair_notEnoughReplicas_fails() {
-        // Local node only, requesting 2 responses
-        CompletableFuture<ReadRepairHandler.RepairResult> future =
-            handler.readWithRepair("test-key", 2, 1000);
+    void aSlowReplicaIsBackedUpBySpeculativelyAskingTheSpare() throws Exception {
+        replicas.put(local, "k", "v", 1);
+        replicas.put(peer1, "k", "v", 1);
+        replicas.put(peer2, "k", "v", 1);
+        replicas.slow.add(local); // asked first, hangs for 3 seconds
 
-        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
-            .hasCauseInstanceOf(ConsistencyException.class)
-            .hasMessageContaining("Not enough replicas");
+        long start = System.nanoTime();
+        ReadRepairHandler.RepairResult result = read(1);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+        assertThat(string(result.getValue())).isEqualTo("v");
+        assertThat(elapsedMs).isLessThan(1_000);
+        assertThat(handler.getSpeculativeReads()).isEqualTo(1);
     }
 
-    @Test
-    void readWithRepair_emptyKey_handled() {
-        CompletableFuture<ReadRepairHandler.RepairResult> future =
-            handler.readWithRepair("", 1, 1000);
-
-        // Should attempt to read even with empty key
-        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
-            .isInstanceOf(ExecutionException.class);
-    }
-
-    @Test
-    void handler_usesCorrectReplicationFactor() {
-        ReadRepairHandler customHandler = new ReadRepairHandler(clusterManager, 5);
-
-        try {
-            // Verify it's created successfully with custom RF
-            assertThat(customHandler).isNotNull();
-
-            // No replicas available for RF=5
-            CompletableFuture<ReadRepairHandler.RepairResult> future =
-                customHandler.readWithRepair("test-key", 1, 1000);
-
-            assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
-                .hasCauseInstanceOf(ConsistencyException.class);
-        } finally {
-            customHandler.shutdown();
+    private void awaitValue(Node node, String expected) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 3_000;
+        while (System.currentTimeMillis() < deadline) {
+            KeyValuePair kv = replicas.store(node).get("k");
+            if (kv != null && expected.equals(string(kv.getValueUnsafe()))) {
+                return;
+            }
+            Thread.sleep(10);
         }
+        fail(node.getId() + " was not repaired to " + expected);
     }
 
-    @Test
-    void readWithRepair_slowReplica_speculativelyAsksSpare() throws Exception {
-        for (int i = 1; i <= 2; i++) {
-            Node peer = new Node("peer" + i, "localhost", 19300 + i);
-            peer.setStatus(Node.Status.ALIVE);
-            clusterManager.addNode(peer);
+    private static String string(byte[] bytes) {
+        return bytes == null ? null : new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Replicas as maps that apply writes with last-write-wins, like the real store.
+     */
+    private static final class FakeReplicas implements ReplicaIO {
+        final Map<Node, Map<String, KeyValuePair>> stores = new ConcurrentHashMap<>();
+        final Map<Node, Integer> reads = new ConcurrentHashMap<>();
+        final Set<Node> failing = ConcurrentHashMap.newKeySet();
+        final Set<Node> slow = ConcurrentHashMap.newKeySet();
+
+        Map<String, KeyValuePair> store(Node node) {
+            return stores.computeIfAbsent(node, n -> new ConcurrentHashMap<>());
         }
-        // The local replica (asked first) hangs; the others answer at once
-        ReplicaIO io = new ReplicaIO() {
-            @Override
-            public java.util.Optional<ReplicationManager.ReadResult> read(Node replica, String key) {
-                if (replica.equals(localNode)) {
-                    try {
-                        Thread.sleep(3000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+
+        void put(Node node, String key, String value, long timestamp) {
+            store(node).put(key, new KeyValuePair(value.getBytes(StandardCharsets.UTF_8), timestamp, 0));
+        }
+
+        @Override
+        public Optional<ReplicationManager.ReadResult> read(Node replica, String key) throws IOException {
+            reads.merge(replica, 1, Integer::sum);
+            if (failing.contains(replica)) {
+                throw new IOException("replica unreachable");
+            }
+            if (slow.contains(replica)) {
+                try {
+                    Thread.sleep(3_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
-                return java.util.Optional.of(new ReplicationManager.ReadResult("v".getBytes(), 42, 0));
             }
+            return Optional.ofNullable(store(replica).get(key))
+                    .map(kv -> new ReplicationManager.ReadResult(kv.getValue(), kv.getTimestamp(), kv.getExpiresAt()));
+        }
 
-            @Override
-            public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt) {
-            }
-        };
-        ReadRepairHandler speculating = new ReadRepairHandler(clusterManager, 3, io,
-                java.util.concurrent.Executors.newFixedThreadPool(4));
-        try {
-            long start = System.nanoTime();
-            ReadRepairHandler.RepairResult result =
-                    speculating.readWithRepair("key", 1, 2000).get(2, TimeUnit.SECONDS);
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-
-            assertThat(result.getValue()).isEqualTo("v".getBytes());
-            assertThat(elapsedMs).isLessThan(1000);
-            assertThat(speculating.getSpeculativeReads()).isEqualTo(1);
-        } finally {
-            speculating.shutdown();
+        @Override
+        public void write(Node replica, String key, byte[] value, long timestamp, long expiresAt) {
+            KeyValuePair entry = new KeyValuePair(value, timestamp, expiresAt);
+            store(replica).merge(key, entry, (current, fresh) -> fresh.isNewerThan(current) ? fresh : current);
         }
     }
 }

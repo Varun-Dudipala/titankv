@@ -1,5 +1,7 @@
 package com.titankv.core;
 
+import com.titankv.util.HybridLogicalClock;
+
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -19,7 +21,7 @@ public final class KeyValuePair {
      * @param value the value bytes
      */
     public KeyValuePair(byte[] value) {
-        this(value, System.currentTimeMillis(), 0);
+        this(value, HybridLogicalClock.encode(System.currentTimeMillis()), 0);
     }
 
     /**
@@ -29,7 +31,7 @@ public final class KeyValuePair {
      * @param ttlMillis time-to-live in milliseconds (0 for no expiration)
      */
     public KeyValuePair(byte[] value, long ttlMillis) {
-        this(value, System.currentTimeMillis(),
+        this(value, HybridLogicalClock.encode(System.currentTimeMillis()),
              ttlMillis > 0 ? System.currentTimeMillis() + ttlMillis : 0);
     }
 
@@ -126,17 +128,31 @@ public final class KeyValuePair {
     }
 
     /**
-     * Compare timestamps for conflict resolution.
-     * The entry with the higher timestamp wins.
+     * Whether this version wins over the other under last-write-wins ({@link #compareVersions}).
      *
-     * @param other the other entry to compare
-     * @return true if this entry is newer
+     * @param other the current entry, or null if there is none
      */
     public boolean isNewerThan(KeyValuePair other) {
-        if (other == null) {
-            return true;
+        return other == null || compareVersions(timestamp, value, other.timestamp, other.value) > 0;
+    }
+
+    /**
+     * The total order of versions used by last-write-wins: the higher timestamp wins; on equal
+     * timestamps a tombstone wins (as in Cassandra), then the greater value. Two coordinators can
+     * issue the same hybrid-clock timestamp for concurrent writes, so ties must be broken the same
+     * way on every node, or replicas that applied the writes in different orders would disagree
+     * forever.
+     *
+     * @return negative, zero or positive as version 1 is older than, the same as, or newer than version 2
+     */
+    public static int compareVersions(long timestamp1, byte[] value1, long timestamp2, byte[] value2) {
+        if (timestamp1 != timestamp2) {
+            return Long.compare(timestamp1, timestamp2);
         }
-        return this.timestamp > other.timestamp;
+        if (value1 == null || value2 == null) {
+            return value1 == value2 ? 0 : (value1 == null ? 1 : -1);
+        }
+        return Arrays.compare(value1, value2);
     }
 
     @Override

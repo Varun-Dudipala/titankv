@@ -76,14 +76,13 @@ measure scaling "3 nodes" 3 16 mixed
 cluster_up 5
 measure scaling "5 nodes" 5 16 mixed
 
-echo "== 3. Consistency level (3 nodes)"
+echo "== 3. Consistency level (3 nodes, chosen per request by the client)"
+cluster_up 3
 for level in ONE QUORUM ALL; do
-    cluster_up 3 TITANKV_READ_CONSISTENCY=$level TITANKV_WRITE_CONSISTENCY=$level
-    measure consistency "$level" 3 16 mixed
+    measure consistency "$level" 3 16 mixed --consistency "$level"
 done
 
 echo "== 4. Value size (3 nodes, QUORUM)"
-cluster_up 3
 for size in 100 1000 10000; do
     measure value-size "${size} B" 3 16 mixed --value-size "$size"
 done

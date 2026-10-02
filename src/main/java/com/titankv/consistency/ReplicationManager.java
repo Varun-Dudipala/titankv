@@ -132,10 +132,13 @@ public final class ReplicationManager implements ReplicaIO {
                             }
 
                             @Override
-                            public byte[] merkleLeaf(Node peer, int leaf) throws IOException {
+                            public byte[] merkleLeaves(Node peer, int[] leaves) throws IOException {
+                                java.nio.ByteBuffer args = java.nio.ByteBuffer.allocate(4 * leaves.length);
+                                for (int leaf : leaves) {
+                                    args.putInt(leaf);
+                                }
                                 return client(peer, true).internalRequest(Command.MERKLE_LEAF,
-                                        clusterManager.getLocalNode().getId(),
-                                        java.nio.ByteBuffer.allocate(4).putInt(leaf).array());
+                                        clusterManager.getLocalNode().getId(), args.array());
                             }
                         },
                         antiEntropyIntervalMs())

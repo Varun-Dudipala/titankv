@@ -103,6 +103,32 @@ class AntiEntropyTest {
         }
     }
 
+    /**
+     * Two coordinators can issue the same hybrid-clock version for concurrent writes. Replicas that
+     * applied them in different orders must still converge on one winner.
+     */
+    @Test
+    void concurrentWritesWithTheSameVersionConvergeOnOneWinner() throws Exception {
+        System.setProperty("titankv.anti.entropy.interval.ms", "0");
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 30, 3)) {
+            long version = com.titankv.util.HybridLogicalClock.encode(System.currentTimeMillis());
+            cluster.node(0).getStore().putIfNewer("tie", bytes("apple"), version, 0);
+            cluster.node(0).getStore().putIfNewer("tie", bytes("banana"), version, 0);
+            cluster.node(1).getStore().putIfNewer("tie", bytes("banana"), version, 0);
+            cluster.node(1).getStore().putIfNewer("tie", bytes("apple"), version, 0);
+            // Arrival order does not matter: both keep the same winner
+            assertThat(value(cluster.node(0).getStore(), "tie")).isEqualTo("banana");
+            assertThat(value(cluster.node(1).getStore(), "tie")).isEqualTo("banana");
+
+            cluster.node(2).getStore().putIfNewer("tie", bytes("apple"), version, 0);
+            AntiEntropy.RepairStats stats = antiEntropy(cluster.node(0)).repairWith(peer(cluster, 0, 2));
+
+            assertThat(stats.differingLeaves()).isEqualTo(1);
+            assertThat(value(cluster.node(2).getStore(), "tie")).isEqualTo("banana");
+            assertThat(antiEntropy(cluster.node(0)).repairWith(peer(cluster, 0, 2)).differingLeaves()).isZero();
+        }
+    }
+
     private static void rollBack(KVStore store, String key, String olderValue) {
         long current = store.getRaw(key).orElseThrow().getTimestamp();
         store.delete(key);

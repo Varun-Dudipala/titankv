@@ -5,7 +5,7 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 /**
- * Tests for ClientConfig to boost client package coverage.
+ * ClientConfig defaults, validation and the builder.
  */
 class ClientConfigTest {
 

@@ -28,10 +28,12 @@ import java.util.concurrent.TimeUnit;
  * <ol>
  *   <li>fetches the peer's root hash (8 bytes) and stops if it matches the local one;</li>
  *   <li>otherwise fetches the peer's whole tree and walks both trees top-down to the leaves that differ;</li>
- *   <li>for each differing leaf, fetches the peer's (key, version) digests and copies whichever side
- *       holds the newer version of each key to the other side.</li>
+ *   <li>fetches the peer's (key, version) digests for the differing leaves, up to
+ *       {@value #LEAVES_PER_REQUEST} leaves per request, and copies whichever side holds the newer
+ *       version of each key to the other side.</li>
  * </ol>
  * Identical replicas cost one round trip; replicas that differ in a few keys transfer only those keys.
+ * Each side scans its store once per request rather than once per leaf.
  */
 public final class AntiEntropy {
 
@@ -42,6 +44,7 @@ public final class AntiEntropy {
     private static final int TREE_SIZE = 2 * LEAVES - 1; // heap layout: node i has children 2i+1, 2i+2
     static final byte MODE_ROOT = 0;
     static final byte MODE_FULL = 1;
+    static final int LEAVES_PER_REQUEST = 64;
 
     private final ClusterManager clusterManager;
     private final InMemoryStore store;
@@ -58,7 +61,11 @@ public final class AntiEntropy {
     public interface PeerTransport {
         byte[] merkleTree(Node peer, byte mode) throws IOException;
 
-        byte[] merkleLeaf(Node peer, int leaf) throws IOException;
+        /**
+         * @return the peer's digests for every shared key in the given leaves, as encoded by
+         *         {@link #handleLeafRequest}
+         */
+        byte[] merkleLeaves(Node peer, int[] leaves) throws IOException;
     }
 
     /**
@@ -148,28 +155,28 @@ public final class AntiEntropy {
 
         int pulled = 0;
         int pushed = 0;
-        for (int leaf : leaves) {
-            Map<String, Digest> theirs = decodeLeaf(transport.merkleLeaf(peer, leaf));
-            Map<String, Digest> ours = leafDigests(peer.getId(), leaf);
+        for (int from = 0; from < leaves.size(); from += LEAVES_PER_REQUEST) {
+            int[] batch = leaves.subList(from, Math.min(from + LEAVES_PER_REQUEST, leaves.size()))
+                    .stream().mapToInt(Integer::intValue).toArray();
+            Map<String, Digest> theirs = decodeDigests(transport.merkleLeaves(peer, batch));
+            Map<String, Digest> ours = leafDigests(peer.getId(), batch);
             Set<String> keys = new HashSet<>(theirs.keySet());
             keys.addAll(ours.keySet());
             for (String key : keys) {
                 Digest mine = ours.get(key);
                 Digest other = theirs.get(key);
-                if (other != null && (mine == null || other.timestamp > mine.timestamp)) {
-                    Optional<ReplicationManager.ReadResult> fresh = replicaIO.read(peer, key);
-                    if (fresh.isPresent()) {
-                        ReplicationManager.ReadResult r = fresh.get();
-                        store.putIfNewer(key, r.getValue(), r.getTimestamp(), r.getExpiresAt());
-                        pulled++;
-                    }
-                } else if (mine != null && (other == null || mine.timestamp > other.timestamp)) {
-                    Optional<KeyValuePair> entry = store.getRaw(key);
-                    if (entry.isPresent()) {
-                        KeyValuePair kv = entry.get();
-                        replicaIO.write(peer, key, kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
-                        pushed++;
-                    }
+                if (mine != null && other != null && mine.hash == other.hash) {
+                    continue;
+                }
+                // Equal timestamps with different contents are concurrent writes: both sides
+                // apply both versions and keep the same winner by the tie-break order.
+                boolean pull = other != null && (mine == null || other.timestamp >= mine.timestamp);
+                boolean push = mine != null && (other == null || mine.timestamp >= other.timestamp);
+                if (pull && pullFrom(peer, key)) {
+                    pulled++;
+                }
+                if (push && pushTo(peer, key)) {
+                    pushed++;
                 }
             }
         }
@@ -179,6 +186,26 @@ public final class AntiEntropy {
         }
         keysSynced.addAndGet(pulled + pushed);
         return new RepairStats(leaves.size(), pulled, pushed);
+    }
+
+    private boolean pullFrom(Node peer, String key) throws IOException {
+        Optional<ReplicationManager.ReadResult> fresh = replicaIO.read(peer, key);
+        if (fresh.isEmpty()) {
+            return false;
+        }
+        ReplicationManager.ReadResult r = fresh.get();
+        store.putIfNewer(key, r.getValue(), r.getTimestamp(), r.getExpiresAt());
+        return true;
+    }
+
+    private boolean pushTo(Node peer, String key) throws IOException {
+        Optional<KeyValuePair> entry = store.getRaw(key);
+        if (entry.isEmpty()) {
+            return false;
+        }
+        KeyValuePair kv = entry.get();
+        replicaIO.write(peer, key, kv.getValueUnsafe(), kv.getTimestamp(), kv.getExpiresAt());
+        return true;
     }
 
     private static void collectDifferingLeaves(long[] a, long[] b, int node, List<Integer> out) {
@@ -212,25 +239,32 @@ public final class AntiEntropy {
     }
 
     /**
-     * Answer a peer's MERKLE_LEAF request: (key, timestamp, digest) for every shared key in the leaf.
+     * Answer a peer's MERKLE_LEAF request: (key, timestamp, digest) for every shared key in the
+     * requested leaves, as [count:4] then per key [length:4][key][timestamp:8][digest:8].
      */
-    public byte[] handleLeafRequest(String peerId, int leaf) {
-        if (leaf < 0 || leaf >= LEAVES) {
-            throw new IllegalArgumentException("Invalid leaf " + leaf);
+    public byte[] handleLeafRequest(String peerId, int[] leaves) {
+        if (leaves.length == 0 || leaves.length > LEAVES_PER_REQUEST) {
+            throw new IllegalArgumentException("Invalid number of leaves " + leaves.length);
         }
-        Map<String, Digest> digests = leafDigests(peerId, leaf);
+        for (int leaf : leaves) {
+            if (leaf < 0 || leaf >= LEAVES) {
+                throw new IllegalArgumentException("Invalid leaf " + leaf);
+            }
+        }
+        Map<String, Digest> digests = leafDigests(peerId, leaves);
         int size = 4;
-        List<byte[]> keys = new ArrayList<>();
-        for (String key : digests.keySet()) {
-            byte[] k = key.getBytes(StandardCharsets.UTF_8);
+        List<byte[]> keys = new ArrayList<>(digests.size());
+        List<Digest> values = new ArrayList<>(digests.size());
+        for (Map.Entry<String, Digest> entry : digests.entrySet()) {
+            byte[] k = entry.getKey().getBytes(StandardCharsets.UTF_8);
             keys.add(k);
+            values.add(entry.getValue());
             size += 4 + k.length + 8 + 8;
         }
-        ByteBuffer buffer = ByteBuffer.allocate(size).putInt(digests.size());
-        int i = 0;
-        for (Digest digest : digests.values()) {
-            byte[] k = keys.get(i++);
-            buffer.putInt(k.length).put(k).putLong(digest.timestamp).putLong(digest.hash);
+        ByteBuffer buffer = ByteBuffer.allocate(size).putInt(keys.size());
+        for (int i = 0; i < keys.size(); i++) {
+            byte[] k = keys.get(i);
+            buffer.putInt(k.length).put(k).putLong(values.get(i).timestamp).putLong(values.get(i).hash);
         }
         return buffer.array();
     }
@@ -257,10 +291,17 @@ public final class AntiEntropy {
         return tree;
     }
 
-    private Map<String, Digest> leafDigests(String peerId, int leaf) {
+    /**
+     * Digests of the keys shared with the peer that fall in any of the given leaves, in one pass.
+     */
+    private Map<String, Digest> leafDigests(String peerId, int[] leaves) {
+        boolean[] wanted = new boolean[LEAVES];
+        for (int leaf : leaves) {
+            wanted[leaf] = true;
+        }
         Map<String, Digest> digests = new HashMap<>();
         store.forEachEntry((key, kv) -> {
-            if (leafOf(key) == leaf && sharedWith(peerId, key)) {
+            if (wanted[leafOf(key)] && sharedWith(peerId, key)) {
                 digests.put(key, new Digest(kv.getTimestamp(), entryHash(key, kv)));
             }
         });
@@ -308,7 +349,7 @@ public final class AntiEntropy {
         return tree;
     }
 
-    private static Map<String, Digest> decodeLeaf(byte[] bytes) {
+    private static Map<String, Digest> decodeDigests(byte[] bytes) {
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         int count = buffer.getInt();
         Map<String, Digest> digests = new HashMap<>();

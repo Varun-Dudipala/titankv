@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Gossip membership: convergence, failure detection, recovery and graceful leave.
+ * Gossip membership: convergence, failure detection, recovery and graceful shutdown.
  */
 @Tag("integration")
 class MembershipTest {
@@ -41,18 +41,24 @@ class MembershipTest {
     }
 
     @Test
-    void gracefulLeaveRemovesNodeWithoutItComingBack() throws Exception {
+    void gracefullyStoppedNodeIsDownAtOnceStaysOnTheRingAndRejoins() throws Exception {
         try (TestCluster cluster = TestCluster.start(BASE_PORT + 20, 3)) {
-            String leftId = cluster.node(2).getNodeId();
+            String stoppedId = cluster.node(2).getNodeId();
             cluster.stopNode(2);
 
-            TestCluster.awaitCondition(() -> cluster.node(0).getClusterManager().getNode(leftId) == null
-                            && cluster.node(1).getClusterManager().getNode(leftId) == null,
-                    5_000, "remaining nodes to drop " + leftId);
-            // Several gossip rounds later, stale digests must not have re-added it
+            // The shutdown announcement marks it DEAD well before the 10s failure detector would
+            TestCluster.awaitCondition(() -> allOthersSee(cluster, 2, stoppedId, Node.Status.DEAD),
+                    2_000, "remaining nodes to mark " + stoppedId + " DEAD");
+            // Several gossip rounds later, stale digests must not have revived it, and it is
+            // still a replica of its keys
             Thread.sleep(3_000);
-            assertThat(cluster.node(0).getClusterManager().getNode(leftId)).isNull();
-            assertThat(cluster.node(1).getClusterManager().getNode(leftId)).isNull();
+            assertThat(allOthersSee(cluster, 2, stoppedId, Node.Status.DEAD)).isTrue();
+            for (int i = 0; i < 2; i++) {
+                assertThat(cluster.node(i).getClusterManager().getHashRing().getNodeCount()).isEqualTo(3);
+            }
+
+            cluster.startNode(2);
+            cluster.awaitConverged(20_000);
         }
     }
 

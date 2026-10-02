@@ -23,7 +23,9 @@ public class Node {
     private final int port;
     private final String hashHost;
     private volatile Status status;
-    private volatile long lastHeartbeat;
+    // System.nanoTime() when the node was last heard from: monotonic, so a wall-clock jump cannot
+    // make every node look silent (or alive) at once
+    private volatile long lastHeartbeatNanos;
     // Gossip heartbeat state: generation is the node's start time, version counts its heartbeats
     // within that generation. Higher (generation, version) means newer.
     private long generation;
@@ -42,7 +44,7 @@ public class Node {
         this.port = port;
         this.hashHost = canonicalizeHost(host);
         this.status = Status.JOINING;
-        this.lastHeartbeat = System.currentTimeMillis();
+        this.lastHeartbeatNanos = System.nanoTime();
     }
 
     /**
@@ -181,12 +183,8 @@ public class Node {
         this.status = status;
     }
 
-    public long getLastHeartbeat() {
-        return lastHeartbeat;
-    }
-
     public void updateHeartbeat() {
-        this.lastHeartbeat = System.currentTimeMillis();
+        this.lastHeartbeatNanos = System.nanoTime();
         if (this.status == Status.SUSPECT) {
             this.status = Status.ALIVE;
         }
@@ -226,7 +224,7 @@ public class Node {
      * Get milliseconds since last heartbeat.
      */
     public long getMillisSinceLastHeartbeat() {
-        return System.currentTimeMillis() - lastHeartbeat;
+        return (System.nanoTime() - lastHeartbeatNanos) / 1_000_000;
     }
 
     @Override

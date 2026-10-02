@@ -83,6 +83,25 @@ class AuthenticatedClusterTest {
     }
 
     @Test
+    void adminCommandsNeedTheClusterToken() throws IOException {
+        // No client token is configured, so anyone may read and write, but not remove nodes
+        try (TitanKVClient anonymous = cluster.client(cluster.address(0))) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> anonymous.removeClusterNode("node-2"))
+                    .hasMessageContaining("Admin commands require the cluster token");
+            org.assertj.core.api.Assertions.assertThatThrownBy(anonymous::cleanup)
+                    .hasMessageContaining("Admin commands require the cluster token");
+        }
+        com.titankv.client.ClientConfig config = com.titankv.client.ClientConfig.builder()
+                .authToken("integration-test-secret").build();
+        try (TitanKVClient admin = new TitanKVClient(config, cluster.address(0))) {
+            // Authorized, but node-2 is alive, so the removal itself is refused
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> admin.removeClusterNode("node-2"))
+                    .hasMessageContaining("only DEAD nodes can be removed");
+            assertThat(admin.cleanup()).isZero();
+        }
+    }
+
+    @Test
     void eachNodeWritesItsOwnWal() {
         for (int i = 0; i < cluster.size(); i++) {
             Path wal = Path.of(System.getProperty("titankv.data.dir"), "node-" + (BASE_PORT + i), "wal.log");

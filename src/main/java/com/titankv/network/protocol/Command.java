@@ -1,10 +1,17 @@
 package com.titankv.network.protocol;
 
+import com.titankv.consistency.ConsistencyLevel;
+
 import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * Immutable command object representing a client request.
+ * Immutable request: a command type, optional key and value, and two 64-bit fields whose meaning
+ * depends on the command (see {@link #put(String, byte[], long)}).
+ *
+ * On the wire the command byte's low 6 bits are the type and its top 2 bits an optional
+ * consistency level for GET, EXISTS, PUT and DELETE: 0 = the server's default, 1 = ONE,
+ * 2 = QUORUM, 3 = ALL. So choosing a level per request costs no extra bytes.
  */
 public final class Command {
 
@@ -14,7 +21,7 @@ public final class Command {
     public static final byte DELETE = 0x03;
     public static final byte PING = 0x04;
     public static final byte EXISTS = 0x05;
-    public static final byte KEYS = 0x06;
+    // 0x06 is reserved (an early KEYS command, removed)
     public static final byte AUTH = 0x07;
     public static final byte STATUS = 0x08;       // Cluster membership as seen by the node
     public static final byte REMOVE_NODE = 0x09;  // Admin: permanently remove a DEAD node (key = node id)
@@ -24,13 +31,16 @@ public final class Command {
     public static final byte PUT_INTERNAL = 0x12;  // Put without triggering replication
     public static final byte DELETE_INTERNAL = 0x13;  // Delete without triggering replication
     public static final byte MERKLE_TREE = 0x14;  // Anti-entropy: Merkle tree of keys shared with the sender
-    public static final byte MERKLE_LEAF = 0x15;  // Anti-entropy: key digests in one Merkle leaf
+    public static final byte MERKLE_LEAF = 0x15;  // Anti-entropy: key digests in a list of Merkle leaves
+
+    static final int TYPE_MASK = 0x3F;
 
     private final byte type;
     private final String key;
     private final byte[] value;
     private final long timestamp;   // Server-side timestamp for versioning (0 = not set)
     private final long expiresAt;   // Expiration timestamp (0 = no expiration)
+    private final ConsistencyLevel consistency; // null = the server's default
 
     /**
      * Create a new command with timestamp and expiry metadata.
@@ -42,6 +52,18 @@ public final class Command {
      * @param expiresAt expiration timestamp (0 = no expiration)
      */
     public Command(byte type, String key, byte[] value, long timestamp, long expiresAt) {
+        this(type, key, value, timestamp, expiresAt, null);
+    }
+
+    /**
+     * @param consistency consistency level for this request, or null for the server's default
+     */
+    public Command(byte type, String key, byte[] value, long timestamp, long expiresAt,
+            ConsistencyLevel consistency) {
+        if ((type & ~TYPE_MASK) != 0) {
+            throw new IllegalArgumentException("Command type out of range: " + type);
+        }
+        this.consistency = consistency;
         this.type = type;
         this.key = key;
         this.value = value != null ? Arrays.copyOf(value, value.length) : null;
@@ -160,6 +182,36 @@ public final class Command {
     }
 
     /**
+     * @return the consistency level requested for this command, or null for the server's default
+     */
+    public ConsistencyLevel getConsistency() {
+        return consistency;
+    }
+
+    /**
+     * @return this command with the given consistency level (null for the server's default)
+     */
+    public Command withConsistency(ConsistencyLevel level) {
+        return new Command(type, key, value, timestamp, expiresAt, level);
+    }
+
+    /**
+     * The command byte sent on the wire: the type, plus the consistency level in the top 2 bits.
+     */
+    byte wireType() {
+        int level = consistency == null ? 0 : consistency.ordinal() + 1;
+        return (byte) (type | level << 6);
+    }
+
+    /**
+     * Inverse of {@link #wireType()}.
+     */
+    static ConsistencyLevel consistencyOf(byte wireType) {
+        int level = (wireType >> 6) & 0x3;
+        return level == 0 ? null : ConsistencyLevel.values()[level - 1];
+    }
+
+    /**
      * Get the timestamp for versioning.
      *
      * @return timestamp in milliseconds since epoch, or 0 if not set
@@ -187,7 +239,6 @@ public final class Command {
             case DELETE: return "DELETE";
             case PING: return "PING";
             case EXISTS: return "EXISTS";
-            case KEYS: return "KEYS";
             case AUTH: return "AUTH";
             case STATUS: return "STATUS";
             case REMOVE_NODE: return "REMOVE_NODE";

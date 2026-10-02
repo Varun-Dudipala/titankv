@@ -2,6 +2,7 @@ package com.titankv.benchmark;
 
 import com.titankv.TitanKVClient;
 import com.titankv.client.ClientConfig;
+import com.titankv.consistency.ConsistencyLevel;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -35,6 +36,7 @@ public class LoadGenerator {
     private final int valueSize;
     private final int keysPerThread;
     private final boolean retry;
+    private final ConsistencyLevel consistency;
 
     private final LongAdder reads = new LongAdder();
     private final LongAdder readMisses = new LongAdder();
@@ -45,7 +47,7 @@ public class LoadGenerator {
     private static final Map<String, LongAdder> ERROR_KINDS = new java.util.concurrent.ConcurrentHashMap<>();
 
     public LoadGenerator(String[] hosts, int threads, int opsPerThread, int durationSeconds, int warmupOpsPerThread,
-            double readRatio, int valueSize, int keysPerThread, boolean retry) {
+            double readRatio, int valueSize, int keysPerThread, boolean retry, ConsistencyLevel consistency) {
         if (valueSize < 8) {
             throw new IllegalArgumentException("--value-size must be at least 8 (values carry a sequence number)");
         }
@@ -58,6 +60,7 @@ public class LoadGenerator {
         this.valueSize = valueSize;
         this.keysPerThread = keysPerThread;
         this.retry = retry;
+        this.consistency = consistency;
     }
 
     /**
@@ -216,6 +219,7 @@ public class LoadGenerator {
                 .retryOnFailure(retry)
                 .maxRetries(3)
                 .retryDelayMs(20)
+                .consistency(consistency)
                 .build(), hosts);
     }
 
@@ -287,6 +291,7 @@ public class LoadGenerator {
         int keys = 1_000;
         boolean timeline = false;
         boolean retry = false;
+        ConsistencyLevel consistency = null;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -316,6 +321,7 @@ public class LoadGenerator {
                 case "--read-ratio": readRatio = Double.parseDouble(value); break;
                 case "--value-size": valueSize = Integer.parseInt(value); break;
                 case "--keys": keys = Integer.parseInt(value); break;
+                case "--consistency": consistency = ConsistencyLevel.valueOf(value.toUpperCase()); break;
                 default: throw new IllegalArgumentException("Unknown option " + arg);
             }
         }
@@ -330,18 +336,20 @@ public class LoadGenerator {
         System.out.println("Read ratio:       " + readRatio);
         System.out.println("Value size:       " + valueSize + " bytes");
         System.out.println("Keys per thread:  " + keys);
+        System.out.println("Consistency:      " + (consistency != null ? consistency : "server default"));
         System.out.println("Client retries:   " + (retry ? "on (fails over to another node)" : "off"));
         System.out.println("CPUs:             " + Runtime.getRuntime().availableProcessors());
         System.out.println("-------------------------------------------");
 
-        new LoadGenerator(hosts, threads, ops, duration, warmup, readRatio, valueSize, keys, retry)
+        new LoadGenerator(hosts, threads, ops, duration, warmup, readRatio, valueSize, keys, retry, consistency)
                 .run(timeline).print();
     }
 
     private static void printUsage() {
         System.out.println("Usage: LoadGenerator [--hosts h1:p1,h2:p2] [--threads 16] [--ops 20000 | --duration SECONDS]");
         System.out.println("                     [--warmup 2000] [--read-ratio 0.8] [--value-size 100] [--keys 1000]");
-        System.out.println("                     [--retry] [--timeline]");
+        System.out.println("                     [--consistency ONE|QUORUM|ALL] [--retry] [--timeline]");
+        System.out.println("  --consistency  level for every read and write (default: the server's)");
         System.out.println("  --retry     let clients fail over to another node on error");
         System.out.println("  --timeline  print TIMELINE,<second>,<ops>,<errors> every second");
     }

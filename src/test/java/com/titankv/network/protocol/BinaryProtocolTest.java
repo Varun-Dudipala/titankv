@@ -1,5 +1,7 @@
 package com.titankv.network.protocol;
 
+import com.titankv.consistency.ConsistencyLevel;
+
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -293,5 +295,20 @@ class BinaryProtocolTest {
         // Null value should be preserved (distinct from empty array)
         assertThat(decoded.hasValue()).isFalse();
         assertThat(decoded.getValue()).isNull();
+    }
+
+    @Test
+    void consistencyLevelTravelsInTheCommandByteAtNoExtraCost() {
+        for (ConsistencyLevel level : ConsistencyLevel.values()) {
+            Command command = Command.get("k").withConsistency(level);
+            ByteBuffer encoded = BinaryProtocol.encode(command);
+            assertThat(encoded.remaining()).isEqualTo(BinaryProtocol.REQUEST_HEADER_SIZE + 1);
+            Command decoded = BinaryProtocol.decodeCommand(encoded);
+            assertThat(decoded.getType()).isEqualTo(Command.GET);
+            assertThat(decoded.getConsistency()).isEqualTo(level);
+        }
+        Command plain = BinaryProtocol.decodeCommand(BinaryProtocol.encode(Command.put("k", new byte[] {1})));
+        assertThat(plain.getType()).isEqualTo(Command.PUT);
+        assertThat(plain.getConsistency()).isNull();
     }
 }

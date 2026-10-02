@@ -1,5 +1,6 @@
 package com.titankv.cluster;
 
+import com.titankv.util.Env;
 import com.titankv.util.HybridLogicalClock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,6 +26,9 @@ public class ClusterManager {
     private final ScheduledExecutorService scheduler;
     private final String clusterSecret;
     private final Map<String, Long> departedGenerations = new ConcurrentHashMap<>();
+    // Generation of each node that announced a graceful shutdown; its heartbeats from that
+    // generation no longer count, so stale gossip about it cannot mark it alive again
+    private final Map<String, Long> shutdownGenerations = new ConcurrentHashMap<>();
     private final HybridLogicalClock clock = new HybridLogicalClock();
 
     private GossipProtocol gossipProtocol;
@@ -80,24 +84,14 @@ public class ClusterManager {
      * This prevents accidentally deploying clusters without authentication.
      */
     private static String getDefaultClusterSecret() {
-        String secret = System.getenv("TITANKV_CLUSTER_SECRET");
-        if (secret == null || secret.isEmpty()) {
-            secret = System.getProperty("titankv.cluster.secret");
-        }
-
-        // Check if dev mode is explicitly enabled
-        boolean devMode = "true".equalsIgnoreCase(System.getenv("TITANKV_DEV_MODE"))
-            || "true".equalsIgnoreCase(System.getProperty("titankv.dev.mode"));
-
-        // In production mode, require a secret
-        if (!devMode && (secret == null || secret.isEmpty())) {
+        String secret = Env.clusterSecret();
+        if (secret == null && !Env.isDevMode()) {
             throw new IllegalStateException(
                 "Cluster secret is required for production deployment. " +
                 "Set TITANKV_CLUSTER_SECRET environment variable or titankv.cluster.secret property. " +
                 "To run in development mode without authentication (UNSAFE), set TITANKV_DEV_MODE=true."
             );
         }
-
         return secret;
     }
 
@@ -259,7 +253,27 @@ public class ClusterManager {
     }
 
     /**
-     * Whether a node with this id left the cluster gracefully and this generation of it
+     * Apply a peer's announcement that it is shutting down. It is marked DEAD right away, rather
+     * than after the failure detector's 10 seconds, but it stays a member and stays on the ring,
+     * as in Cassandra: a shutdown is usually a restart, and taking the node off the ring would
+     * hand its keys to nodes that do not have them. Writes for it become hints until it returns
+     * (with a newer generation). Removing a node for good is {@link #removeDeadNode}.
+     */
+    void markShutdown(String nodeId) {
+        Node node = nodes.get(nodeId);
+        if (node == null || node.equals(localNode)) {
+            return;
+        }
+        shutdownGenerations.merge(nodeId, node.getGeneration(), Math::max);
+        if (node.getStatus() != Node.Status.DEAD) {
+            node.setStatus(Node.Status.DEAD);
+            fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_DEAD, node));
+            logger.info("Node {} shut down", nodeId);
+        }
+    }
+
+    /**
+     * Whether a node with this id was removed from the cluster and this generation of it
      * should not be re-added from stale gossip.
      */
     public boolean hasDeparted(String nodeId, long generation) {
@@ -275,6 +289,10 @@ public class ClusterManager {
     public void updateHeartbeat(String nodeId) {
         Node node = nodes.get(nodeId);
         if (node != null) {
+            Long shutdownGeneration = shutdownGenerations.get(nodeId);
+            if (shutdownGeneration != null && node.getGeneration() <= shutdownGeneration) {
+                return; // gossip about a process that has already shut down
+            }
             Node.Status oldStatus = node.getStatus();
             node.updateHeartbeat();
 
@@ -293,15 +311,12 @@ public class ClusterManager {
      * Check health of all nodes.
      */
     private void checkHealth() {
-        long now = System.currentTimeMillis();
-
         for (Node node : nodes.values()) {
             if (node.equals(localNode)) {
                 continue;
             }
 
-            long lastHeartbeat = node.getLastHeartbeat();
-            long elapsed = now - lastHeartbeat;
+            long elapsed = node.getMillisSinceLastHeartbeat();
 
             if (node.getStatus() == Node.Status.ALIVE && elapsed > SUSPECT_THRESHOLD_MS) {
                 node.setStatus(Node.Status.SUSPECT);
