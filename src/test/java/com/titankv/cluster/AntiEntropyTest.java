@@ -73,8 +73,12 @@ class AntiEntropyTest {
             cluster.awaitReplicated("ae-deleted");
             KeyValuePair original = cluster.node(1).getStore().getRaw("ae-deleted").orElseThrow();
             client.delete("ae-deleted");
-            TestCluster.awaitCondition(() -> cluster.node(1).getStore().getRaw("ae-deleted")
-                    .map(KeyValuePair::isTombstone).orElse(false), 5_000, "tombstone to reach node 2");
+            // A QUORUM delete returns after two replicas; wait for the third before diverging one
+            for (int i = 0; i < cluster.size(); i++) {
+                KVStore store = cluster.node(i).getStore();
+                TestCluster.awaitCondition(() -> store.getRaw("ae-deleted").map(KeyValuePair::isTombstone)
+                        .orElse(false), 5_000, "the tombstone to reach node " + (i + 1));
+            }
             KVStore diverged = cluster.node(1).getStore();
             diverged.delete("ae-deleted");
             diverged.putIfNewer("ae-deleted", bytes("value"), original.getTimestamp(), 0); // missed the delete
