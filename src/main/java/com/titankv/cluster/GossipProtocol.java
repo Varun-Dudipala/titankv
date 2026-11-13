@@ -315,7 +315,7 @@ public class GossipProtocol {
 
     private void send(ByteBuffer message, Node target) {
         DatagramSocket out = socket;
-        if (out == null) {
+        if (out == null || !clusterManager.getLinkFilter().allowsGossip(localNode, target)) {
             return;
         }
         try {

@@ -56,6 +56,45 @@ class ClockSkewTest {
         }
     }
 
+    /**
+     * A client's write through a node whose clock runs fast fails for lack of a quorum, but that
+     * node has applied it locally. The client fails over to another node and its next write is
+     * acknowledged. When the first node's copy reaches the other replicas, the acknowledged write
+     * must still be the one that wins: it came later, from the same client.
+     *
+     * Known gap, reproduced by this test: the failed write wins. The coordinator picks the
+     * version, so the client never learns the version of a write whose outcome it did not see,
+     * and its causal context cannot order the next write after it. With clocks 20 seconds apart
+     * the second coordinator issues a lower version than the first did.
+     */
+    @Test
+    @org.junit.jupiter.api.Disabled("Known gap: a failed write through a fast-clock node can override the "
+            + "same client's later acknowledged write; needs versions the client can know (see README limitations)")
+    void acknowledgedWriteIsNotOverriddenByTheClientsEarlierFailedWrite() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 20, 3);
+             TitanKVClient viaFastNode = cluster.client(cluster.address(0));
+             TitanKVClient viaOtherNode = cluster.client(cluster.address(1))) {
+            cluster.node(0).getClusterManager().getClock().setSkewMillis(20_000);
+
+            cluster.isolate(0);
+            // Node 1 has not noticed yet: it writes its own copy, then cannot reach a quorum
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> viaFastNode.put("failover-key", "failed"))
+                    .isInstanceOf(java.io.IOException.class);
+            assertThat(cluster.node(0).getStore().get("failover-key")).isPresent();
+
+            // The same client, now talking to node 2, with everything it has seen so far
+            viaOtherNode.observeCausalContext(viaFastNode.getCausalContext());
+            viaOtherNode.put("failover-key", "acknowledged");
+
+            cluster.heal();
+            cluster.awaitConverged(20_000);
+            TestCluster.awaitCondition(() -> cluster.node(0).getReplicationManager().getHintedHandoff()
+                    .totalPendingHints() == 0, 15_000, "node 1 to deliver the failed write's hints");
+            assertThat(viaOtherNode.getString("failover-key", com.titankv.consistency.ConsistencyLevel.ALL))
+                    .contains("acknowledged");
+        }
+    }
+
     private static String keyNotReplicatedOn(TestCluster cluster, int index) {
         String nodeId = cluster.node(index).getNodeId();
         for (int i = 0; ; i++) {

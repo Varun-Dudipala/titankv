@@ -34,7 +34,13 @@ public final class ReplicationManager implements ReplicaIO {
     private final int replicationFactor;
     private final long timeoutMs;
     private final int poolSize;
+    // Local replica writes that wait for a WAL fsync
     private final ExecutorService executor;
+    // Calls to each other node, by address. One pool per node: calls stuck on a slow or
+    // unreachable node fill only that node's pool, and calls to healthy nodes are unaffected.
+    private final Map<String, ThreadPoolExecutor> peerExecutors = new ConcurrentHashMap<>();
+    private static final int PEER_QUEUE_LENGTH = 1024;
+    private volatile boolean shutdown;
     private final Map<String, TitanKVClient> nodeClients;
     private final Map<String, TitanKVClient> backgroundClients = new ConcurrentHashMap<>();
     private final ReadRepairHandler readRepairHandler;
@@ -105,7 +111,7 @@ public final class ReplicationManager implements ReplicaIO {
         }
         this.poolSize = threads;
 
-        // Replica calls use blocking sockets, so this pool is sized for I/O wait, not CPU.
+        // Replica calls use blocking sockets, so these pools are sized for I/O wait, not CPU.
         this.executor = new ThreadPoolExecutor(
                 poolSize,
                 poolSize,
@@ -120,7 +126,16 @@ public final class ReplicationManager implements ReplicaIO {
                 new ThreadPoolExecutor.CallerRunsPolicy());
         this.nodeClients = new ConcurrentHashMap<>();
         this.internalAuthToken = Env.internalToken();
-        this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this, executor);
+        this.readRepairHandler = new ReadRepairHandler(clusterManager, replicationFactor, this,
+                (ReplicaExecutor) this::executeFor);
+        clusterManager.addEventListener(event -> {
+            if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_LEFT) {
+                ThreadPoolExecutor removed = peerExecutors.remove(event.getNode().getAddress());
+                if (removed != null) {
+                    removed.shutdown();
+                }
+            }
+        });
         this.hintedHandoff = new HintedHandoff(clusterManager, backgroundIO, hintsDir);
         this.antiEntropy = localStore instanceof InMemoryStore
                 ? new AntiEntropy(clusterManager, (InMemoryStore) localStore, replicationFactor, backgroundIO,
@@ -218,6 +233,14 @@ public final class ReplicationManager implements ReplicaIO {
 
         Runnable localWrite = null;
         for (Node replica : live) {
+            java.util.function.Consumer<Exception> failed = e -> {
+                logger.warn("{} to {} failed, storing hint: {}", name, replica.getId(), e.getMessage());
+                hintedHandoff.store(replica, key, value, timestamp, expiresAt);
+                if (failures.incrementAndGet() > allowedFailures) {
+                    result.completeExceptionally(new ConsistencyException(
+                            "Cannot meet consistency level", consistency, required, successes.get()));
+                }
+            };
             Runnable task = () -> {
                 try {
                     write(replica, key, value, timestamp, expiresAt);
@@ -225,18 +248,17 @@ public final class ReplicationManager implements ReplicaIO {
                         result.complete(true);
                     }
                 } catch (IOException | RuntimeException e) {
-                    logger.warn("{} to {} failed, storing hint: {}", name, replica.getId(), e.getMessage());
-                    hintedHandoff.store(replica, key, value, timestamp, expiresAt);
-                    if (failures.incrementAndGet() > allowedFailures) {
-                        result.completeExceptionally(new ConsistencyException(
-                                "Cannot meet consistency level", consistency, required, successes.get()));
-                    }
+                    failed.accept(e);
                 }
             };
             if (isLocal(replica) && !localWritesWait()) {
                 localWrite = task;
             } else {
-                executor.execute(task);
+                try {
+                    executeFor(replica, task);
+                } catch (RejectedExecutionException e) {
+                    failed.accept(e); // too many calls already waiting on this replica
+                }
             }
         }
         // The local replica is written on this thread, after the remote writes are on their way:
@@ -247,6 +269,43 @@ public final class ReplicationManager implements ReplicaIO {
         // No timer here: every replica call ends within the socket timeout, and the caller bounds
         // the whole request.
         return result;
+    }
+
+    /**
+     * Run a blocking call to a replica on that replica's own pool.
+     *
+     * @throws RejectedExecutionException if the replica's queue is full, which means its calls
+     *                                    are not completing: the caller counts the call as failed
+     */
+    private void executeFor(Node replica, Runnable task) {
+        if (isLocal(replica)) {
+            executor.execute(task);
+            return;
+        }
+        ThreadPoolExecutor pool = peerExecutors.computeIfAbsent(replica.getAddress(), this::newPeerExecutor);
+        if (shutdown) {
+            throw new RejectedExecutionException("Replication manager is shut down");
+        }
+        pool.execute(task);
+    }
+
+    private ThreadPoolExecutor newPeerExecutor(String address) {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                poolSize,
+                poolSize,
+                60L,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(PEER_QUEUE_LENGTH),
+                r -> {
+                    Thread t = new Thread(r, "replica-io-" + address);
+                    t.setDaemon(true);
+                    return t;
+                },
+                (task, executor) -> {
+                    throw new RejectedExecutionException("Too many calls waiting on " + address);
+                });
+        pool.allowCoreThreadTimeOut(true); // a node that is down or idle holds no threads
+        return pool;
     }
 
     /**
@@ -388,7 +447,9 @@ public final class ReplicationManager implements ReplicaIO {
         return localStore != null && replica.equals(clusterManager.getLocalNode());
     }
 
-    private TitanKVClient client(Node node, boolean background) {
+    private TitanKVClient client(Node node, boolean background) throws IOException {
+        // Every node-to-node request passes through here
+        clusterManager.getLinkFilter().beforeRequest(clusterManager.getLocalNode(), node);
         Map<String, TitanKVClient> clients = background ? backgroundClients : nodeClients;
         // Repair traffic gets at most 2 connections per node, which also throttles it
         int connections = background ? 2 : poolSize;
@@ -419,6 +480,10 @@ public final class ReplicationManager implements ReplicaIO {
         }
         hintedHandoff.shutdown();
         readRepairHandler.shutdown();
+        shutdown = true;
+        for (ThreadPoolExecutor pool : peerExecutors.values()) {
+            pool.shutdown();
+        }
         executor.shutdown();
         try {
             if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -428,6 +493,10 @@ public final class ReplicationManager implements ReplicaIO {
             executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+        for (ThreadPoolExecutor pool : peerExecutors.values()) {
+            pool.shutdownNow(); // calls still in flight end when their connections close below
+        }
+        peerExecutors.clear();
 
         for (TitanKVClient client : nodeClients.values()) {
             client.close();

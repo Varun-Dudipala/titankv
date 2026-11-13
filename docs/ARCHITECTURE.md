@@ -155,9 +155,9 @@ data, so every node immediately runs a round with each peer.
 ## Threading model
 
 ```
-selector thread ──► worker pool (max(4, CPUs)) ──► replication pool (max(16, 4×CPUs))
+selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool per peer (max(16, 4×CPUs) each)
   accepts, reads,     decodes auth, runs local      blocking socket I/O to
-  writes sockets      commands, starts replicated   remote replicas
+  writes sockets      commands, starts replicated   that peer
                       ones and returns at once
 ```
 
@@ -165,7 +165,13 @@ selector thread ──► worker pool (max(4, CPUs)) ──► replication pool 
 - **Worker threads never wait on replicas.** A replicated command returns a `CompletableFuture`;
   when it completes, the response is queued and the connection's next command is scheduled. Commands
   on one connection still run in order, so responses match request order.
-- **Replica I/O** runs on a separate pool because it uses blocking client sockets. Node-to-node
+- **Replica I/O** runs on separate pools because it uses blocking client sockets, one pool per
+  peer. Calls stuck on a slow or unreachable peer fill only that peer's threads and its queue of
+  1,024; further calls to it fail at once (writes become hints, reads go to another replica),
+  and calls to healthy peers are unaffected. An earlier version shared one pool between all
+  peers. A fault-injection test with one replica answering a second late showed the coordinator
+  falling to about 20 requests a second (threads ÷ the slow peer's latency), for every key,
+  including keys that replica did not hold; with a pool per peer it stays above 800. Node-to-node
   clients retry once on a fresh connection if a pooled one turns out to be stale (the peer
   restarted), and do not use the client circuit breaker, since gossip already tracks liveness.
   A client's connection pool allows a fixed number of connections per node; a thread that finds
@@ -299,7 +305,7 @@ delete or an expired write could resurrect the key. This is the same trade-off a
 ## Testing strategy
 
 - **Unit tests** for the protocol, hash ring, store, WAL recovery (including torn writes and
-  concurrent snapshots), hinted handoff and configuration.
+  concurrent snapshots), hinted handoff, the client connection pool and configuration.
 - **Integration tests** start real clusters of 1–5 nodes inside the JVM, on real sockets.
 - **Chaos test.** Eight writers overwrite 200 keys with increasing versions at QUORUM on a 5-node
   production-mode cluster while nodes restart one at a time: once crashing (no LEAVE), once shutting
@@ -308,6 +314,20 @@ delete or an expired write could resurrect the key. This is the same trade-off a
   a version between its last acknowledged and last attempted write: no acknowledged write is lost,
   and no value appears that was never written. It found three real bugs: sloppy quorums, stale
   connections combined with the circuit breaker, and the seed-restart split brain.
+
+- **Fault injection.** Every node consults a `LinkFilter` before it sends a gossip datagram or a
+  node-to-node request; production nodes use a no-op. In tests a `FaultInjector` cuts links in one
+  or both directions (refusing requests at once, or swallowing them until a timeout) and adds
+  latency, the way Cassandra's in-JVM tests filter messages. `PartitionTest` uses it for a 2 | 3
+  split, an isolated node, a one-way cut and a slow replica. `PartitionChaosTest` runs the chaos
+  workload while a nemesis cycles through isolation, splits, one-way cuts, crashes, and crashes
+  during a partition, once with correct clocks and once with node clocks up to 20 seconds wrong,
+  and afterwards also requires all three replicas of every key to hold the same version. Clients
+  are not partitioned: they can always reach every node.
+- **What the tests do not show.** Nodes run in one JVM. A "crash" stops a node's threads without
+  losing data the OS had not yet written, so the tests cannot find a missing fsync, and all nodes
+  share one clock source except where a test skews it. One known gap is kept as a disabled test:
+  see `ClockSkewTest` and the README's limitations.
 
 ## Security summary
 

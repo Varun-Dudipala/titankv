@@ -32,6 +32,7 @@ public class ClusterManager {
     private final HybridLogicalClock clock = new HybridLogicalClock();
 
     private GossipProtocol gossipProtocol;
+    private volatile LinkFilter linkFilter = LinkFilter.NONE;
     private volatile boolean running;
     private volatile boolean seedsConfigured;
     private volatile boolean membershipLearned;
@@ -442,6 +443,20 @@ public class ClusterManager {
                 logger.error("Error in event listener", e);
             }
         }
+    }
+
+    /**
+     * What happens to traffic this node sends to other nodes; {@link LinkFilter#NONE} outside tests.
+     */
+    public LinkFilter getLinkFilter() {
+        return linkFilter;
+    }
+
+    /**
+     * Fault injection for tests. Set it before {@link #start} to cover the node's first gossip.
+     */
+    public void setLinkFilter(LinkFilter linkFilter) {
+        this.linkFilter = java.util.Objects.requireNonNull(linkFilter);
     }
 
     /**

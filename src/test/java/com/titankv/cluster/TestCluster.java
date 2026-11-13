@@ -15,6 +15,7 @@ public final class TestCluster implements AutoCloseable {
 
     private final int basePort;
     private final List<TitanKVServer> servers = new ArrayList<>();
+    private final FaultInjector faults = new FaultInjector();
 
     private TestCluster(int basePort) {
         this.basePort = basePort;
@@ -45,6 +46,7 @@ public final class TestCluster implements AutoCloseable {
         }
         String seeds = others.isEmpty() ? null : String.join(",", others);
         TitanKVServer server = new TitanKVServer(basePort + index, "node-" + (index + 1), seeds);
+        server.getClusterManager().setLinkFilter(faults); // before start, so its first gossip is covered
         server.start();
         servers.set(index, server);
         return server;
@@ -68,6 +70,73 @@ public final class TestCluster implements AutoCloseable {
      */
     public void crashNode(int index) {
         servers.get(index).crash();
+    }
+
+    // ==================== Network faults ====================
+
+    /**
+     * Cut the network between two groups of nodes (given by index), in both directions. Clients are
+     * not affected: a test puts a client on one side by giving it only that side's addresses.
+     */
+    public void partition(int[] sideA, int[] sideB) {
+        faults.partition(ports(sideA), ports(sideB));
+    }
+
+    /** Cut one node off from every other node. */
+    public void isolate(int index) {
+        List<Integer> others = new ArrayList<>();
+        for (int i = 0; i < servers.size(); i++) {
+            if (i != index) {
+                others.add(basePort + i);
+            }
+        }
+        faults.partition(List.of(basePort + index), others);
+    }
+
+    /** Cut traffic from one node to another; the opposite direction keeps working. */
+    public void cutOneWay(int from, int to) {
+        faults.cut(basePort + from, basePort + to);
+    }
+
+    /** Add latency to every request one node sends another. */
+    public void slowLink(int from, int to, long millis) {
+        faults.delay(basePort + from, basePort + to, millis);
+    }
+
+    /** Restore every link. */
+    public void heal() {
+        faults.heal();
+    }
+
+    public FaultInjector faults() {
+        return faults;
+    }
+
+    private List<Integer> ports(int[] indexes) {
+        List<Integer> ports = new ArrayList<>();
+        for (int index : indexes) {
+            ports.add(basePort + index);
+        }
+        return ports;
+    }
+
+    /**
+     * The indexes of the nodes that replicate a key, as node {@code viewOf} sees the ring.
+     */
+    public List<Integer> replicasOf(String key, int viewOf) {
+        List<Integer> replicas = new ArrayList<>();
+        for (Node replica : servers.get(viewOf).getClusterManager().getReplicasForKey(key, 3)) {
+            replicas.add(replica.getPort() - basePort);
+        }
+        return replicas;
+    }
+
+    /**
+     * Wait until node {@code index} considers exactly {@code alive} members (itself included) up.
+     */
+    public void awaitAliveCount(int index, int alive, long timeoutMs) {
+        awaitCondition(() -> servers.get(index).getClusterManager().getAliveNodeCount() == alive,
+                timeoutMs, "node " + (index + 1) + " to see " + alive + " nodes alive");
     }
 
     public TitanKVServer node(int index) {

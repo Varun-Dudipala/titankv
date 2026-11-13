@@ -128,6 +128,7 @@ public class DataRebalancer {
             }
             KeyValuePair kv = entry.get();
             try {
+                clusterManager.getLinkFilter().beforeRequest(clusterManager.getLocalNode(), newNode);
                 if (kv.isTombstone()) {
                     client.deleteInternal(key, kv.getTimestamp(), kv.getExpiresAt());
                 } else {

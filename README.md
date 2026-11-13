@@ -167,7 +167,7 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
 | `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
 | `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
-| `TITANKV_REPLICATION_THREADS` | max(16, 4 × CPUs) | Threads for replica I/O |
+| `TITANKV_REPLICATION_THREADS` | max(16, 4 × CPUs) | Threads for replica I/O, per peer node |
 
 Ports per node: client TCP on `--port`, gossip UDP on port + 1000, metrics HTTP on port + 90.
 
@@ -244,7 +244,7 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 
 ```bash
 mvn test       # 179 unit tests
-mvn verify     # + 58 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn verify     # + 64 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -258,6 +258,10 @@ The integration suite includes:
 - gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode`, join + `cleanup`,
   admin commands requiring the cluster token
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
+- **Network faults**, injected between nodes: a 2 | 3 partition (each side serves exactly the keys it
+  holds a quorum of, and refuses the rest), an isolated node, a link cut in one direction, a replica
+  that answers a second late, and a second chaos test that mixes all of these with crashes and
+  with node clocks up to 20 seconds wrong, then checks that every replica converges
 
 WAL tests cover crash recovery across snapshots, concurrent writers during snapshots, torn writes
 (including writes made after recovering from one) and expired values.
@@ -266,6 +270,11 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
 
 - **Last write wins.** Concurrent writes to the same key resolve by version; the losing write is
   discarded rather than surfaced as a conflict (vector clocks with siblings would expose it).
+- **A failed write can override a later one when clocks disagree.** The coordinator picks a write's
+  version. If a write fails for lack of a quorum, its coordinator may still hold it, with a version
+  the client never saw. If that coordinator's clock is ahead and the client's next write goes
+  through another node, the failed write wins once it spreads. `ClockSkewTest` has a disabled test
+  that reproduces it. Closing it needs versions the client chooses, as Cassandra drivers do.
 - **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
 - **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
 - **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is
