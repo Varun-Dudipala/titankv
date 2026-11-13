@@ -132,6 +132,41 @@ public final class TestCluster implements AutoCloseable {
     }
 
     /**
+     * Wait for every replica of every key to hold the same entry: version, value or tombstone, and
+     * expiry. Hints and anti-entropy should get them there once the network is whole.
+     *
+     * @return the keys whose replicas still differ when the time is up, with each copy (empty if none)
+     */
+    public List<String> awaitReplicasAgree(java.util.Collection<String> keys, long timeoutMs)
+            throws InterruptedException {
+        List<String> diverged = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        do {
+            diverged.clear();
+            for (String key : keys) {
+                List<String> copies = new ArrayList<>();
+                boolean same = true;
+                for (int replica : replicasOf(key, 0)) {
+                    String copy = servers.get(replica).getStore().getRaw(key)
+                            .map(kv -> kv.getTimestamp() + ":" + (kv.isTombstone() ? "tombstone"
+                                    : new String(kv.getValueUnsafe(), java.nio.charset.StandardCharsets.UTF_8))
+                                    + ":" + kv.getExpiresAt())
+                            .orElse("none");
+                    same &= copies.isEmpty() || copy.equals(copies.get(0).substring(copies.get(0).indexOf('=') + 1));
+                    copies.add("node " + (replica + 1) + "=" + copy);
+                }
+                if (!same) {
+                    diverged.add(key + " " + copies);
+                }
+            }
+            if (!diverged.isEmpty()) {
+                Thread.sleep(500);
+            }
+        } while (!diverged.isEmpty() && System.currentTimeMillis() < deadline);
+        return diverged;
+    }
+
+    /**
      * Wait until node {@code index} considers exactly {@code alive} members (itself included) up.
      */
     public void awaitAliveCount(int index, int alive, long timeoutMs) {

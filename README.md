@@ -259,8 +259,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 204 unit tests
-mvn verify     # + 76 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 215 unit tests
+mvn verify     # + 79 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -281,8 +281,13 @@ The integration suite includes:
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
 - **Network faults**, injected between nodes: a 2 | 3 partition (each side serves exactly the keys it
   holds a quorum of, and refuses the rest), an isolated node, a link cut in one direction, a replica
-  that answers a second late, and a second chaos test that mixes all of these with crashes and
-  with node and client clocks up to 20 seconds wrong, then checks that every replica converges
+  that answers a second late, and a second chaos test that mixes all of these with crashes, lost
+  replies, and node and client clocks up to 20 seconds wrong, then checks that every replica converges
+- **Many writers per key**: eight clients read, write and delete the same twenty keys under those
+  faults, every operation is recorded, and the whole history is checked: no read may return
+  anything an acknowledged write had already replaced. With the STALE reply deliberately switched
+  off, the same test reports hundreds of violations
+- **Real process kills**: three nodes as separate JVMs, killed with SIGKILL under that workload
 
 WAL tests cover crash recovery across snapshots, concurrent writers during snapshots, torn writes
 (including writes made after recovering from one) and expired values.
