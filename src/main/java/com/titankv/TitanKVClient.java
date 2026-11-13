@@ -44,9 +44,12 @@ public class TitanKVClient implements AutoCloseable {
     private final ConnectionPool connectionPool;
     private final ConsistentHash hashRing;
     private volatile boolean closed = false;
-    // Newest version timestamp this client has read or written; sent with every write so the
-    // write is ordered after it even if the coordinating node's clock is behind.
-    private final AtomicLong causalContext = new AtomicLong();
+    // This client's hybrid logical clock: the newest version it has issued, read or been told of.
+    // The client, not the coordinating node, chooses each write's version, so it knows the
+    // version of every write it attempted, including ones whose outcome it never learned, and
+    // every later write is ordered after them whichever node coordinates it.
+    private final AtomicLong lastVersion = new AtomicLong();
+    private volatile long clockSkewMillis;
 
     // Circuit breaker state per host
     private final Map<String, CircuitBreaker> circuitBreakers = new ConcurrentHashMap<>();
@@ -255,7 +258,9 @@ public class TitanKVClient implements AutoCloseable {
         if (ttlMillis < 0) {
             throw new IllegalArgumentException("ttlMillis must not be negative");
         }
-        Command command = new Command(Command.PUT, key, value, causalContext.get(), ttlMillis, level);
+        // One version for the whole call: if it fails over to another node, both nodes store
+        // the same version, not two competing ones
+        Command command = new Command(Command.PUT, key, value, nextVersion(), ttlMillis, level);
         Response response = execute(command, key);
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
@@ -293,7 +298,7 @@ public class TitanKVClient implements AutoCloseable {
      */
     public void delete(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(new Command(Command.DELETE, key, null, causalContext.get(), 0, level), key);
+        Response response = execute(new Command(Command.DELETE, key, null, nextVersion(), 0, level), key);
 
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
@@ -302,20 +307,42 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
-     * The newest version timestamp this client has seen. Another client (or process) can pass it to
-     * {@link #observeCausalContext(long)} so its writes are ordered after everything this one saw.
+     * The newest version this client has issued or seen, including the versions of writes that
+     * failed or timed out. Another client (or process) can pass it to
+     * {@link #observeCausalContext(long)} so its writes are ordered after everything this one
+     * did and saw.
      */
     public long getCausalContext() {
-        return causalContext.get();
+        return lastVersion.get();
     }
 
     public void observeCausalContext(long timestamp) {
-        causalContext.accumulateAndGet(timestamp, Math::max);
+        lastVersion.accumulateAndGet(timestamp, Math::max);
     }
 
+    /**
+     * Fault injection for tests: shift this client's view of wall time.
+     */
+    public void setClockSkewMillis(long clockSkewMillis) {
+        this.clockSkewMillis = clockSkewMillis;
+    }
+
+    /**
+     * @return a version greater than every version this client has issued or seen: the wall clock,
+     *         or one more than the last version if the wall clock is not past it
+     */
+    private long nextVersion() {
+        long physical = com.titankv.util.HybridLogicalClock.encode(System.currentTimeMillis() + clockSkewMillis);
+        return lastVersion.updateAndGet(previous -> Math.max(previous + 1, physical));
+    }
+
+    /**
+     * Advance this client's clock past a version a node returned: the version of a value read,
+     * or, after a write, the newest version that node has seen.
+     */
     private void observe(Response response) {
         if (response.isOk() && response.getTimestamp() > 0) {
-            causalContext.accumulateAndGet(response.getTimestamp(), Math::max);
+            lastVersion.accumulateAndGet(response.getTimestamp(), Math::max);
         }
     }
 

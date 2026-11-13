@@ -43,8 +43,9 @@ to another node if one is down.
 
 ### Write (PUT / DELETE)
 
-1. The coordinator assigns a version from its hybrid logical clock, after observing the client's
-   causal context (see below). A PUT with TTL also gets an absolute expiry.
+1. The write arrives with the version its client chose (see below); the coordinator checks it is
+   not far ahead of its own clock. A PUT with TTL also gets an absolute expiry, from the
+   coordinator's clock.
 2. It sends the versioned value to the key's replicas that are up, in parallel on the replication
    pool. The local replica is written in-process; remote replicas get `PUT_INTERNAL` /
    `DELETE_INTERNAL` over authenticated connections.
@@ -84,24 +85,37 @@ write quorum, so a QUORUM read returns the latest acknowledged QUORUM write.
 Every write carries a 64-bit version from a **hybrid logical clock** (HLC): wall-clock milliseconds in
 the high 48 bits and a logical counter in the low 16. Last write wins by version.
 
-Plain wall clocks make last-write-wins lose data under clock skew: if a coordinator's clock is 30
-seconds behind, its writes carry older versions than writes it follows and are silently discarded.
-TitanKV prevents this in two ways:
+**The client chooses the version**, as Cassandra's drivers do. Each client has an HLC and issues
+`max(wall clock, last issued or seen + 1)` for every PUT and DELETE. Three things follow:
 
-- **Node clocks never move backwards past a version they have seen.** An HLC issues
-  `max(wall clock, last issued or observed + 1)`, and a node observes the version of every replicated
-  write it receives and every read it coordinates. A replica with a slow clock therefore still
-  versions its next write after the writes it has stored.
-- **Clients carry causal context.** A client remembers the newest version it has read or written and
-  sends it with each PUT and DELETE; the coordinator observes it before assigning a version. A client's
-  later write therefore always wins over anything it saw, even if the coordinator never saw that
-  version. Context can be handed between clients (`getCausalContext` / `observeCausalContext`).
+- **A client's writes keep their order**, whichever nodes coordinate them and whatever those
+  nodes' clocks say, including writes that failed or timed out: the client knows the version of
+  every write it attempted. A call that fails over to another node carries the same version, so
+  the two nodes store one version, not two competing ones.
+- **A write is ordered after everything its client has seen.** A read moves the client's clock
+  past the version read, and the reply to a write carries the newest version the coordinator has
+  seen. A client whose wall clock is behind therefore catches up to the cluster with its first
+  reply. The clock value can be handed to another client or process (`getCausalContext` /
+  `observeCausalContext`), which then writes after everything the first one did and saw.
+- **Node clocks do not decide which write wins.** They are used for expiry times, tombstone age,
+  and one check: a node refuses a version more than 60 seconds ahead of its own clock. Accepted,
+  such a version would outrank every write to the key until real time caught up.
 
-Versions more than 60 seconds ahead of the local clock are not adopted, so one node with a badly
-wrong clock cannot drag the whole cluster into the future. `ClockSkewTest` runs a node 30 seconds
-slow and shows a write losing without context and winning with it.
+An earlier version had the coordinator choose the version from its own HLC, after observing the
+newest version the client had seen. A fault-injection test broke it. A write that fails for lack
+of a quorum can stay on its coordinator, with a version the client never learned. When that
+coordinator's clock was ahead and the client's next write was acknowledged through another node,
+the failed write carried the higher version and replaced the acknowledged one on every replica
+once the network healed. `ClockSkewTest` keeps that scenario, and runs node and client clocks
+wrong in both directions.
 
-**One order for versions, everywhere.** Two coordinators can issue the same HLC timestamp for
+What client clocks cannot fix is inherent to last-write-wins: between writers that have seen
+nothing of each other, the higher clock wins. The first write from a client whose clock is behind
+can lose to a value already there; after that reply its clock has caught up. A write sent without a
+version (the wire protocol allows it) gets one from the coordinator's HLC, which is newer than
+anything that node has stored or coordinated.
+
+**One order for versions, everywhere.** Two clients can issue the same HLC timestamp for
 concurrent writes to a key (same millisecond, counter 0). So versions are totally ordered: higher
 timestamp, then a tombstone (deletes win ties, as in Cassandra), then the greater value. Replicas
 (`putIfNewer`), the read coordinator and anti-entropy all use this one comparison
@@ -321,13 +335,13 @@ delete or an expired write could resurrect the key. This is the same trade-off a
   latency, the way Cassandra's in-JVM tests filter messages. `PartitionTest` uses it for a 2 | 3
   split, an isolated node, a one-way cut and a slow replica. `PartitionChaosTest` runs the chaos
   workload while a nemesis cycles through isolation, splits, one-way cuts, crashes, and crashes
-  during a partition, once with correct clocks and once with node clocks up to 20 seconds wrong,
-  and afterwards also requires all three replicas of every key to hold the same version. Clients
+  during a partition, and a node cut off and then crashed, once with correct clocks and once with
+  node clocks up to 20 seconds and client clocks up to 15 seconds wrong, and afterwards also
+  requires all three replicas of every key to hold the same version. Clients
   are not partitioned: they can always reach every node.
 - **What the tests do not show.** Nodes run in one JVM. A "crash" stops a node's threads without
   losing data the OS had not yet written, so the tests cannot find a missing fsync, and all nodes
-  share one clock source except where a test skews it. One known gap is kept as a disabled test:
-  see `ClockSkewTest` and the README's limitations.
+  share one clock source except where a test skews it.
 
 ## Security summary
 

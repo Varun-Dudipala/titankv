@@ -30,9 +30,10 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 - **Read repair**: reads return once the consistency level is met, then fix stale replicas in the background
 - **Hinted handoff**: writes for a down replica are kept (persisted, coalesced per key) and delivered when it returns
 - **Merkle-tree anti-entropy**: replica pairs compare 1024-leaf hash trees every minute and sync only the keys that differ
-- **Last-write-wins with hybrid logical clocks**, plus client causal context, so clock skew cannot make a
-  client's later write lose to its earlier one; equal versions break ties the same way on every node;
-  deletes and expired values leave tombstones, so nothing is resurrected
+- **Last-write-wins with hybrid logical clocks**, issued by the client: a client's writes keep their
+  order across nodes, failovers and failed attempts, whatever the nodes' clocks say; equal versions
+  break ties the same way on every node; deletes and expired values leave tombstones, so nothing is
+  resurrected
 
 **Membership and operations**
 - **Gossip** (UDP, Cassandra-style heartbeat digests) with HMAC-SHA256 authentication and replay
@@ -116,8 +117,9 @@ Without a level, requests use the client's default (`ClientConfig.builder().cons
 otherwise the server's (QUORUM unless configured).
 
 The client spreads requests across nodes by consistent hashing, pools connections, fails over to
-another node on error, and tracks the newest version it has seen so its writes are always ordered
-after what it has read or written (see [clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
+another node on error, and chooses each write's version from its own hybrid logical clock, so its
+writes are always ordered after what it has read or written, including writes that failed (see
+[clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
 
 ## Consistency and failure behaviour
 
@@ -143,7 +145,8 @@ With replication factor 3:
 | A restarted node has not learned the membership yet | It rejects client requests (`/ready` is 503) until a peer's digest has given it every member, down ones included, rather than serving with a partial ring. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
 | Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and cuts a torn final record off the log. |
-| Clock skew | Hybrid logical clocks never go backwards past a version already seen; clients carry causal context. |
+| Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. |
+| A client's clock is wrong | Its clock follows every reply, so only its first write can lose to a newer value. A version over 60s ahead of a node's clock is refused. |
 | Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
 ## Configuration
@@ -181,8 +184,9 @@ Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE]
 Big-endian; `VAL_LEN` of -1 means no value (distinct from an empty value). The low 6 bits of `CMD`
 are the command and the top 2 bits an optional consistency level for GET, EXISTS, PUT and DELETE
 (0 = server default, 1 = ONE, 2 = QUORUM, 3 = ALL), so choosing a level costs no bytes. For client
-PUT/DELETE, `TIMESTAMP` is optional causal context and `EXPIRES` carries the TTL in milliseconds;
-responses to PUT/DELETE return the version assigned. Replica messages carry absolute versions and
+PUT/DELETE, `TIMESTAMP` is the write's version, chosen by the client (0 lets the node choose), and
+`EXPIRES` carries the TTL in milliseconds; responses to PUT/DELETE return the newest version the
+node has seen, which the client's clock follows. Replica messages carry absolute versions and
 expiry times.
 
 | Command | Code | Command | Code | Status | Code |
@@ -244,7 +248,7 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 
 ```bash
 mvn test       # 179 unit tests
-mvn verify     # + 64 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn verify     # + 67 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -253,15 +257,15 @@ The integration suite includes:
   and again with graceful rolling restarts. No read may go back past an acknowledged write, and at
   the end every key must hold a version between its last acknowledged and last attempted write
 - production mode (auth, signed gossip, fsynced WAL), 32 concurrent clients with read-your-writes checks
-- QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, clock skew with
-  and without causal context, concurrent writes with equal versions
+- QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, node and client
+  clocks that are wrong, concurrent writes with equal versions
 - gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode`, join + `cleanup`,
   admin commands requiring the cluster token
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
 - **Network faults**, injected between nodes: a 2 | 3 partition (each side serves exactly the keys it
   holds a quorum of, and refuses the rest), an isolated node, a link cut in one direction, a replica
   that answers a second late, and a second chaos test that mixes all of these with crashes and
-  with node clocks up to 20 seconds wrong, then checks that every replica converges
+  with node and client clocks up to 20 seconds wrong, then checks that every replica converges
 
 WAL tests cover crash recovery across snapshots, concurrent writers during snapshots, torn writes
 (including writes made after recovering from one) and expired values.
@@ -270,11 +274,9 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
 
 - **Last write wins.** Concurrent writes to the same key resolve by version; the losing write is
   discarded rather than surfaced as a conflict (vector clocks with siblings would expose it).
-- **A failed write can override a later one when clocks disagree.** The coordinator picks a write's
-  version. If a write fails for lack of a quorum, its coordinator may still hold it, with a version
-  the client never saw. If that coordinator's clock is ahead and the client's next write goes
-  through another node, the failed write wins once it spreads. `ClockSkewTest` has a disabled test
-  that reproduces it. Closing it needs versions the client chooses, as Cassandra drivers do.
+- **Client clocks order unrelated writes.** Between clients that have seen nothing of each other,
+  the one with the higher clock wins, so the first write from a client whose clock is behind can
+  lose to an existing value (its clock then follows the reply).
 - **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
 - **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
 - **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is
