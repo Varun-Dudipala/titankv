@@ -30,7 +30,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@link ChaosTest} with a network: while writers overwrite keys with increasing versions at
  * QUORUM on a 5-node production-mode cluster, a nemesis keeps breaking it in a random way: one
  * node cut off, the cluster split 2 | 3, a link cut in one direction, or a node crashed and
- * restarted, alone or during a partition. Cut links either refuse requests at once or swallow
+ * restarted, alone, during a partition, or after being cut off itself. Cut links either refuse requests at once or swallow
  * them until a timeout. The clients can reach every node throughout.
  *
  * Checked, as in ChaosTest: a read never returns a version older than the last one acknowledged
@@ -74,8 +74,9 @@ class PartitionChaosTest {
     }
 
     /**
-     * The same, with every node's clock wrong by up to 20 seconds in either direction. Last write
-     * wins by version, so a version must never depend on which node's clock issued it.
+     * The same, with every node's clock wrong by up to 20 seconds and every client's by up to 15,
+     * in either direction. Each key has one writer, so its writes must keep their order whatever
+     * the clocks say and whichever nodes coordinate them.
      */
     @Test
     void acknowledgedWritesSurvivePartitionsWithSkewedClocks() throws Exception {
@@ -106,6 +107,9 @@ class PartitionChaosTest {
                 Random random = new Random(writer);
                 int version = 0;
                 try (TitanKVClient client = new TitanKVClient(config, cluster.addresses())) {
+                    if (mode.equals("skew")) {
+                        client.setClockSkewMillis((writer - WRITERS / 2) * 3_750L); // -15s .. +11s
+                    }
                     while (running.get()) {
                         String key = mode + ":" + writer + ":" + random.nextInt(KEYS_PER_WRITER);
                         version++;
@@ -139,7 +143,7 @@ class PartitionChaosTest {
             Random random = new Random(seed);
             List<String> faults = new ArrayList<>();
             // Every kind of fault happens at least once, in a random order, then they repeat
-            List<Integer> kinds = new ArrayList<>(List.of(0, 1, 2, 3, 4));
+            List<Integer> kinds = new ArrayList<>(List.of(0, 1, 2, 3, 4, 5));
             Collections.shuffle(kinds, random);
             long end = System.currentTimeMillis() + CHAOS_MILLIS;
             while (System.currentTimeMillis() < end || faults.size() < kinds.size()) {
@@ -174,13 +178,23 @@ class PartitionChaosTest {
                         fault = "crash " + (crashed + 1);
                         break;
                     }
-                    default: {
+                    case 4: {
                         // A node crashes while another is cut off, and restarts into the partition
                         int node = random.nextInt(NODES);
                         crashed = (node + 1 + random.nextInt(NODES - 1)) % NODES;
                         cluster.isolate(node);
                         cluster.crashNode(crashed);
                         fault = "isolate " + (node + 1) + " + crash " + (crashed + 1);
+                        break;
+                    }
+                    default: {
+                        // A node is cut off, takes writes it cannot replicate, then crashes: the
+                        // clients move to other nodes, and its unreplicated writes return with it
+                        crashed = random.nextInt(NODES);
+                        cluster.isolate(crashed);
+                        Thread.sleep(300 + random.nextInt(1_500));
+                        cluster.crashNode(crashed);
+                        fault = "isolate then crash " + (crashed + 1);
                         break;
                     }
                 }
@@ -251,7 +265,7 @@ class PartitionChaosTest {
         System.out.printf("PartitionChaosTest (%s): %d faults, %d acknowledged writes, %d failed writes, "
                         + "%d reads checked, %d keys checked%n  faults: %s%n", mode, faults.size(), acked.get(),
                 failed.get(), readsChecked.get(), lastAttempted.size(), faults);
-        assertThat(faults.size()).isGreaterThanOrEqualTo(5);
+        assertThat(faults.size()).isGreaterThanOrEqualTo(6);
         assertThat(acked.get()).isGreaterThan(1_000);
         assertThat(violations).as("lost acknowledged writes, stale reads or unwritten values").isEmpty();
         assertThat(diverged).as("replicas that still differ 45s after the network healed").isEmpty();

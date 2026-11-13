@@ -667,13 +667,10 @@ public class ConnectionHandler {
         if (command.getExpiresAt() < 0) {
             return done(Response.error("TTL must not be negative"));
         }
-        // A client PUT's timestamp field is its causal context: the newest version it has seen.
-        // Observing it first makes this write newer than anything the client read or wrote before.
-        clock().observe(command.getTimestamp());
-        long timestamp = clock().next();
+        long timestamp = writeVersion(command);
         // Client PUTs carry a relative TTL in the expires field
         long expiresAt = command.getExpiresAt() > 0 ? System.currentTimeMillis() + command.getExpiresAt() : 0;
-        Response written = Response.ok(null, timestamp, expiresAt);
+        Response written = Response.ok(null, clock().current(), expiresAt);
 
         if (isDistributed()) {
             return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
@@ -681,6 +678,34 @@ public class ConnectionHandler {
         }
         store.putIfNewer(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt);
         return done(written);
+    }
+
+    /**
+     * The version of a client PUT or DELETE. The client chooses it and sends it in the timestamp
+     * field: a client then knows the version of every write it attempted, even one that failed or
+     * timed out, and its next write is newer whichever node coordinates it. If the coordinator
+     * chose, a write that failed for lack of a quorum could stay on its coordinator with a
+     * version the client never saw, and override the client's later, acknowledged write.
+     *
+     * This node's clock only observes the version, so the reply can tell the client the newest
+     * version this node has seen, and it issues one itself for a client that sends none.
+     *
+     * @throws IllegalArgumentException if the version is too far ahead of this node's clock to
+     *                                  come from a correct clock; accepted, it would outrank
+     *                                  every write to the key until real time caught up
+     */
+    private long writeVersion(Command command) {
+        long chosen = command.getTimestamp();
+        if (chosen <= 0) {
+            return clock().next();
+        }
+        if (clock().isTooFarAhead(chosen)) {
+            throw new IllegalArgumentException("write version is more than "
+                    + HybridLogicalClock.MAX_FORWARD_DRIFT_MS / 1000 + "s ahead of this node's clock; "
+                    + "check the client's clock");
+        }
+        clock().observe(chosen);
+        return chosen;
     }
 
     /**
@@ -710,11 +735,12 @@ public class ConnectionHandler {
         if (command.getKey() == null) {
             return done(Response.error("Key required for DELETE"));
         }
-        // The tombstone must be newer than the client's causal context and any local version
-        clock().observe(command.getTimestamp());
-        store.getRaw(command.getKey()).ifPresent(existing -> clock().observe(existing.getTimestamp()));
-        long timestamp = clock().next();
-        Response deleted = Response.ok(null, timestamp, 0);
+        if (command.getTimestamp() <= 0) {
+            // No version from the client: make the tombstone newer than the local copy
+            store.getRaw(command.getKey()).ifPresent(existing -> clock().observe(existing.getTimestamp()));
+        }
+        long timestamp = writeVersion(command);
+        Response deleted = Response.ok(null, clock().current(), 0);
 
         if (isDistributed()) {
             return replicated(replicationManager.delete(command.getKey(), timestamp, 0, level(command, deleteConsistency)),

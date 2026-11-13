@@ -53,7 +53,7 @@ public interface KVStore {
      *
      * @param key       the key
      * @param value     the value, or null to write a tombstone
-     * @param timestamp the version timestamp assigned by the coordinator
+     * @param timestamp the write's version
      * @param expiresAt absolute expiration time in epoch millis (0 = never)
      * @return true if the value was stored, false if the existing entry is newer
      */
