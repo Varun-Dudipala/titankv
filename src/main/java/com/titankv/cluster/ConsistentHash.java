@@ -70,8 +70,12 @@ public class ConsistentHash {
 
             physicalNodes.add(node);
 
+            // Positions come from the node's id, which is the same on every node and survives a
+            // change of address. They used to come from the resolved IP: a node that came back
+            // with another IP silently took over different ranges, and a node that resolved a
+            // peer's host name differently from the others built a different ring.
             for (int i = 0; i < virtualNodesPerNode; i++) {
-                String hashKey = node.getHashKey() + "#" + i;
+                String hashKey = node.getId() + "#" + i;
                 long hash = MurmurHash3.hash64(hashKey);
                 int collisionCount = 0;
                 while (ring.containsKey(hash)) {

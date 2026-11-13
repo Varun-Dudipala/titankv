@@ -9,6 +9,31 @@ import static org.assertj.core.api.Assertions.*;
 
 class ConsistentHashTest {
 
+    /**
+     * Placement follows node ids. Two rings whose nodes have the same ids but different
+     * addresses (a container that came back with another IP, a host name that resolves
+     * differently) must place every key on the same nodes.
+     */
+    @org.junit.jupiter.api.Test
+    void placementDependsOnNodeIdsNotAddresses() {
+        ConsistentHash before = new ConsistentHash();
+        ConsistentHash after = new ConsistentHash();
+        for (int i = 1; i <= 5; i++) {
+            Node original = new Node("node-" + i, "10.0.0." + i, 9001);
+            Node moved = new Node("node-" + i, "192.168.7." + (50 - i), 9100 + i);
+            original.setStatus(Node.Status.ALIVE);
+            moved.setStatus(Node.Status.ALIVE);
+            before.addNode(original);
+            after.addNode(moved);
+        }
+
+        for (int k = 0; k < 500; k++) {
+            String key = "key-" + k;
+            org.assertj.core.api.Assertions.assertThat(after.getReplicas(key, 3)).extracting(Node::getId)
+                    .as(key).isEqualTo(before.getReplicas(key, 3).stream().map(Node::getId).toList());
+        }
+    }
+
     private ConsistentHash hashRing;
 
     @BeforeEach
