@@ -46,13 +46,38 @@ public class TcpServer {
         return DEFAULT_WORKER_THREADS;
     }
 
+    /**
+     * TITANKV_MAX_CONNECTIONS / titankv.max.connections, or 10,000. Every connection holds two
+     * 64 KB buffers from the moment it is accepted, before any authentication.
+     */
+    private static int configuredMaxConnections() {
+        String configured = com.titankv.util.Env.get("TITANKV_MAX_CONNECTIONS", "titankv.max.connections");
+        if (configured != null) {
+            try {
+                int limit = Integer.parseInt(configured.trim());
+                if (limit > 0) {
+                    return limit;
+                }
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+            logger.warn("Invalid TITANKV_MAX_CONNECTIONS value {}, using {}", configured, DEFAULT_MAX_CONNECTIONS);
+        }
+        return DEFAULT_MAX_CONNECTIONS;
+    }
+
     private final int port;
     private final KVStore store;
     private final MetricsCollector metrics;
     private final com.titankv.consistency.ReplicationManager replicationManager;
     private final com.titankv.cluster.ClusterManager clusterManager;
+    private static final int DEFAULT_MAX_CONNECTIONS = 10_000;
+
     private final AtomicBoolean running;
     private final Map<SocketChannel, ConnectionHandler> connections;
+    private final int maxConnections = configuredMaxConnections();
+    private long lastSweepNanos = System.nanoTime();
+    private long lastRefusalLogNanos;
     private final ExecutorService workerPool;
 
     private Selector selector;
@@ -122,6 +147,7 @@ public class TcpServer {
         while (running.get()) {
             try {
                 int ready = selector.select(1000); // 1 second timeout for clean shutdown
+                closeStalledConnections();
 
                 if (ready == 0) {
                     continue;
@@ -172,9 +198,43 @@ public class TcpServer {
         cleanup();
     }
 
+    /**
+     * About once a second, close connections that have kept the server waiting for a whole
+     * request for too long (see {@link ConnectionHandler#isStalled}).
+     */
+    private void closeStalledConnections() {
+        long nowNanos = System.nanoTime();
+        if (nowNanos - lastSweepNanos < TimeUnit.SECONDS.toNanos(1)) {
+            return;
+        }
+        lastSweepNanos = nowNanos;
+        long nowMillis = System.currentTimeMillis();
+        for (Map.Entry<SocketChannel, ConnectionHandler> entry : connections.entrySet()) {
+            ConnectionHandler handler = entry.getValue();
+            if (handler.isStalled(nowMillis)) {
+                logger.warn("Closing connection from {}: no complete request in time", handler.getRemoteAddress());
+                SelectionKey key = entry.getKey().keyFor(selector);
+                if (key != null) {
+                    closeConnection(key, handler);
+                } else {
+                    handler.close();
+                }
+            }
+        }
+    }
+
     private void accept() throws IOException {
         SocketChannel clientChannel = serverChannel.accept();
         if (clientChannel == null) {
+            return;
+        }
+        if (connections.size() >= maxConnections) {
+            clientChannel.close();
+            long nowNanos = System.nanoTime();
+            if (nowNanos - lastRefusalLogNanos > TimeUnit.SECONDS.toNanos(10)) {
+                lastRefusalLogNanos = nowNanos;
+                logger.warn("Refusing connections: the limit of {} is reached", maxConnections);
+            }
             return;
         }
 

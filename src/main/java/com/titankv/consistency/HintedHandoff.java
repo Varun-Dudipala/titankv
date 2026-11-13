@@ -38,6 +38,9 @@ public final class HintedHandoff {
 
     static final long HINT_WINDOW_MS = 3 * 60 * 60 * 1000L;
     static final int MAX_HINTS_PER_NODE = 100_000;
+    // Hints are held in memory with their values, outside the store's memory limit, so they are
+    // capped by size as well as by count
+    static final long MAX_HINT_BYTES_PER_NODE = 64L * 1024 * 1024;
     private static final long DELIVERY_INTERVAL_MS = 2_000;
     // A hint file is rewritten once it holds this many times more records than pending hints
     private static final int COMPACTION_RATIO = 4;
@@ -50,6 +53,7 @@ public final class HintedHandoff {
     private final ReplicaIO replicaIO;
     private final Path hintsDir;
     private final Map<String, ConcurrentHashMap<String, Hint>> pending = new ConcurrentHashMap<>();
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> pendingBytes = new ConcurrentHashMap<>();
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
     private final Map<String, FileChannel> files = new ConcurrentHashMap<>();
     private final Map<String, Integer> recordsInFile = new ConcurrentHashMap<>();
@@ -105,20 +109,61 @@ public final class HintedHandoff {
         synchronized (lockFor(target.getId())) {
             ConcurrentHashMap<String, Hint> hints = pending.computeIfAbsent(target.getId(),
                     id -> new ConcurrentHashMap<>());
-            if (hints.size() >= MAX_HINTS_PER_NODE && !hints.containsKey(key)) {
+            java.util.concurrent.atomic.AtomicLong bytes = bytesFor(target.getId());
+            if ((hints.size() >= MAX_HINTS_PER_NODE || bytes.get() + sizeOf(hint) > MAX_HINT_BYTES_PER_NODE)
+                    && !hints.containsKey(key)) {
                 if (droppedHints.getAndIncrement() % 10_000 == 0) {
                     logger.warn("Hint limit reached for {}, dropping hints (anti-entropy will repair them)",
                             target.getId());
                 }
                 return;
             }
-            hints.merge(key, hint, (old, fresh) -> fresh.timestamp > old.timestamp ? fresh : old);
+            keep(hints, bytes, hint);
             persist(target.getId(), hint);
             int records = recordsInFile.merge(target.getId(), 1, Integer::sum);
             if (records >= MIN_RECORDS_BEFORE_COMPACTION && records > COMPACTION_RATIO * hints.size()) {
                 compact(target.getId(), hints);
             }
         }
+    }
+
+    /**
+     * Add a hint unless a newer one for its key is already held, keeping the byte count exact
+     * against hints that delivery removes at the same moment.
+     */
+    private static void keep(ConcurrentHashMap<String, Hint> hints, java.util.concurrent.atomic.AtomicLong bytes,
+            Hint hint) {
+        hints.compute(hint.key, (key, old) -> {
+            if (old != null && newer(old, hint) == old) {
+                return old;
+            }
+            bytes.addAndGet(sizeOf(hint) - (old != null ? sizeOf(old) : 0));
+            return hint;
+        });
+    }
+
+    private java.util.concurrent.atomic.AtomicLong bytesFor(String nodeId) {
+        return pendingBytes.computeIfAbsent(nodeId, id -> new java.util.concurrent.atomic.AtomicLong());
+    }
+
+    private static long sizeOf(Hint hint) {
+        return hint.key.length() * 2L + (hint.value != null ? hint.value.length : 0) + 64;
+    }
+
+    /**
+     * @return estimated bytes of memory held by pending hints, for all nodes
+     */
+    public long totalPendingHintBytes() {
+        return pendingBytes.values().stream().mapToLong(java.util.concurrent.atomic.AtomicLong::get).sum();
+    }
+
+    /**
+     * Of two hints for one key, the one the replica would keep: the same order replicas, reads
+     * and repair use, so a tie between a delete and a put is not decided by which arrived first.
+     */
+    private static Hint newer(Hint old, Hint fresh) {
+        return com.titankv.core.KeyValuePair.compareVersions(fresh.timestamp, fresh.value, fresh.expiresAt,
+                old.timestamp, old.value, old.expiresAt) > 0 ? fresh : old;
     }
 
     /**
@@ -154,7 +199,9 @@ public final class HintedHandoff {
         try {
             for (Hint hint : hints.values()) {
                 replicaIO.write(target, hint.key, hint.value, hint.timestamp, hint.expiresAt);
-                hints.remove(hint.key, hint); // unless a newer hint replaced it meanwhile
+                if (hints.remove(hint.key, hint)) { // unless a newer hint replaced it meanwhile
+                    bytesFor(target.getId()).addAndGet(-sizeOf(hint));
+                }
                 delivered++;
             }
         } catch (IOException | RuntimeException e) {
@@ -236,6 +283,7 @@ public final class HintedHandoff {
     private void discard(String nodeId) {
         synchronized (lockFor(nodeId)) {
             Map<String, Hint> dropped = pending.remove(nodeId);
+            pendingBytes.remove(nodeId);
             recordsInFile.remove(nodeId);
             FileChannel channel = files.remove(nodeId);
             try {
@@ -297,12 +345,22 @@ public final class HintedHandoff {
                     continue;
                 }
                 ConcurrentHashMap<String, Hint> hints = pending.computeIfAbsent(nodeId, id -> new ConcurrentHashMap<>());
-                java.util.List<Hint> records = readAll(file);
+                java.util.List<Hint> records = new java.util.ArrayList<>();
+                boolean intact = readAll(file, records);
                 for (Hint hint : records) {
-                    hints.merge(hint.key, hint, (old, fresh) -> fresh.timestamp > old.timestamp ? fresh : old);
+                    keep(hints, bytesFor(nodeId), hint);
                 }
                 recordsInFile.put(nodeId, records.size());
                 logger.info("Loaded {} hints from {}", hints.size(), fileName);
+                if (!intact) {
+                    // The file ends in a record torn by a crash. It is appended to from here on,
+                    // and hints written behind the torn record would be skipped by the next load,
+                    // so write the file again with only the hints that were read.
+                    logger.warn("Hint file {} ends in an unreadable record; rewriting it", fileName);
+                    synchronized (lockFor(nodeId)) {
+                        compact(nodeId, hints);
+                    }
+                }
             }
         } catch (IOException e) {
             logger.warn("Failed to load hints from {}: {}", hintsDir, e.getMessage());
@@ -324,38 +382,50 @@ public final class HintedHandoff {
         return new String(id, StandardCharsets.UTF_8);
     }
 
-    private static java.util.List<Hint> readAll(Path file) throws IOException {
-        java.util.List<Hint> hints = new java.util.ArrayList<>();
+    /**
+     * Read every intact hint record into {@code hints}.
+     *
+     * @return false if the file ends in bytes that are not a whole record with a valid checksum
+     */
+    private static boolean readAll(Path file, java.util.List<Hint> hints) throws IOException {
         ByteBuffer buffer = ByteBuffer.wrap(Files.readAllBytes(file));
-        try {
-            int idLength = buffer.getInt();
-            buffer.position(buffer.position() + idLength);
-            while (buffer.remaining() >= 4) {
-                int start = buffer.position();
-                int keyLength = buffer.getInt();
-                byte[] key = new byte[keyLength];
-                buffer.get(key);
-                int valueLength = buffer.getInt();
-                byte[] value = null;
-                if (valueLength >= 0) {
-                    value = new byte[valueLength];
-                    buffer.get(value);
-                }
-                long timestamp = buffer.getLong();
-                long expiresAt = buffer.getLong();
-                int end = buffer.position();
-                int crc = buffer.getInt();
-                CRC32 check = new CRC32();
-                check.update(buffer.array(), start, end - start);
-                if ((int) check.getValue() != crc) {
-                    break;
-                }
-                hints.add(new Hint(new String(key, StandardCharsets.UTF_8), value, timestamp, expiresAt));
+        int idLength = buffer.getInt();
+        buffer.position(buffer.position() + idLength);
+        while (buffer.hasRemaining()) {
+            int start = buffer.position();
+            // Lengths are checked against what is left before anything is allocated: a garbage
+            // length must not be trusted to size an array
+            if (buffer.remaining() < 4) {
+                return false;
             }
-        } catch (RuntimeException e) {
-            // truncated tail from a crash mid-append: keep what was read
+            int keyLength = buffer.getInt();
+            if (keyLength < 0 || keyLength > buffer.remaining() - 4) {
+                return false;
+            }
+            byte[] key = new byte[keyLength];
+            buffer.get(key);
+            int valueLength = buffer.getInt();
+            int valueSize = Math.max(valueLength, 0);
+            if (valueLength < -1 || valueSize > buffer.remaining() - 8 - 8 - 4) {
+                return false;
+            }
+            byte[] value = null;
+            if (valueLength >= 0) {
+                value = new byte[valueLength];
+                buffer.get(value);
+            }
+            long timestamp = buffer.getLong();
+            long expiresAt = buffer.getLong();
+            int end = buffer.position();
+            int crc = buffer.getInt();
+            CRC32 check = new CRC32();
+            check.update(buffer.array(), start, end - start);
+            if ((int) check.getValue() != crc) {
+                return false;
+            }
+            hints.add(new Hint(new String(key, StandardCharsets.UTF_8), value, timestamp, expiresAt));
         }
-        return hints;
+        return true;
     }
 
     private ByteBuffer encode(Hint hint) {

@@ -189,6 +189,105 @@ class WalRecoveryTest {
         assertThat(restartedAgain.getRaw("after-crash-deleted").orElseThrow().isTombstone()).isTrue();
     }
 
+    /**
+     * A bad record with intact records after it is not a torn final write: the log is damaged in
+     * the middle. Replaying up to it would drop every later write, and cutting the log there
+     * would delete them from disk. The node must refuse to start and leave the file alone.
+     */
+    @Test
+    void corruptionInTheMiddleOfTheWalStopsTheNodeAndKeepsTheFile() throws IOException {
+        InMemoryStore store = open();
+        byte[] value = new byte[20];
+        for (int i = 0; i < 1_000; i++) {
+            store.put(String.format("key-%04d", i), value);
+        }
+        store.shutdown();
+        Path wal = dataDir.resolve("wal.log");
+        long size = java.nio.file.Files.size(wal);
+        long recordSize = size / 1_000;
+        flipByteAt(wal, 9 * recordSize + recordSize / 2); // inside the 10th record
+
+        assertThatThrownBy(this::open).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("corrupt at byte " + 9 * recordSize)
+                .hasMessageContaining("Refusing to start");
+        assertThat(java.nio.file.Files.size(wal)).as("the damaged log is left as it was").isEqualTo(size);
+
+        flipByteAt(wal, 9 * recordSize + recordSize / 2); // repaired, or restored from a copy
+        assertThat(open().size()).isEqualTo(1_000);
+    }
+
+    @Test
+    void garbageAfterTheLastRecordIsCutOffLikeATornWrite() throws IOException {
+        InMemoryStore store = open();
+        store.put("first", "1".getBytes(StandardCharsets.UTF_8));
+        store.shutdown();
+        Path wal = dataDir.resolve("wal.log");
+        long intact = java.nio.file.Files.size(wal);
+        byte[] garbage = new byte[300];
+        new Random(7).nextBytes(garbage);
+        java.nio.file.Files.write(wal, garbage, StandardOpenOption.APPEND);
+
+        InMemoryStore recovered = open();
+        assertThat(recovered.get("first")).isPresent();
+        assertThat(java.nio.file.Files.size(wal)).isEqualTo(intact);
+    }
+
+    /**
+     * A snapshot is written whole and renamed into place, so damage in it is never a torn write.
+     */
+    @Test
+    void corruptSnapshotStopsTheNode() throws IOException {
+        InMemoryStore store = open();
+        byte[] filler = new byte[200_000];
+        for (int i = 0; i < 8; i++) {
+            store.put("filler-" + i, filler); // past the 1MB WAL limit, so a snapshot is taken
+        }
+        store.shutdown();
+        Path snapshot = dataDir.resolve("snapshot.dat");
+        assertThat(snapshot).exists();
+        flipByteAt(snapshot, 100);
+
+        assertThatThrownBy(this::open).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("snapshot.dat").hasMessageContaining("corrupt");
+    }
+
+    /**
+     * After a WAL write fails the log may end in half a record, and nothing appended behind it
+     * could be replayed. The store must stop taking writes rather than acknowledge more of them.
+     */
+    @Test
+    void walFailureStopsFurtherWritesButNotReads() throws IOException {
+        InMemoryStore store = open();
+        store.put("before", "1".getBytes(StandardCharsets.UTF_8));
+        assertThat(store.isHealthy()).isTrue();
+
+        store.closeWalChannel(); // the next append fails, as on a full or failing disk
+        assertThatThrownBy(() -> store.put("failed", "2".getBytes(StandardCharsets.UTF_8)))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("WAL write failed");
+        assertThat(store.isHealthy()).isFalse();
+        assertThatThrownBy(() -> store.putIfNewer("later", "3".getBytes(StandardCharsets.UTF_8), 9_000, 0))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("read-only after a WAL failure");
+        assertThatThrownBy(() -> store.delete("before")).isInstanceOf(IllegalStateException.class);
+        assertThat(store.get("before")).isPresent();
+        assertThat(store.get("failed")).isEmpty();
+
+        InMemoryStore restarted = open();
+        assertThat(restarted.isHealthy()).isTrue();
+        assertThat(restarted.get("before")).isPresent();
+        assertThat(restarted.get("failed")).isEmpty();
+        assertThat(restarted.get("later")).isEmpty();
+    }
+
+    private static void flipByteAt(Path file, long offset) throws IOException {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            java.nio.ByteBuffer one = java.nio.ByteBuffer.allocate(1);
+            channel.read(one, offset);
+            one.flip();
+            one.put(0, (byte) (one.get(0) ^ 0x40));
+            channel.write(one, offset);
+        }
+    }
+
     @Test
     void writesBeyondTheMemoryLimitAreRejectedNotEvicted() {
         InMemoryStore store = new InMemoryStore(60_000, 10_000, dataDir);

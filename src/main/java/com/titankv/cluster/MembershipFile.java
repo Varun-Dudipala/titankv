@@ -119,5 +119,11 @@ final class MembershipFile {
             channel.force(true);
         }
         Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        // The rename is not durable until its directory is
+        try (FileChannel directory = FileChannel.open(file.toAbsolutePath().getParent(), StandardOpenOption.READ)) {
+            directory.force(true);
+        } catch (IOException e) {
+            // Some platforms cannot open or sync a directory; nothing more can be done there
+        }
     }
 }

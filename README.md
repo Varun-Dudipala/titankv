@@ -45,8 +45,7 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 **Storage and networking**
 - **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync
 - **Non-blocking NIO server**; worker threads never wait on replicas
-- **Binary protocol** over TCP with 29-byte request headers: 46–49% fewer bytes per round trip than
-  JSON over HTTP for 100-byte values ([measured](benchmark/results/benchmark_results.md#protocol-size-vs-json-over-http))
+- **Binary protocol** over TCP with 29-byte request and 25-byte response headers
 - **TTL** per key, **client circuit breaker**, connection pooling
 
 ## Quick start
@@ -142,12 +141,15 @@ With replication factor 3:
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
 | A node is gone for good | `removenode <id>` drops it cluster-wide; nodes that were down or cut off at the time learn of it from later gossip. Anti-entropy re-replicates its keys to their new replicas. |
 | A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
-| A node restarts | It has its saved member list at once, down members included, and rejects client requests (`/ready` is 503) until a peer that knows the whole membership confirms it, or 5 seconds pass with no peer up. A node with nothing saved waits for such a peer, or for every seed. |
+| A node restarts | It has its saved member list at once, down members included, and rejects client requests (`/ready` is 503) until a peer that knows the whole membership confirms it, or 5 seconds pass without one doing so. A node with nothing saved waits for such a peer, or for every seed. |
 | The whole cluster stops and only some nodes return | They know the full ring from disk, so they refuse QUORUM for keys whose replicas are still down instead of accepting them onto the wrong nodes. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
 | Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and cuts a torn final record off the log. |
-| Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. |
-| A client's clock is wrong | A write behind a newer version is reported (STALE) and sent again with a later one, so at QUORUM a write that starts after another was acknowledged still wins. A version over 60s ahead of a node's clock is refused. |
+| The WAL or a snapshot is damaged anywhere else | The node refuses to start and leaves the files as they are, rather than drop every write after the damage. Moving the file aside lets it start and be repaired from its peers. |
+| A WAL write or fsync fails | The node stops accepting writes (`/health` returns 503) until it is restarted; it does not carry on appending behind a possibly half-written record. |
+| Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. Node clocks still decide when a TTL runs out and when a tombstone is purged: a key expires when the first replica's clock says so. |
+| A client's clock is wrong | A write behind a newer version is reported (STALE) and sent again with a later one, so at QUORUM a write that starts after another was acknowledged still wins. A version over 60s ahead of a node's clock is refused. Other clients do not adopt a version more than 30s ahead of their own clock: a key written by a client that far ahead cannot be overwritten until real time reaches it, and the writer is told so. |
+| A client sends part of a request and goes quiet | The server closes the connection after 30 seconds without a whole request. Connections idle between requests are kept; at most 10,000 are open at once. |
 | Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
 ## Configuration
@@ -166,7 +168,9 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_WAL_ENABLED` | on unless dev mode | Write-ahead log |
 | `TITANKV_WAL_FSYNC` | `true` | fsync before acknowledging a write (group-committed) |
 | `TITANKV_WAL_MAX_MB` | `128` | WAL size that triggers a snapshot |
-| `TITANKV_MAX_MEMORY_MB` | `512` | Writes beyond this are rejected (never silently evicted) |
+| `TITANKV_MAX_MEMORY_MB` | `512` | Writes beyond this are rejected (never silently evicted); deletes always pass |
+| `TITANKV_MAX_CONNECTIONS` | `10000` | Connections beyond this are refused |
+| `TITANKV_FRAME_TIMEOUT_MS` | `30000` | How long a connection may take to deliver a whole request |
 | `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long tombstones of deleted and expired keys are kept |
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
 | `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
@@ -224,6 +228,10 @@ clocks, the three convergence mechanisms, WAL recovery and the design trade-offs
 
 ## Performance
 
+**These numbers were measured on 2 October 2026 at commit `612ad48` and have not been re-measured.**
+The request path has changed since (one thread pool per peer, versions chosen by the client, replies
+that report superseded writes), so treat them as the earlier code's.
+
 Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator together
 ([method, spreads and all scenarios](benchmark/results/benchmark_results.md)):
 
@@ -251,8 +259,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 188 unit tests
-mvn verify     # + 74 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 204 unit tests
+mvn verify     # + 76 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -266,6 +274,8 @@ The integration suite includes:
   writers, concurrent writes with equal versions
 - gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode` (also
   reaching a node that was cut off at the time), join + `cleanup`, admin commands requiring the cluster token
+- stalled connections, the connection limit, WAL damage in the middle of the log, a failing WAL,
+  torn hint files, a full store that must still take deletes
 - restarts with saved membership: a full stop after which only two of five nodes return, a node
   that returns alone, and nodes with nothing saved restarting together
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
@@ -291,6 +301,9 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
 - **Fixed failure-detection timeouts** (3s/10s) rather than an adaptive phi-accrual detector.
 - **Snapshots pause writes** while all entries are written out (when the WAL passes 128 MB).
 - **Hints are not fsynced**; a coordinator crash can lose some, which anti-entropy then repairs.
+  Hints are also dropped beyond 100,000 or 64 MB per down node.
+- **TTL precision is the clock skew between nodes.** Each replica expires a key by its own clock,
+  and the first to do so wins: a node whose clock runs fast ends a TTL early for the whole cluster.
 - **Gossip digests fit in one UDP packet** (about 30 members with short node IDs; larger clusters
   send a rotating subset each round). A node with nothing saved only trusts a digest that lists
   the whole membership, so a brand-new node cannot join a cluster too large for one packet.

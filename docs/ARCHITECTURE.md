@@ -105,6 +105,12 @@ the high 48 bits and a logical counter in the low 16. Last write wins by version
 - **Node clocks do not decide which write wins.** They are used for expiry times, tombstone age,
   and one check: a node refuses a version more than 60 seconds ahead of its own clock. Accepted,
   such a version would outrank every write to the key until real time caught up.
+- **A client follows other clocks only so far.** It adopts a version from a reply or a read only
+  if it is at most 30 seconds ahead of its own wall clock. Without that limit, one client 58
+  seconds fast (inside what nodes accept) pulled every node's and client's clock forward with it,
+  and a correct client then had every write refused by any node whose clock ran a few seconds
+  slow. Now the damage stays with the keys that client wrote: another client cannot overwrite
+  them until real time catches up, and gets an error saying so.
 - **A write that would lose is sent again.** A version is only as good as its client's clock: a
   client 30 seconds behind another, or writing in the same millisecond, can issue a lower version
   for a later write. The replicas would take it, acknowledge it, and never return it. Instead a
@@ -161,8 +167,11 @@ node. Hints are coalesced per key (only the newest version matters) and appended
 `<data dir>/node-<port>/hints/<node>.hints` so they survive a coordinator restart. When gossip reports
 the node as recovered, joined or restarted (and every 2 seconds after that), hints are delivered;
 delivery stops at the first failure and resumes later. Once all of a node's hints are delivered
-its file is emptied, including hints that were loaded from disk after a restart. No hints are kept for a node that has
-been down longer than 3 hours, or beyond 100,000 per node; anti-entropy covers those cases.
+its file is emptied, including hints that were loaded from disk after a restart. A hint file that
+ends in a record torn by a crash is rewritten on load, for the same reason the WAL is cut back.
+No hints are kept for a node that has been down longer than 3 hours, or beyond 100,000 hints or
+64 MB per node (hints are held in memory with their values, outside the store's limit);
+anti-entropy covers those cases.
 
 ### Merkle-tree anti-entropy
 
@@ -313,14 +322,29 @@ record `[magic][version][op][key len][value len][timestamp][expires][key][value]
   read lock and snapshots the write lock, so the WAL is only truncated once every record in it is
   already in the map, and therefore in the snapshot.
 - **Recovery** replays the snapshot and then the WAL, stopping at the first truncated or corrupt
-  record, which is what a crash in the middle of an append leaves behind. The WAL is then cut back
-  to that point, so new records are never appended behind an unreadable one. An earlier version
-  left the torn record in place: writes after the restart were acknowledged, then lost at the next
-  restart, when replay stopped at the torn record before reaching them.
+  record. If nothing intact follows it, it is what a crash in the middle of an append leaves
+  behind, and the WAL is cut back to that point, so new records are never appended behind an
+  unreadable one. If intact records do follow (every place the record magic appears after it is
+  tried), the log is damaged in the middle: the node refuses to start and leaves the file as it
+  is. A snapshot is written whole and renamed into place, so any unreadable record in one is
+  damage. Two earlier versions got this wrong in opposite directions. The first left a torn record
+  in place: writes after the restart were acknowledged, then lost at the next restart, when replay
+  stopped at the torn record before reaching them. The second cut the log at the first bad record
+  wherever it was: one flipped byte early in a log of 1,000 records left the node running with 10
+  of them and deleted the other 990 from disk.
+- **A WAL failure stops the store.** After a failed append the log may end in half a record, and
+  after a failed fsync the kernel may have dropped the pages it could not write, so a later fsync
+  that succeeds proves nothing. Either way the store refuses every further write and `/health`
+  reports 503 until the node is restarted; reads still work.
+- **Renames are made durable.** After a snapshot is renamed into place, and after the member list
+  is, the directory is fsynced, before the WAL is emptied. Otherwise a power cut could leave the
+  old snapshot beside an empty log.
+- A snapshot that cannot be written (a full disk) is retried after 30 seconds, not on every write.
 
 **Memory limit.** Writes that would exceed `TITANKV_MAX_MEMORY_MB` are rejected with an error, after
 purging expired entries. Live data is never evicted, since that would silently lose acknowledged
-writes.
+writes. Deletes, and overwrites no larger than what they replace, are always accepted: they used to
+be refused like any other write, so a full node could not be emptied.
 
 **Expiry.** A value whose TTL has run out becomes a tombstone with the same version, as in
 Cassandra: lazily on access, and by a cleanup task every minute. Reads, anti-entropy, snapshots and
@@ -334,6 +358,16 @@ The cleanup task also purges tombstones older than the grace period (24 hours by
 from the delete or from the expiry time). A replica that is away longer than that and missed a
 delete or an expired write could resurrect the key. This is the same trade-off as Cassandra's
 `gc_grace_seconds`. Until then an expired key still costs its key and about 48 bytes.
+
+Each replica judges expiry by its own wall clock, and an expiry tombstone wins the tie with its own
+value. So a TTL ends when the first replica's clock says so: a node whose clock runs fast ends it
+early for the whole cluster, by as much as its clock is ahead. (When expired values simply
+vanished, the fast node dropped only its own copy.)
+
+A write with a TTL that is sent twice with one version, after a failover or on a retried
+connection, gets its expiry from each coordinator's clock. The later expiry wins between such
+copies, as the last step of the version order, so the replicas settle on one. Before that, neither
+copy replaced the other, and anti-entropy exchanged the key on every round without converging.
 
 ## Topology changes
 
@@ -373,8 +407,12 @@ delete or an expired write could resurrect the key. This is the same trade-off a
   requires all three replicas of every key to hold the same version. Clients
   are not partitioned: they can always reach every node.
 - **What the tests do not show.** Nodes run in one JVM. A "crash" stops a node's threads without
-  losing data the OS had not yet written, so the tests cannot find a missing fsync, and all nodes
-  share one clock source except where a test skews it.
+  losing data the OS had not yet written, so the tests cannot find a missing fsync or directory
+  sync. Tests skew the clocks that issue and check versions (clients' and nodes' hybrid clocks);
+  expiry, tombstone age and gossip freshness read the machine's wall clock directly, which no test
+  skews. The chaos workloads have one writer per key and no deletes or TTLs, so ordering between
+  clients is covered only by the scripted cases in `ClockSkewTest`, not under faults. The fault
+  injector fails a request before it is sent; it cannot lose the reply to a request that was applied.
 
 ## Security summary
 
@@ -384,6 +422,7 @@ delete or an expired write could resurrect the key. This is the same trade-off a
 | Internal replica commands | Cluster token (AUTH) and source IP must belong to a cluster member |
 | Admin commands (`removenode`, `cleanup`) | Cluster token |
 | Client commands | Optional client token (`TITANKV_CLIENT_TOKEN`) |
-| Protocol parsing | Magic bytes, length limits (64 KB keys, 16 MB values), incomplete-frame timeout |
+| Protocol parsing | Magic bytes, length limits (64 KB keys, 16 MB values) |
+| Connections | Closed by the selector after 30 seconds without a whole request; at most 10,000 at once |
 
 Token comparison is constant-time. Traffic is not encrypted.

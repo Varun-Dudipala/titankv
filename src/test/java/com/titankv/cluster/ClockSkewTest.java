@@ -87,7 +87,7 @@ class ClockSkewTest {
 
     /**
      * A write that starts after another client's write was acknowledged must win, even when its
-     * client's clock is 30 seconds behind the other's and it has never seen that write. Its
+     * client's clock is 20 seconds behind the other's and it has never seen that write. Its
      * version is too low; a replica holding the newer version says so, and the client sends the
      * write again with a version after it.
      */
@@ -96,8 +96,8 @@ class ClockSkewTest {
         try (TestCluster cluster = TestCluster.start(BASE_PORT + 10, 3);
              TitanKVClient ahead = cluster.client();
              TitanKVClient behind = cluster.client()) {
-            ahead.setClockSkewMillis(15_000);
-            behind.setClockSkewMillis(-15_000);
+            ahead.setClockSkewMillis(10_000);
+            behind.setClockSkewMillis(-10_000);
 
             ahead.put("client-skew", "v1");
             behind.put("client-skew", "v2");
@@ -120,7 +120,7 @@ class ClockSkewTest {
     }
 
     /**
-     * Four clients with clocks up to 15 seconds apart take turns writing one key as fast as they
+     * Four clients with clocks up to 20 seconds apart take turns writing one key as fast as they
      * can, so most writes follow another client's within the same millisecond. Each write is
      * acknowledged before the next starts, so each must be the one a read then returns.
      */
@@ -131,8 +131,8 @@ class ClockSkewTest {
              TitanKVClient b = cluster.client(cluster.address(1));
              TitanKVClient c = cluster.client(cluster.address(2));
              TitanKVClient d = cluster.client()) {
-            b.setClockSkewMillis(-15_000);
-            c.setClockSkewMillis(15_000);
+            b.setClockSkewMillis(-10_000);
+            c.setClockSkewMillis(10_000);
             d.setClockSkewMillis(-3);
             TitanKVClient[] clients = {a, b, c, d};
 
@@ -191,6 +191,36 @@ class ClockSkewTest {
     }
 
     /**
+     * A client 58 seconds ahead is inside what nodes accept. Its versions must stay its own
+     * problem. When clients adopted every version they were shown, a correct client that read
+     * this client's key moved its own clock 58 seconds ahead, and then every write it sent, to
+     * any key, was refused by a node whose clock ran 3 seconds slow.
+     */
+    @Test
+    void oneClientsFastClockDoesNotSpreadToOtherClients() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 70, 3);
+             TitanKVClient fast = cluster.client(cluster.address(0));
+             TitanKVClient correct = cluster.client(cluster.address(1))) {
+            cluster.node(1).getClusterManager().getClock().setSkewMillis(-3_000);
+            fast.setClockSkewMillis(58_500);
+            fast.put("from-the-future", "written-by-the-fast-client");
+
+            assertThat(correct.getString("from-the-future")).contains("written-by-the-fast-client");
+            correct.put("unrelated", "x");
+            assertThat(correct.getString("unrelated")).contains("x");
+
+            // The key the fast client wrote cannot be overwritten yet, and the client is told why
+            assertThatThrownBy(() -> correct.put("from-the-future", "overwrite"))
+                    .isInstanceOf(IOException.class).hasMessageContaining("ahead of this client's clock");
+            assertThatThrownBy(() -> correct.delete("from-the-future"))
+                    .isInstanceOf(IOException.class).hasMessageContaining("ahead of this client's clock");
+            assertThat(correct.observeCausalContext(fast.getCausalContext())).isFalse();
+            correct.put("unrelated", "y");
+            assertThat(correct.getString("unrelated")).contains("y");
+        }
+    }
+
+    /**
      * A version far in the future would outrank every write to the key until real time caught
      * up, so a node refuses one more than a minute ahead of its own clock.
      */
@@ -244,7 +274,7 @@ class ClockSkewTest {
         }
     }
 
-    private static Response send(Socket socket, Command command) throws IOException {
+    static Response send(Socket socket, Command command) throws IOException {
         ByteBuffer request = BinaryProtocol.encode(command);
         socket.getOutputStream().write(request.array(), 0, request.remaining());
         socket.getOutputStream().flush();
