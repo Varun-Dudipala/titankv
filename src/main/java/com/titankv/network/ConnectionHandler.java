@@ -453,6 +453,10 @@ public class ConnectionHandler {
             pending.whenComplete((response, error) -> {
                 Response result = error != null ? errorResponse(command, unwrap(error)) : response;
                 recordMetrics(command, result, System.nanoTime() - startTime);
+                if (replyIsLost(command)) {
+                    close();
+                    return;
+                }
                 queueResponseAsync(result);
                 synchronized (pendingCommands) {
                     commandInProgress = false;
@@ -460,6 +464,18 @@ public class ConnectionHandler {
                 processNextCommand(key);
             });
         });
+    }
+
+    /**
+     * Fault injection for tests ({@link com.titankv.cluster.LinkFilter}): whether the reply to a
+     * client's request, which has been carried out, is to be lost.
+     */
+    private boolean replyIsLost(Command command) {
+        byte type = command.getType();
+        boolean clientRequest = type == Command.GET || type == Command.PUT || type == Command.DELETE
+                || type == Command.EXISTS;
+        return clientRequest && clusterManager != null
+                && !clusterManager.getLinkFilter().deliversClientReply(clusterManager.getLocalNode());
     }
 
     private CompletableFuture<Response> dispatch(Command command) {
