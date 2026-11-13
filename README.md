@@ -147,7 +147,7 @@ With replication factor 3:
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
 | Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and cuts a torn final record off the log. |
 | Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. |
-| A client's clock is wrong | Its clock follows every reply, so only its first write can lose to a newer value. A version over 60s ahead of a node's clock is refused. |
+| A client's clock is wrong | A write behind a newer version is reported (STALE) and sent again with a later one, so at QUORUM a write that starts after another was acknowledged still wins. A version over 60s ahead of a node's clock is refused. |
 | Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
 ## Configuration
@@ -197,7 +197,10 @@ expiry times.
 | DELETE | 0x03 | CLEANUP | 0x0A | ERROR | 0x02 |
 | PING | 0x04 | GET/PUT/DELETE_INTERNAL | 0x11–0x13 | PONG | 0x03 |
 | EXISTS | 0x05 | MERKLE_TREE / MERKLE_LEAF | 0x14–0x15 | EXISTS_TRUE / _FALSE | 0x04 / 0x05 |
-| AUTH | 0x07 | | | | |
+| AUTH | 0x07 | | | STALE | 0x06 |
+
+STALE answers a PUT or DELETE that was replicated but is already superseded: a replica holds a
+newer version of the key, returned in `TIMESTAMP`. The client library retries with a later version.
 
 Internal commands (0x11 and up) are node-to-node; they need the cluster token and a connection from
 a cluster member. REMOVE_NODE and CLEANUP need the cluster token too.
@@ -248,8 +251,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 187 unit tests
-mvn verify     # + 72 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 188 unit tests
+mvn verify     # + 74 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -259,7 +262,8 @@ The integration suite includes:
   the end every key must hold a version between its last acknowledged and last attempted write
 - production mode (auth, signed gossip, fsynced WAL), 32 concurrent clients with read-your-writes checks
 - QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, node and client
-  clocks that are wrong, concurrent writes with equal versions
+  clocks that are wrong (including clients 30 seconds apart taking turns on one key), racing
+  writers, concurrent writes with equal versions
 - gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode` (also
   reaching a node that was cut off at the time), join + `cleanup`, admin commands requiring the cluster token
 - restarts with saved membership: a full stop after which only two of five nodes return, a node
@@ -277,9 +281,8 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
 
 - **Last write wins.** Concurrent writes to the same key resolve by version; the losing write is
   discarded rather than surfaced as a conflict (vector clocks with siblings would expose it).
-- **Client clocks order unrelated writes.** Between clients that have seen nothing of each other,
-  the one with the higher clock wins, so the first write from a client whose clock is behind can
-  lose to an existing value (its clock then follows the reply).
+- **At ONE, client clocks can misorder writes.** A write behind a newer version is only reported if
+  an acknowledging replica holds that version, which QUORUM guarantees and ONE does not.
 - **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
 - **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
 - **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is

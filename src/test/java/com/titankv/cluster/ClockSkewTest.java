@@ -86,37 +86,107 @@ class ClockSkewTest {
     }
 
     /**
-     * Client clocks decide between writes that know nothing of each other, so the first write of
-     * a client whose clock is behind can lose to a value already there. Every reply moves the
-     * client's clock past the newest version the node has seen, and every read past the version
-     * read, so from then on its writes win.
+     * A write that starts after another client's write was acknowledged must win, even when its
+     * client's clock is 30 seconds behind the other's and it has never seen that write. Its
+     * version is too low; a replica holding the newer version says so, and the client sends the
+     * write again with a version after it.
      */
     @Test
-    void clientWithASlowClockCatchesUpFromTheRepliesItGets() throws Exception {
+    void laterWriteFromAClientWithASlowClockStillWins() throws Exception {
         try (TestCluster cluster = TestCluster.start(BASE_PORT + 10, 3);
              TitanKVClient ahead = cluster.client();
-             TitanKVClient behind = cluster.client();
-             TitanKVClient alsoBehind = cluster.client()) {
+             TitanKVClient behind = cluster.client()) {
             ahead.setClockSkewMillis(15_000);
             behind.setClockSkewMillis(-15_000);
-            alsoBehind.setClockSkewMillis(-15_000);
-            ahead.put("client-skew", "v1", ConsistencyLevel.ALL);
 
-            // Knows nothing of v1 and its clock says 30 seconds earlier: last write wins, and this is not it
-            behind.put("client-skew", "lost-to-skew", ConsistencyLevel.ALL);
-            assertThat(ahead.getString("client-skew", ConsistencyLevel.ALL)).contains("v1");
+            ahead.put("client-skew", "v1");
+            behind.put("client-skew", "v2");
+            assertThat(ahead.getString("client-skew")).contains("v2");
 
-            // The reply to that write told it how far the cluster's versions have got
-            behind.put("client-skew", "v2", ConsistencyLevel.ALL);
-            assertThat(ahead.getString("client-skew", ConsistencyLevel.ALL)).contains("v2");
+            ahead.put("client-skew", "v3");
+            behind.delete("client-skew");
+            assertThat(ahead.getString("client-skew")).isEmpty();
+            assertThat(ahead.exists("client-skew")).isFalse();
 
-            // A client that reads a value writes after it, however slow its clock
-            ahead.put("client-skew", "v3", ConsistencyLevel.ALL);
-            assertThat(alsoBehind.getString("client-skew")).contains("v3");
-            alsoBehind.put("client-skew", "v4", ConsistencyLevel.ALL);
-            assertThat(ahead.getString("client-skew", ConsistencyLevel.ALL)).contains("v4");
-            alsoBehind.delete("client-skew", ConsistencyLevel.ALL);
-            assertThat(ahead.getString("client-skew", ConsistencyLevel.ALL)).isEmpty();
+            ahead.put("client-skew", "v4");
+            behind.put("client-skew", "v5", ConsistencyLevel.ALL);
+            assertThat(ahead.getString("client-skew", ConsistencyLevel.ALL)).contains("v5");
+            cluster.awaitReplicated("client-skew");
+            for (int i = 0; i < 3; i++) {
+                assertThat(new String(cluster.node(i).getStore().get("client-skew").orElseThrow().getValueUnsafe(),
+                        StandardCharsets.UTF_8)).as("node " + (i + 1)).isEqualTo("v5");
+            }
+        }
+    }
+
+    /**
+     * Four clients with clocks up to 15 seconds apart take turns writing one key as fast as they
+     * can, so most writes follow another client's within the same millisecond. Each write is
+     * acknowledged before the next starts, so each must be the one a read then returns.
+     */
+    @Test
+    void writesTakingTurnsBetweenClientsKeepTheirOrder() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 50, 3);
+             TitanKVClient a = cluster.client(cluster.address(0));
+             TitanKVClient b = cluster.client(cluster.address(1));
+             TitanKVClient c = cluster.client(cluster.address(2));
+             TitanKVClient d = cluster.client()) {
+            b.setClockSkewMillis(-15_000);
+            c.setClockSkewMillis(15_000);
+            d.setClockSkewMillis(-3);
+            TitanKVClient[] clients = {a, b, c, d};
+
+            for (int turn = 0; turn < 400; turn++) {
+                TitanKVClient writer = clients[turn % 4];
+                TitanKVClient reader = clients[(turn + 1) % 4];
+                if (turn % 10 == 9) {
+                    writer.delete("turns");
+                    assertThat(reader.getString("turns")).as("after delete in turn " + turn).isEmpty();
+                } else {
+                    writer.put("turns", "turn-" + turn);
+                    assertThat(reader.getString("turns")).as("after turn " + turn).contains("turn-" + turn);
+                }
+            }
+        }
+    }
+
+    /**
+     * Writers that race on one key are all acknowledged, and every replica ends with the same one
+     * of their values: last write wins, with no error and no divergence.
+     */
+    @Test
+    void racingWritersOnOneKeyConvergeOnOneValue() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 60, 3)) {
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(6);
+            java.util.List<java.util.concurrent.Future<?>> writers = new java.util.ArrayList<>();
+            for (int w = 0; w < 6; w++) {
+                int writer = w;
+                writers.add(pool.submit(() -> {
+                    try (TitanKVClient client = cluster.client()) {
+                        client.setClockSkewMillis((writer - 3) * 4_000L);
+                        for (int i = 0; i < 150; i++) {
+                            client.put("raced", "writer-" + writer + "-" + i);
+                        }
+                    }
+                    return null;
+                }));
+            }
+            for (java.util.concurrent.Future<?> writer : writers) {
+                writer.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            }
+            pool.shutdown();
+
+            TestCluster.awaitCondition(() -> {
+                String first = new String(cluster.node(0).getStore().get("raced").orElseThrow().getValueUnsafe(),
+                        StandardCharsets.UTF_8);
+                for (int i = 1; i < 3; i++) {
+                    if (!cluster.node(i).getStore().get("raced").map(kv -> new String(kv.getValueUnsafe(),
+                            StandardCharsets.UTF_8)).orElse("").equals(first)) {
+                        return false;
+                    }
+                }
+                return first.endsWith("-149");
+            }, 10_000, "all replicas to hold the same final write of one of the writers");
         }
     }
 
@@ -162,6 +232,14 @@ class ClockSkewTest {
             Response delete = send(socket, Command.delete("raw-key"));
             assertThat(delete.isOk()).isTrue();
             assertThat(delete.getTimestamp()).isGreaterThan(put.getTimestamp());
+            assertThat(client.getString("raw-key")).isEmpty();
+
+            // A write with a version older than the key's is taken but will never be read:
+            // the reply says so, with the version it lost to
+            Response stale = send(socket, new Command(Command.PUT, "raw-key",
+                    "too-old".getBytes(StandardCharsets.UTF_8), clientVersion, 0));
+            assertThat(stale.getStatus()).isEqualTo(Response.STALE);
+            assertThat(stale.getTimestamp()).isEqualTo(delete.getTimestamp());
             assertThat(client.getString("raw-key")).isEmpty();
         }
     }

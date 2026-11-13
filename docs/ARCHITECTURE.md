@@ -56,8 +56,11 @@ to another node if one is down.
 4. Replicas that are down, or whose write fails, get a **hint** (below). Hints never count toward
    the consistency level.
 5. The coordinator replies once 1, 2 or 3 replicas acknowledge (ONE, QUORUM, ALL: the level the
-   client put in the request, or the server's default), with the assigned version. If too few replicas are up it fails immediately; if too many fail, or 5 seconds pass,
-   the client gets an error.
+   client put in the request, or the server's default). If too few replicas are up it fails
+   immediately; if too many fail, or 5 seconds pass, the client gets an error.
+6. A replica that already holds a newer version of the key keeps it and says so. If any
+   acknowledging replica did, the coordinator replies STALE with that version instead of OK, and
+   the client sends the write again with a later version (see below).
 
 The acknowledgements needed come from the replication factor (capped by cluster size), never from
 how many replicas happen to be up.
@@ -102,6 +105,14 @@ the high 48 bits and a logical counter in the low 16. Last write wins by version
 - **Node clocks do not decide which write wins.** They are used for expiry times, tombstone age,
   and one check: a node refuses a version more than 60 seconds ahead of its own clock. Accepted,
   such a version would outrank every write to the key until real time caught up.
+- **A write that would lose is sent again.** A version is only as good as its client's clock: a
+  client 30 seconds behind another, or writing in the same millisecond, can issue a lower version
+  for a later write. The replicas would take it, acknowledge it, and never return it. Instead a
+  replica that holds a newer version reports it, the coordinator answers STALE, and the client
+  retries with a version after the one it lost to (up to three times; after that it is racing
+  other writers and last-write-wins picks one). At QUORUM a write's acknowledging replicas always
+  include one that holds any write acknowledged before it, so **a write that starts after another
+  was acknowledged wins, whatever the two clients' clocks say.** At ONE there is no such overlap.
 
 An earlier version had the coordinator choose the version from its own HLC, after observing the
 newest version the client had seen. A fault-injection test broke it. A write that fails for lack
@@ -111,11 +122,14 @@ the failed write carried the higher version and replaced the acknowledged one on
 once the network healed. `ClockSkewTest` keeps that scenario, and runs node and client clocks
 wrong in both directions.
 
-What client clocks cannot fix is inherent to last-write-wins: between writers that have seen
-nothing of each other, the higher clock wins. The first write from a client whose clock is behind
-can lose to a value already there; after that reply its clock has caught up. A write sent without a
-version (the wire protocol allows it) gets one from the coordinator's HLC, which is newer than
-anything that node has stored or coordinated.
+The first version of this change left that last point out, and a test of two clients writing one
+key in turn failed one run in three: a delete and the put after it, from different clients, fell
+in the same millisecond, and the put got the lower version. `ClockSkewTest` now has four clients
+with clocks up to 30 seconds apart taking 400 turns on one key.
+
+What remains is inherent to last-write-wins: writes that overlap in time resolve to one winner,
+by version. A write sent without a version (the wire protocol allows it) gets one from the
+coordinator's HLC, which is newer than anything that node has stored or coordinated.
 
 **One order for versions, everywhere.** Two clients can issue the same HLC timestamp for
 concurrent writes to a key (same millisecond, counter 0). So versions are totally ordered: higher
