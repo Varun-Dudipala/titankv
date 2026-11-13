@@ -15,7 +15,8 @@
 `./scripts/benchmark-suite.sh` runs every configuration below **5 times for 8 seconds** each and
 reports the median, the min–max range, and the spread (half the range as a share of the median).
 
-- Each client thread has its own `TitanKVClient` and issues one request at a time (closed loop).
+- Each client thread has its own `TitanKVClient` and issues one request at a time (closed loop,
+  see below).
 - Every fresh cluster first gets an unrecorded 5-second run, so the servers' JIT is warm.
 - Each thread writes its 1,000-key space before measuring, so reads hit existing keys; "mixed" is
   80% reads and 20% writes of 100-byte values unless stated otherwise.
@@ -32,7 +33,31 @@ reports the median, the min–max range, and the spread (half the range as a sha
 
 Every run's numbers are in [`suite/summary.csv`](suite/summary.csv).
 
-## Results
+### Closed loop versus open loop
+
+**Every load-test table in this file comes from closed-loop runs on the 4-vCPU VM, except
+[latency versus load](#latency-versus-load-open-loop).** In a closed loop each client sends its
+next request only when the previous one returns. That is the right way to find maximum throughput,
+but it understates latency. When a request stalls (a GC pause, a slow replica), the client stalls
+with it and sends nothing; the requests that would have queued up behind the stall are never sent,
+so they are never measured. This is *coordinated omission*: the generator slows down exactly when
+the server does, and the p99 reflects only requests that got lucky. The closed-loop percentiles
+below are therefore service times at saturation, not the latency a user would see at that load.
+
+`LoadGenerator --rate <ops/sec>` runs an **open loop** instead. Requests follow a fixed schedule,
+spread evenly across client threads, and each latency is measured from the time the request was
+*due* to be sent, not when it actually went out. A thread that falls behind sends its overdue
+requests at once and skips none, so the backlog shows up in the percentiles. The run also reports
+the achieved rate (below the target means the system, or the generator, could not keep up) and
+the service time from the actual send, for comparison with closed-loop numbers. Each thread still
+has one request in flight, so `--threads` must be large enough that a thread is free when a
+request is due.
+
+`./scripts/benchmark-latency.sh` measures closed-loop maximum throughput on a 3-node QUORUM
+cluster, then runs open loop at 25%, 50%, 75% and 90% of it. Its results, measured on a different
+machine from the tables below, are in [latency versus load](#latency-versus-load-open-loop).
+
+## Results (closed loop)
 
 | Scenario | Setup | Clients | Workload | Median ops/sec | Min – max | Spread | p50 ms | p99 ms | Errors | Stale reads |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -70,9 +95,46 @@ How to read it:
 - **Production mode** adds authentication and an fsync on every replica before acknowledging.
   Writes-only drops to about 4.4K/sec, bounded by fsyncs even with group commit.
 
+## Latency versus load (open loop)
+
+`./scripts/benchmark-latency.sh`, measured on a **different machine** from the tables above: an
+Apple M3 laptop (8 CPUs, macOS 26.6.2, OpenJDK 21.0.6), on 2026-11-12, with the 3 nodes and the
+load generator sharing it over loopback alongside ordinary desktop apps. Compare rows with each
+other, not with the VM numbers.
+
+3-node dev-mode cluster, QUORUM, 80% reads of 100-byte values. Closed-loop maximum first (16
+clients), then open loop at a fixed share of it with the rate spread over 64 clients. 3 runs of
+15 seconds per row, medians:
+
+| Load | Achieved ops/sec | p50 ms | p99 ms | p99 ms, min – max of 3 runs | p99.9 ms | Service p99 ms |
+|---|---|---|---|---|---|---|
+| 25% (open) | 13,754 | 0.08 | 0.23 | 0.20 – 0.33 | 2.98 | 0.20 |
+| 50% (open) | 27,507 | 0.10 | 1.42 | 0.46 – 29.04 | 3.80 | 1.15 |
+| 75% (open) | 41,254 | 0.54 | 9.47 | 5.28 – 14.16 | 43.30 | 2.85 |
+| 90% (open) | 49,470 | 1.24 | 15.21 | 13.65 – 319.18 | 77.18 | 2.87 |
+| max (closed) | 55,018 | 0.25 | 0.90 | 0.87 – 1.07 | 4.18 | 0.90 |
+
+Every open-loop run reached its target rate to within 1% and had 0 errors, 0 stale reads and 0
+read misses; so did the closed-loop runs (all 15 runs: 8.4 million operations). Full table:
+[`suite/latency.md`](suite/latency.md).
+
+- **The closed-loop p99 is not the latency at that throughput.** At full speed, closed loop
+  reports a p99 of 0.90 ms. Sending 90% of that rate on a fixed schedule gives a p99 of 15 ms, and
+  one of the three runs reached 319 ms. In the closed loop, a stalled client simply stopped
+  sending, so the requests that would have waited behind each stall were never measured.
+- **Latency stays flat to about half of maximum throughput** (p99 under 1.5 ms in the median run),
+  then rises steeply: p50 goes from 0.10 ms at 50% to 1.24 ms at 90%.
+- **Service time hides the queueing.** At 75% and 90% load the time from actual send to response
+  has a median p99 under 3 ms, while the latency from intended send time is 3 to 5 times higher: requests
+  spend most of that time waiting for their client to finish an earlier slow request.
+- **Single runs vary a lot at the tail.** One stall (GC, the OS scheduling a node's threads away
+  on a shared laptop) dominates a 15-second run's p99 and p99.9, which is why the range is shown.
+- Each of the 64 client threads keeps one request in flight, like a client with 64 connections;
+  a stall on one connection delays the requests queued for that connection.
+
 ## Availability under node failure
 
-`./scripts/benchmark-failover.sh`: 16 clients (failing over between nodes) on a 3-node
+`./scripts/benchmark-failover.sh`: 16 closed-loop clients (failing over between nodes) on a 3-node
 production-mode cluster for 40 seconds. Node 2 is killed with SIGKILL at 10s and restarted at 25s.
 
 | Phase | Avg ops/sec | Errors |
@@ -115,7 +177,7 @@ per operation, 3.3 of them `futex`:
 3. A response is written straight to the socket when nothing is queued ahead of it.
 4. Node-to-node reads use `SO_TIMEOUT` instead of scheduling a timer per read.
 
-Old and new builds alternated on the same machine (2 rounds × 5 runs each, medians):
+Old and new builds alternated on the same machine (closed loop, 2 rounds × 5 runs each, medians):
 
 | Scenario | Before | After | Change |
 |---|---|---|---|
@@ -135,7 +197,7 @@ asks a spare one (speculative retry). Repeated failover runs since then have had
 
 ## Effect of WAL group commit
 
-Same 3-node production cluster, 16 clients, measured when group commit was introduced:
+Same 3-node production cluster, 16 closed-loop clients, measured when group commit was introduced:
 
 | Workload | fsync per write | Group commit |
 |---|---|---|
