@@ -79,6 +79,10 @@ public class InMemoryStore implements KVStore {
     private FileChannel walChannel;
     private long walBytes;
     private boolean loading;
+    private volatile IOException walFailure;
+    private static final long SNAPSHOT_RETRY_SECONDS = 30;
+    private boolean snapshotFailed;
+    private long snapshotRetryAtNanos;
 
     public InMemoryStore() {
         this(60_000, defaultMaxMemoryBytes(), defaultDataDir());
@@ -97,7 +101,7 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
-     * @param cleanupIntervalMs how often expired entries and old tombstones are purged
+     * @param cleanupIntervalMs how often expired values become tombstones and old tombstones are purged
      * @param maxMemoryBytes    writes that would exceed this estimated size are rejected
      * @param dataDir           directory for the WAL and snapshot (used only if the WAL is enabled)
      */
@@ -167,15 +171,24 @@ public class InMemoryStore implements KVStore {
             Files.createDirectories(dataDir);
             loading = true;
             if (Files.exists(snapshotPath)) {
-                replayFile(snapshotPath);
+                long intact = replayFile(snapshotPath);
+                if (intact < Files.size(snapshotPath)) {
+                    // A snapshot is written whole and renamed into place, so it is never torn
+                    throw corrupt(snapshotPath, intact);
+                }
                 logger.info("Loaded snapshot from {}", snapshotPath.toAbsolutePath());
             }
-            if (Files.exists(walPath)) {
-                replayFile(walPath);
+            boolean walExisted = Files.exists(walPath);
+            if (walExisted) {
+                long intact = replayFile(walPath);
                 logger.info("Replayed WAL from {}", walPath.toAbsolutePath());
+                discardWalTail(intact);
             }
             walChannel = FileChannel.open(walPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                     StandardOpenOption.APPEND);
+            if (!walExisted) {
+                syncDirectory(dataDir); // or a power cut could lose the file, and the records in it
+            }
             walBytes = walChannel.size();
             logger.info("WAL enabled at {} (size={} bytes, {} keys recovered)",
                     walPath.toAbsolutePath(), walBytes, store.size());
@@ -187,88 +200,178 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
-     * Apply every intact record in order. Stops at the first truncated or corrupt record, which
-     * is what a crash in the middle of an append leaves behind.
+     * Cut a torn final record off the WAL. Replay stops at the first unreadable record, and the
+     * log is appended to from here on: records written behind that garbage would be acknowledged
+     * now but never reached by the next replay.
+     *
+     * Only a tail is cut. If intact records follow the unreadable one, it was not left by a crash
+     * in the middle of an append: the log is damaged in the middle, and cutting there would
+     * delete acknowledged writes. The node then refuses to start and leaves the file as it is.
      */
-    private void replayFile(Path path) throws IOException {
+    private void discardWalTail(long intactBytes) throws IOException {
+        long size = Files.size(walPath);
+        if (intactBytes >= size) {
+            return;
+        }
+        if (hasIntactRecordAfter(walPath, intactBytes)) {
+            throw corrupt(walPath, intactBytes);
+        }
+        try (FileChannel channel = FileChannel.open(walPath, StandardOpenOption.WRITE)) {
+            channel.truncate(intactBytes);
+            channel.force(true);
+        }
+        logger.warn("Discarded {} unreadable bytes at the end of {} (a write interrupted by a crash)",
+                size - intactBytes, walPath.toAbsolutePath());
+    }
+
+    private static IllegalStateException corrupt(Path file, long offset) throws IOException {
+        return new IllegalStateException(file.toAbsolutePath() + " is corrupt at byte " + offset + " of "
+                + Files.size(file) + ", and not at its end, so this is not a write interrupted by a crash. "
+                + "Refusing to start: replaying it would silently drop every write after that point. "
+                + "To start without this file, move it aside; the node is then repaired from its peers.");
+    }
+
+    /**
+     * One record of a WAL or snapshot file.
+     *
+     * @param end the offset just past the record
+     */
+    private record LogRecord(byte op, String key, byte[] value, long timestamp, long expiresAt, long end) {
+    }
+
+    /**
+     * Apply every intact record in order, stopping at the first that is truncated or corrupt.
+     *
+     * @return the number of bytes replayed: the offset of the first unreadable record, or the
+     *         file's size if every record was intact
+     */
+    private long replayFile(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            ByteBuffer header = ByteBuffer.allocate(WAL_HEADER_SIZE);
-            while (true) {
-                header.clear();
-                int read = readFully(channel, header);
-                if (read == -1) {
-                    return;
+            long size = channel.size();
+            long offset = 0;
+            while (offset < size) {
+                LogRecord record = readRecord(channel, offset, size);
+                if (record == null) {
+                    logger.warn("Unreadable record at byte {} of {}, stopping replay", offset, path);
+                    break;
                 }
-                if (read < WAL_HEADER_SIZE) {
-                    logger.warn("Truncated record header in {}, stopping replay", path);
-                    return;
-                }
-                header.flip();
-                int magic = header.getInt();
-                short version = header.getShort();
-                byte op = header.get();
-                int keyLen = header.getInt();
-                int valueLen = header.getInt();
-                long timestamp = header.getLong();
-                long expiresAt = header.getLong();
-
-                if (magic != WAL_MAGIC || version != WAL_VERSION
-                        || keyLen < 0 || keyLen > BinaryProtocol.MAX_KEY_LENGTH
-                        || valueLen < -1 || valueLen > BinaryProtocol.MAX_VALUE_LENGTH) {
-                    logger.warn("Corrupt record header in {}, stopping replay", path);
-                    return;
-                }
-
-                int valueSize = Math.max(valueLen, 0);
-                ByteBuffer payload = ByteBuffer.allocate(keyLen + valueSize + 4);
-                if (readFully(channel, payload) < payload.capacity()) {
-                    logger.warn("Truncated record in {}, stopping replay", path);
-                    return;
-                }
-                payload.flip();
-                byte[] keyBytes = new byte[keyLen];
-                payload.get(keyBytes);
-                byte[] value = valueLen >= 0 ? new byte[valueLen] : null;
-                if (valueSize > 0) {
-                    payload.get(value);
-                }
-                int checksum = payload.getInt();
-
-                CRC32 crc = new CRC32();
-                crc.update(header.array(), 0, WAL_HEADER_SIZE);
-                crc.update(keyBytes);
-                if (valueSize > 0) {
-                    crc.update(value);
-                }
-                if ((int) crc.getValue() != checksum) {
-                    logger.warn("Checksum mismatch in {}, stopping replay", path);
-                    return;
-                }
-                applyRecord(op, new String(keyBytes, StandardCharsets.UTF_8), value, timestamp, expiresAt);
+                applyRecord(record.op(), record.key(), record.value(), record.timestamp(), record.expiresAt());
+                offset = record.end();
             }
+            return offset;
         }
     }
 
-    private static int readFully(FileChannel channel, ByteBuffer buffer) throws IOException {
-        int total = 0;
-        while (buffer.hasRemaining()) {
-            int read = channel.read(buffer);
-            if (read == -1) {
-                return total == 0 ? -1 : total;
-            }
-            total += read;
+    /**
+     * @return the record that starts at this offset, or null if the bytes there are not a whole
+     *         record with a valid header and checksum
+     */
+    private static LogRecord readRecord(FileChannel channel, long offset, long size) throws IOException {
+        if (size - offset < WAL_HEADER_SIZE + 4) {
+            return null;
         }
-        return total;
+        ByteBuffer header = ByteBuffer.allocate(WAL_HEADER_SIZE);
+        readFully(channel, header, offset);
+        header.flip();
+        int magic = header.getInt();
+        short version = header.getShort();
+        byte op = header.get();
+        int keyLen = header.getInt();
+        int valueLen = header.getInt();
+        long timestamp = header.getLong();
+        long expiresAt = header.getLong();
+        if (magic != WAL_MAGIC || version != WAL_VERSION
+                || keyLen < 0 || keyLen > BinaryProtocol.MAX_KEY_LENGTH
+                || valueLen < -1 || valueLen > BinaryProtocol.MAX_VALUE_LENGTH) {
+            return null;
+        }
+        int valueSize = Math.max(valueLen, 0);
+        long end = offset + WAL_HEADER_SIZE + keyLen + valueSize + 4;
+        if (end > size) {
+            return null; // the record runs past the end of the file
+        }
+        ByteBuffer payload = ByteBuffer.allocate(keyLen + valueSize + 4);
+        readFully(channel, payload, offset + WAL_HEADER_SIZE);
+        payload.flip();
+        byte[] keyBytes = new byte[keyLen];
+        payload.get(keyBytes);
+        byte[] value = valueLen >= 0 ? new byte[valueLen] : null;
+        if (valueSize > 0) {
+            payload.get(value);
+        }
+        int checksum = payload.getInt();
+
+        CRC32 crc = new CRC32();
+        crc.update(header.array(), 0, WAL_HEADER_SIZE);
+        crc.update(keyBytes);
+        if (valueSize > 0) {
+            crc.update(value);
+        }
+        if ((int) crc.getValue() != checksum) {
+            return null;
+        }
+        return new LogRecord(op, new String(keyBytes, StandardCharsets.UTF_8), value, timestamp, expiresAt, end);
+    }
+
+    private static void readFully(FileChannel channel, ByteBuffer buffer, long offset) throws IOException {
+        long position = offset;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, position);
+            if (read < 0) {
+                throw new java.io.EOFException("Unexpected end of file at byte " + position);
+            }
+            position += read;
+        }
+    }
+
+    /**
+     * Whether an intact record starts anywhere after the given offset: every place the record
+     * magic appears is tried. Tells damage in the middle of the log from a torn tail.
+     */
+    private static boolean hasIntactRecordAfter(Path path, long offset) throws IOException {
+        byte[] magic = ByteBuffer.allocate(4).putInt(WAL_MAGIC).array();
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            long size = channel.size();
+            ByteBuffer chunk = ByteBuffer.allocate(1 << 20);
+            long chunkStart = offset + 1;
+            while (chunkStart + magic.length <= size) {
+                chunk.clear();
+                int read = channel.read(chunk, chunkStart);
+                if (read < magic.length) {
+                    break;
+                }
+                byte[] bytes = chunk.array();
+                for (int i = 0; i + magic.length <= read; i++) {
+                    if (bytes[i] == magic[0] && bytes[i + 1] == magic[1] && bytes[i + 2] == magic[2]
+                            && bytes[i + 3] == magic[3] && readRecord(channel, chunkStart + i, size) != null) {
+                        return true;
+                    }
+                }
+                chunkStart += read - (magic.length - 1); // overlap, so a magic split across chunks is seen
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Make a rename or a new file in this directory durable. The file's own fsync does not cover
+     * its directory entry: after a power cut the old name could be back.
+     */
+    static void syncDirectory(Path directory) {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch (IOException e) {
+            // Some platforms cannot open or sync a directory; nothing more can be done there
+            logger.debug("Could not sync directory {}: {}", directory, e.getMessage());
+        }
     }
 
     private void applyRecord(byte op, String key, byte[] value, long timestamp, long expiresAt) {
         switch (op) {
             case WAL_OP_PUT:
-                if (expiresAt > 0 && System.currentTimeMillis() > expiresAt) {
-                    applyDelete(key);
-                } else {
-                    applyPut(key, new KeyValuePair(value, timestamp, expiresAt));
-                }
+                // A value that expired while the node was down comes back as its tombstone, so
+                // it still outranks older versions
+                applyPut(key, asStored(new KeyValuePair(value, timestamp, expiresAt)));
                 break;
             case WAL_OP_DELETE:
                 applyDelete(key);
@@ -300,6 +403,7 @@ public class InMemoryStore implements KVStore {
         if (!walEnabled) {
             return mutation.get();
         }
+        ensureWritable();
         T result;
         mutationLock.readLock().lock();
         try {
@@ -323,9 +427,45 @@ public class InMemoryStore implements KVStore {
                 appendedTotal += written;
                 lastAppendEnd.get()[0] = appendedTotal;
             } catch (IOException e) {
-                throw new IllegalStateException("WAL write failed", e);
+                throw walFailed("WAL write failed", e);
             }
         }
+    }
+
+    /**
+     * Stop accepting writes for good. After a failed append the log may end in half a record, and
+     * anything appended behind it could never be replayed; after a failed fsync the kernel may
+     * have dropped the pages it could not write, so a later fsync that succeeds proves nothing.
+     * Carrying on would mean acknowledging writes that are not durable.
+     */
+    private IllegalStateException walFailed(String what, IOException cause) {
+        if (walFailure == null) {
+            walFailure = cause;
+            logger.error("{}: this node no longer accepts writes and must be restarted", what, cause);
+        }
+        return new IllegalStateException(what, cause);
+    }
+
+    private void ensureWritable() {
+        IOException failure = walFailure;
+        if (failure != null) {
+            throw new IllegalStateException("Store is read-only after a WAL failure (" + failure.getMessage()
+                    + "); restart the node", failure);
+        }
+    }
+
+    /**
+     * @return false once a WAL write or fsync has failed and the store has stopped accepting writes
+     */
+    public boolean isHealthy() {
+        return walFailure == null;
+    }
+
+    /**
+     * Fault injection for tests: make the next WAL write fail, as a full or failing disk would.
+     */
+    void closeWalChannel() throws IOException {
+        walChannel.close();
     }
 
     /**
@@ -348,7 +488,7 @@ public class InMemoryStore implements KVStore {
             try {
                 walChannel.force(false);
             } catch (IOException e) {
-                throw new IllegalStateException("WAL fsync failed", e);
+                throw walFailed("WAL fsync failed", e);
             }
             durableTotal = upTo;
         }
@@ -356,14 +496,14 @@ public class InMemoryStore implements KVStore {
 
     private void maybeSnapshot() {
         synchronized (walLock) {
-            if (walBytes < walMaxBytes) {
+            if (walBytes < walMaxBytes || snapshotPostponed()) {
                 return;
             }
         }
         mutationLock.writeLock().lock();
         try {
             synchronized (walLock) {
-                if (walBytes >= walMaxBytes) {
+                if (walBytes >= walMaxBytes && !snapshotPostponed()) {
                     writeSnapshot();
                 }
             }
@@ -381,28 +521,39 @@ public class InMemoryStore implements KVStore {
         try (FileChannel out = FileChannel.open(tempSnapshot, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             for (var entry : store.entrySet()) {
-                KeyValuePair kv = entry.getValue();
-                if (!kv.isExpired()) {
-                    writeRecord(out, WAL_OP_PUT, entry.getKey(), kv.getValueUnsafe(), kv.getTimestamp(),
-                            kv.getExpiresAt());
-                }
+                KeyValuePair kv = asStored(entry.getValue());
+                writeRecord(out, WAL_OP_PUT, entry.getKey(), kv.getValueUnsafe(), kv.getTimestamp(),
+                        kv.getExpiresAt());
             }
             out.force(true);
         } catch (IOException e) {
-            logger.warn("Snapshot failed, keeping the WAL: {}", e.getMessage());
+            // Without a pause every write would repeat the whole attempt, holding up all others
+            snapshotRetryAtNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(SNAPSHOT_RETRY_SECONDS);
+            snapshotFailed = true;
+            logger.warn("Snapshot failed, keeping the WAL and trying again in {}s: {}", SNAPSHOT_RETRY_SECONDS,
+                    e.getMessage());
             return;
         }
+        snapshotFailed = false;
         try {
             Files.move(tempSnapshot, snapshotPath, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE);
+            // The rename must be durable before the WAL is emptied: otherwise a power cut could
+            // leave the old snapshot with an empty log, and every write since that snapshot gone
+            syncDirectory(dataDir);
             walChannel.truncate(0);
             walChannel.force(true);
             walBytes = 0;
             durableTotal = appendedTotal; // everything appended so far is in the fsynced snapshot
             logger.info("Snapshot of {} keys written to {}", store.size(), snapshotPath.toAbsolutePath());
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to install snapshot", e);
+            throw walFailed("Failed to install snapshot", e);
         }
+    }
+
+    /** Caller holds walLock. */
+    private boolean snapshotPostponed() {
+        return snapshotFailed && System.nanoTime() - snapshotRetryAtNanos < 0;
     }
 
     private static int writeRecord(FileChannel channel, byte op, String key, byte[] value,
@@ -444,7 +595,7 @@ public class InMemoryStore implements KVStore {
         validateKey(key);
         long now = System.currentTimeMillis();
         KeyValuePair entry = new KeyValuePair(value, HybridLogicalClock.encode(now), ttlMillis > 0 ? now + ttlMillis : 0);
-        ensureCapacity(key, entry);
+        ensureCapacity(key, entry, store.get(key));
         return mutate(() -> {
             KeyValuePair[] previous = new KeyValuePair[1];
             store.compute(key, (k, old) -> {
@@ -473,10 +624,11 @@ public class InMemoryStore implements KVStore {
      */
     public boolean putIfNewer(String key, KeyValuePair entry) {
         validateKey(key);
-        if (!entry.isNewerThan(store.get(key))) {
+        KeyValuePair existing = store.get(key);
+        if (!entry.isNewerThan(existing)) {
             return false;
         }
-        ensureCapacity(key, entry);
+        ensureCapacity(key, entry, existing);
         return mutate(() -> {
             KeyValuePair[] previous = new KeyValuePair[1];
             boolean[] stored = {false};
@@ -538,24 +690,18 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
-     * Visit every unexpired entry, tombstones included. Weakly consistent with concurrent writes.
+     * Visit every entry, tombstones included; an expired value is seen as its tombstone, as
+     * {@link #getRaw} returns it. Weakly consistent with concurrent writes.
      */
     public void forEachEntry(java.util.function.BiConsumer<String, KeyValuePair> action) {
-        store.forEach((key, value) -> {
-            if (!value.isExpired()) {
-                action.accept(key, value);
-            }
-        });
+        store.forEach((key, value) -> action.accept(key, asStored(value)));
     }
 
     /**
-     * All unexpired keys, including deleted keys whose tombstones are still retained.
+     * All keys with an entry, including deleted and expired keys whose tombstones are still retained.
      */
     public Set<String> keysIncludingTombstones() {
-        return store.entrySet().stream()
-                .filter(e -> !e.getValue().isExpired())
-                .map(e -> e.getKey())
-                .collect(Collectors.toSet());
+        return new java.util.HashSet<>(store.keySet());
     }
 
     @Override
@@ -571,6 +717,9 @@ public class InMemoryStore implements KVStore {
             mutationLock.writeLock().lock();
         }
         try {
+            if (walEnabled) {
+                ensureWritable();
+            }
             appendToWal(WAL_OP_CLEAR, "", null, 0, 0);
             awaitDurable();
             store.clear();
@@ -628,50 +777,78 @@ public class InMemoryStore implements KVStore {
     // ==================== Housekeeping ====================
 
     /**
-     * The entry for a key, removing it first if it has expired.
+     * An entry as the rest of the system should see it: a value whose time-to-live has run out
+     * is its tombstone.
+     */
+    private static KeyValuePair asStored(KeyValuePair entry) {
+        return entry.isExpired() ? entry.toTombstone() : entry;
+    }
+
+    /**
+     * The entry for a key, turning it into a tombstone first if it has expired. An expired value
+     * keeps its version instead of being removed: a replica that missed this write still holds an
+     * older version, which would otherwise look newest and be read, and repaired back, as if the
+     * overwrite had never happened.
      */
     private KeyValuePair liveEntry(String key) {
         KeyValuePair entry = store.get(key);
-        if (entry != null && entry.isExpired()) {
-            if (store.remove(key, entry)) {
-                adjustMemory(key, entry, null);
+        while (entry != null && entry.isExpired()) {
+            KeyValuePair tombstone = entry.toTombstone();
+            if (store.replace(key, entry, tombstone)) {
+                adjustMemory(key, entry, tombstone);
+                return tombstone;
             }
-            return null;
+            entry = store.get(key); // a write got in first
         }
         return entry;
     }
 
     /**
-     * Purge expired entries, and tombstones older than the grace period. Tombstones are kept that
-     * long so a replica that missed the delete gets repaired instead of resurrecting the value.
-     * Purges are not written to the WAL: replay re-derives expiry, and a replayed old tombstone is
-     * purged again on the next run.
+     * Turn expired values into tombstones (which frees the value), and purge tombstones older
+     * than the grace period. Tombstones are kept that long so a replica that missed the delete or
+     * the expired write gets repaired instead of resurrecting an older value. Neither step is
+     * written to the WAL: replay re-derives expiry, and a replayed old tombstone is purged again
+     * on the next run.
      */
     private void cleanupExpired() {
         long tombstoneCutoff = System.currentTimeMillis() - tombstoneGraceMs;
-        int removed = 0;
+        int expired = 0;
+        int purged = 0;
         for (var entry : store.entrySet()) {
+            String key = entry.getKey();
             KeyValuePair value = entry.getValue();
-            boolean purge = value.isExpired()
-                    || (value.isTombstone() && HybridLogicalClock.physicalMillis(value.getTimestamp()) < tombstoneCutoff);
-            if (purge && store.remove(entry.getKey(), value)) {
-                adjustMemory(entry.getKey(), value, null);
-                removed++;
+            if (value.isExpired()) {
+                KeyValuePair tombstone = value.toTombstone();
+                if (!store.replace(key, value, tombstone)) {
+                    continue; // a write got in first
+                }
+                adjustMemory(key, value, tombstone);
+                expired++;
+                value = tombstone;
+            }
+            if (value.isTombstone() && value.deletedAtMillis() < tombstoneCutoff && store.remove(key, value)) {
+                adjustMemory(key, value, null);
+                purged++;
             }
         }
-        if (removed > 0) {
-            logger.debug("Purged {} expired entries and old tombstones, memoryUsed={}", removed,
+        if (expired + purged > 0) {
+            logger.debug("Expired {} values and purged {} old tombstones, memoryUsed={}", expired, purged,
                     currentMemoryBytes.get());
         }
     }
 
     /**
-     * Reject a write that would exceed the memory limit, after first purging expired entries.
+     * Reject a write that would exceed the memory limit, after first freeing expired values.
      * Live data is never evicted: silently dropping acknowledged writes would be data loss.
+     * Deletes are always let through (a tombstone for a key the node does not hold costs its key
+     * and a few dozen bytes, and is purged after the grace period).
      */
-    private void ensureCapacity(String key, KeyValuePair entry) {
-        long needed = estimateSize(key, entry.getValueUnsafe());
-        if (currentMemoryBytes.get() + needed <= maxMemoryBytes) {
+    private void ensureCapacity(String key, KeyValuePair entry, KeyValuePair existing) {
+        // What the write adds: a delete, or an overwrite no larger than what it replaces, adds
+        // nothing and must go through, or a full node could never be emptied
+        long needed = estimateSize(key, entry.getValueUnsafe())
+                - (existing != null ? estimateSize(key, existing.getValueUnsafe()) : 0);
+        if (entry.isTombstone() || needed <= 0 || currentMemoryBytes.get() + needed <= maxMemoryBytes) {
             return;
         }
         cleanupExpired();

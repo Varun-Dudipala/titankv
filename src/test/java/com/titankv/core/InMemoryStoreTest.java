@@ -230,6 +230,131 @@ class InMemoryStoreTest {
         assertThat(store.get("key1")).isEmpty();
     }
 
+    /**
+     * A full store must still take deletes, and overwrites that do not grow it: otherwise the
+     * only way to free memory is refused for lack of memory.
+     */
+    @Test
+    void fullStore_stillTakesDeletesAndOverwritesThatDoNotGrowIt() {
+        InMemoryStore small = new InMemoryStore(60_000, 10_000);
+        try {
+            byte[] value = new byte[100];
+            int stored = 0;
+            try {
+                for (; ; stored++) {
+                    small.putIfNewer("key" + stored, value, 100, 0);
+                }
+            } catch (IllegalStateException full) {
+                assertThat(full).hasMessageContaining("memory limit");
+            }
+            assertThat(stored).isGreaterThan(10);
+            long usedWhenFull = small.getMemoryUsedBytes();
+
+            assertThat(small.putIfNewer("key0", new byte[100], 101, 0)).as("same-size overwrite").isTrue();
+            assertThat(small.putIfNewer("key1", new byte[10], 101, 0)).as("smaller overwrite").isTrue();
+            assertThat(small.putIfNewer("key2", null, 101, 0)).as("delete").isTrue();
+            assertThat(small.putIfNewer("never-stored", null, 101, 0)).as("delete of a key not held").isTrue();
+            assertThat(small.get("key2")).isEmpty();
+            assertThat(small.getMemoryUsedBytes()).isLessThan(usedWhenFull);
+
+            assertThatThrownBy(() -> small.putIfNewer("key0", new byte[5_000], 102, 0))
+                    .as("an overwrite that grows past the limit").isInstanceOf(IllegalStateException.class);
+            assertThat(small.putIfNewer("key2", value, 102, 0)).as("the freed space is usable").isTrue();
+        } finally {
+            small.shutdown();
+        }
+    }
+
+    @Test
+    void putOrSuperseded_reportsTheNewerVersionThatWasKept() {
+        byte[] a = "a".getBytes(StandardCharsets.UTF_8);
+        byte[] b = "b".getBytes(StandardCharsets.UTF_8);
+
+        assertThat(store.putOrSuperseded("key1", a, 100, 0)).as("stored").isZero();
+        assertThat(store.putOrSuperseded("key1", a, 100, 0)).as("the same version again").isZero();
+        assertThat(store.putOrSuperseded("key1", a, 50, 0)).as("older").isEqualTo(100);
+        assertThat(store.putOrSuperseded("key1", b, 100, 0)).as("same timestamp, greater value").isZero();
+        assertThat(store.putOrSuperseded("key1", a, 100, 0)).as("same timestamp, lesser value").isEqualTo(100);
+        assertThat(store.putOrSuperseded("key1", null, 100, 0)).as("a delete wins the tie").isZero();
+        assertThat(store.putOrSuperseded("key1", b, 100, 0)).as("a value loses the tie to a delete").isEqualTo(100);
+        assertThat(store.putOrSuperseded("key1", b, 101, 0)).as("newer").isZero();
+        assertThat(store.get("key1").orElseThrow().getValueUnsafe()).isEqualTo(b);
+    }
+
+    /**
+     * An expired value keeps its version as a tombstone. If it vanished, an older version held by
+     * a replica that missed the write would look newest and come back.
+     */
+    @Test
+    void expiredValue_becomesTombstoneThatOutranksOlderVersions() throws InterruptedException {
+        long older = HybridLogicalClock.encode(System.currentTimeMillis());
+        long newer = older + 1;
+        long expiresAt = System.currentTimeMillis() + 50;
+        store.putIfNewer("key1", "old".getBytes(StandardCharsets.UTF_8), older, 0);
+        store.putIfNewer("key1", "short-lived".getBytes(StandardCharsets.UTF_8), newer, expiresAt);
+        long usedBeforeExpiry = store.getMemoryUsedBytes();
+
+        Thread.sleep(250); // past the expiry and at least one cleanup run
+
+        assertThat(store.get("key1")).isEmpty();
+        assertThat(store.keys()).isEmpty();
+        assertThat(store.size()).isZero();
+        KeyValuePair raw = store.getRaw("key1").orElseThrow();
+        assertThat(raw.isTombstone()).isTrue();
+        assertThat(raw.getTimestamp()).isEqualTo(newer);
+        assertThat(raw.deletedAtMillis()).isEqualTo(expiresAt);
+        assertThat(store.keysIncludingTombstones()).containsExactly("key1");
+        assertThat(store.getMemoryUsedBytes()).as("the value's memory is released").isLessThan(usedBeforeExpiry);
+
+        // A replica that missed the short-lived write offers its older copy: it must lose
+        assertThat(store.putIfNewer("key1", "old".getBytes(StandardCharsets.UTF_8), older, 0)).isFalse();
+        assertThat(store.get("key1")).isEmpty();
+        // A later write still wins
+        assertThat(store.putIfNewer("key1", "fresh".getBytes(StandardCharsets.UTF_8), newer + 1, 0)).isTrue();
+        assertThat(store.get("key1")).isPresent();
+    }
+
+    @Test
+    void expiredValue_isSeenAsATombstoneBeforeAnyCleanup() throws InterruptedException {
+        InMemoryStore slowCleanup = new InMemoryStore(60_000);
+        try {
+            slowCleanup.put("key1", "short-lived".getBytes(StandardCharsets.UTF_8), 30);
+            Thread.sleep(80);
+
+            java.util.Map<String, KeyValuePair> visited = new java.util.HashMap<>();
+            slowCleanup.forEachEntry(visited::put);
+            assertThat(visited.get("key1").isTombstone()).isTrue();
+            assertThat(slowCleanup.getRaw("key1").orElseThrow().isTombstone()).isTrue();
+        } finally {
+            slowCleanup.shutdown();
+        }
+    }
+
+    @Test
+    void expiredValue_isPurgedOnceTheTombstoneGracePeriodEnds() throws InterruptedException {
+        System.setProperty("titankv.tombstone.grace.ms", "500");
+        InMemoryStore shortGrace;
+        try {
+            shortGrace = new InMemoryStore(20);
+        } finally {
+            System.clearProperty("titankv.tombstone.grace.ms");
+        }
+        try {
+            shortGrace.put("key1", "short-lived".getBytes(StandardCharsets.UTF_8), 50);
+            Thread.sleep(100); // expired, but within the grace period
+            assertThat(shortGrace.rawSize()).isEqualTo(1);
+
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (shortGrace.rawSize() > 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20);
+            }
+            assertThat(shortGrace.rawSize()).isZero();
+            assertThat(shortGrace.getMemoryUsedBytes()).isZero();
+        } finally {
+            shortGrace.shutdown();
+        }
+    }
+
     @Test
     void concurrentOperations_areThreadSafe() throws InterruptedException {
         int threadCount = 10;

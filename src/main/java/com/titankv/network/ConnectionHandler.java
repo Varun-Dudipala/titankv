@@ -44,8 +44,9 @@ public class ConnectionHandler {
     // Maximum read buffer size = header + max key + max value
     private static final int MAX_READ_BUFFER_SIZE = BinaryProtocol.REQUEST_HEADER_SIZE
             + BinaryProtocol.MAX_KEY_LENGTH + BinaryProtocol.MAX_VALUE_LENGTH;
-    // Timeout for completing a request frame (30 seconds)
-    private static final long INCOMPLETE_FRAME_TIMEOUT_MS = 30_000;
+    // How long a connection may take to deliver a whole request: from being accepted to its first
+    // request, and from the first byte of any later request to its last
+    private static final long DEFAULT_FRAME_TIMEOUT_MS = 30_000;
     private static final long OPERATION_TIMEOUT_MS = 5_000;
 
     private final SocketChannel channel;
@@ -67,9 +68,12 @@ public class ConnectionHandler {
     private boolean commandInProgress = false; // Track if a command is currently being processed
     private boolean writeInProgress = false;
 
-    // Frame timeout tracking to prevent memory DoS
+    // Frame timeout tracking to prevent memory DoS. Read and written on the selector thread only.
     private long incompleteFrameStartTime = 0; // When we first received data for current incomplete frame
     private boolean hasIncompleteFrame = false; // Whether we're currently waiting for more data
+    private boolean receivedRequest = false; // Whether a whole request has ever arrived
+    private final long acceptedAtMillis = System.currentTimeMillis();
+    private final long frameTimeoutMs = frameTimeoutMs();
 
     // Lock for protecting interestOps modifications (prevents race conditions)
     private final Object interestOpsLock = new Object();
@@ -204,6 +208,38 @@ public class ConnectionHandler {
         });
     }
 
+    private static long frameTimeoutMs() {
+        String configured = Env.get("TITANKV_FRAME_TIMEOUT_MS", "titankv.frame.timeout.ms");
+        if (configured != null) {
+            try {
+                long millis = Long.parseLong(configured.trim());
+                if (millis > 0) {
+                    return millis;
+                }
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+            logger.warn("Invalid TITANKV_FRAME_TIMEOUT_MS {}, using {}", configured, DEFAULT_FRAME_TIMEOUT_MS);
+        }
+        return DEFAULT_FRAME_TIMEOUT_MS;
+    }
+
+    /**
+     * Whether this connection has kept the server waiting too long for a whole request: it has
+     * sent part of one and stopped, or has sent nothing complete since it was accepted. Such a
+     * connection holds buffers (up to the size of the largest request) for as long as it stays
+     * open. Called by the selector thread about once a second: the check inside the read path
+     * only runs when more bytes arrive, which a client that goes quiet never sends.
+     *
+     * A connection that is idle between requests is not stalled: clients pool connections.
+     */
+    boolean isStalled(long nowMillis) {
+        if (hasIncompleteFrame) {
+            return nowMillis - incompleteFrameStartTime > frameTimeoutMs;
+        }
+        return !receivedRequest && nowMillis - acceptedAtMillis > frameTimeoutMs;
+    }
+
     private static ConsistencyLevel readConsistencyLevel(String envKey, String propKey, ConsistencyLevel fallback) {
         String value = Env.get(envKey, propKey);
         if (value == null) {
@@ -321,7 +357,7 @@ public class ConnectionHandler {
                     } else {
                         // Check if we've exceeded the timeout
                         long elapsed = System.currentTimeMillis() - incompleteFrameStartTime;
-                        if (elapsed > INCOMPLETE_FRAME_TIMEOUT_MS) {
+                        if (elapsed > frameTimeoutMs) {
                             logger.warn("Connection from {} exceeded incomplete frame timeout ({}ms), closing",
                                     clientAddress, elapsed);
                             return false;
@@ -331,10 +367,12 @@ public class ConnectionHandler {
 
                 processReadBuffer(key);
 
-                // Reset incomplete frame tracking if we processed a complete request
                 if (hasCompleteFrame) {
-                    hasIncompleteFrame = false;
-                    incompleteFrameStartTime = 0;
+                    receivedRequest = true;
+                    // Whatever is left after the requests just processed is the start of a new
+                    // one, and its time starts now
+                    hasIncompleteFrame = readBuffer.position() > 0;
+                    incompleteFrameStartTime = hasIncompleteFrame ? System.currentTimeMillis() : 0;
                 }
 
                 // After processing, buffer is in write mode (position=end of unprocessed data)
@@ -667,20 +705,55 @@ public class ConnectionHandler {
         if (command.getExpiresAt() < 0) {
             return done(Response.error("TTL must not be negative"));
         }
-        // A client PUT's timestamp field is its causal context: the newest version it has seen.
-        // Observing it first makes this write newer than anything the client read or wrote before.
-        clock().observe(command.getTimestamp());
-        long timestamp = clock().next();
+        long timestamp = writeVersion(command);
         // Client PUTs carry a relative TTL in the expires field
         long expiresAt = command.getExpiresAt() > 0 ? System.currentTimeMillis() + command.getExpiresAt() : 0;
-        Response written = Response.ok(null, timestamp, expiresAt);
+        Response written = Response.ok(null, clock().current(), expiresAt);
 
         if (isDistributed()) {
             return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
-                    expiresAt, level(command, writeConsistency)), "Write", command.getKey(), ok -> written);
+                    expiresAt, level(command, writeConsistency)), "Write", command.getKey(),
+                    newer -> acknowledge(written, newer));
         }
-        store.putIfNewer(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt);
-        return done(written);
+        return done(acknowledge(written,
+                store.putOrSuperseded(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt)));
+    }
+
+    /**
+     * The reply to a write the replicas have taken: OK, or STALE with the newer version if one of
+     * them already held a newer version of the key. Without this a write behind a newer version
+     * is acknowledged and never read back, and its client cannot tell.
+     */
+    private static Response acknowledge(Response ok, long newerVersion) {
+        return newerVersion > 0 ? Response.stale(newerVersion) : ok;
+    }
+
+    /**
+     * The version of a client PUT or DELETE. The client chooses it and sends it in the timestamp
+     * field: a client then knows the version of every write it attempted, even one that failed or
+     * timed out, and its next write is newer whichever node coordinates it. If the coordinator
+     * chose, a write that failed for lack of a quorum could stay on its coordinator with a
+     * version the client never saw, and override the client's later, acknowledged write.
+     *
+     * This node's clock only observes the version, so the reply can tell the client the newest
+     * version this node has seen, and it issues one itself for a client that sends none.
+     *
+     * @throws IllegalArgumentException if the version is too far ahead of this node's clock to
+     *                                  come from a correct clock; accepted, it would outrank
+     *                                  every write to the key until real time caught up
+     */
+    private long writeVersion(Command command) {
+        long chosen = command.getTimestamp();
+        if (chosen <= 0) {
+            return clock().next();
+        }
+        if (clock().isTooFarAhead(chosen)) {
+            throw new IllegalArgumentException("write version is more than "
+                    + HybridLogicalClock.MAX_FORWARD_DRIFT_MS / 1000 + "s ahead of this node's clock; "
+                    + "check the client's clock");
+        }
+        clock().observe(chosen);
+        return chosen;
     }
 
     /**
@@ -696,32 +769,32 @@ public class ConnectionHandler {
             return Response.error("Timestamp required for internal PUT");
         }
         clock().observe(command.getTimestamp());
-        boolean written = store.putIfNewer(
+        long newer = store.putOrSuperseded(
                 command.getKey(),
                 command.getValueUnsafe(),
                 command.getTimestamp(),
                 command.getExpiresAt());
         logger.trace("PUT_INTERNAL {}: key={}, timestamp={}",
-                written ? "accepted" : "rejected (stale)", command.getKey(), command.getTimestamp());
-        return Response.ok();
+                newer == 0 ? "accepted" : "superseded", command.getKey(), command.getTimestamp());
+        return acknowledge(Response.ok(), newer);
     }
 
     private CompletableFuture<Response> handleDelete(Command command) {
         if (command.getKey() == null) {
             return done(Response.error("Key required for DELETE"));
         }
-        // The tombstone must be newer than the client's causal context and any local version
-        clock().observe(command.getTimestamp());
-        store.getRaw(command.getKey()).ifPresent(existing -> clock().observe(existing.getTimestamp()));
-        long timestamp = clock().next();
-        Response deleted = Response.ok(null, timestamp, 0);
+        if (command.getTimestamp() <= 0) {
+            // No version from the client: make the tombstone newer than the local copy
+            store.getRaw(command.getKey()).ifPresent(existing -> clock().observe(existing.getTimestamp()));
+        }
+        long timestamp = writeVersion(command);
+        Response deleted = Response.ok(null, clock().current(), 0);
 
         if (isDistributed()) {
             return replicated(replicationManager.delete(command.getKey(), timestamp, 0, level(command, deleteConsistency)),
-                    "Delete", command.getKey(), ok -> deleted);
+                    "Delete", command.getKey(), newer -> acknowledge(deleted, newer));
         }
-        store.putIfNewer(command.getKey(), null, timestamp, 0);
-        return done(deleted);
+        return done(acknowledge(deleted, store.putOrSuperseded(command.getKey(), null, timestamp, 0)));
     }
 
     /**
@@ -738,14 +811,14 @@ public class ConnectionHandler {
         }
         clock().observe(command.getTimestamp());
         // null value = tombstone, so stale replicas cannot resurrect the deleted value
-        boolean written = store.putIfNewer(
+        long newer = store.putOrSuperseded(
                 command.getKey(),
                 null,
                 command.getTimestamp(),
                 command.getExpiresAt());
         logger.trace("DELETE_INTERNAL tombstone {}: key={}, timestamp={}",
-                written ? "written" : "rejected (stale)", command.getKey(), command.getTimestamp());
-        return Response.ok();
+                newer == 0 ? "written" : "superseded", command.getKey(), command.getTimestamp());
+        return acknowledge(Response.ok(), newer);
     }
 
     /**

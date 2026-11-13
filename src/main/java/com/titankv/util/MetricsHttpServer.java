@@ -294,7 +294,11 @@ public class MetricsHttpServer {
     }
 
     private void handleHealth(OutputStream out) throws IOException {
-        // Basic health check - server is running
+        if (store != null && !store.isHealthy()) {
+            // The store stopped accepting writes after a WAL failure; the node needs a restart
+            sendResponse(out, 503, "application/json", "{\"status\":\"unhealthy\",\"reason\":\"WAL failure\"}");
+            return;
+        }
         sendResponse(out, 200, "application/json", "{\"status\":\"healthy\"}");
     }
 

@@ -119,8 +119,8 @@ public class Node {
     }
 
     /**
-     * Get the canonical host used for hashing and identity on the ring.
-     * This may differ from the advertised host if it resolves to an IP.
+     * The host resolved to an IP address when this node was first seen (the host itself if it
+     * did not resolve). Used to recognise connections from cluster members.
      */
     public String getHashHost() {
         return hashHost;
@@ -138,13 +138,6 @@ public class Node {
      */
     public String getAddress() {
         return formatAddress(host, port);
-    }
-
-    /**
-     * Get the canonical address string used for hashing on the ring.
-     */
-    public String getHashKey() {
-        return formatAddress(hashHost, port);
     }
 
     /**

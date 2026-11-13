@@ -30,9 +30,10 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 - **Read repair**: reads return once the consistency level is met, then fix stale replicas in the background
 - **Hinted handoff**: writes for a down replica are kept (persisted, coalesced per key) and delivered when it returns
 - **Merkle-tree anti-entropy**: replica pairs compare 1024-leaf hash trees every minute and sync only the keys that differ
-- **Last-write-wins with hybrid logical clocks**, plus client causal context, so clock skew cannot make a
-  client's later write lose to its earlier one; equal versions break ties the same way on every node;
-  deletes are tombstones, so nothing is resurrected
+- **Last-write-wins with hybrid logical clocks**, issued by the client: a client's writes keep their
+  order across nodes, failovers and failed attempts, whatever the nodes' clocks say; equal versions
+  break ties the same way on every node; deletes and expired values leave tombstones, so nothing is
+  resurrected
 
 **Membership and operations**
 - **Gossip** (UDP, Cassandra-style heartbeat digests) with HMAC-SHA256 authentication and replay
@@ -44,8 +45,7 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 **Storage and networking**
 - **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync
 - **Non-blocking NIO server**; worker threads never wait on replicas
-- **Binary protocol** over TCP with 29-byte request headers: 46–49% fewer bytes per round trip than
-  JSON over HTTP for 100-byte values ([measured](benchmark/results/benchmark_results.md#protocol-size-vs-json-over-http))
+- **Binary protocol** over TCP with 29-byte request and 25-byte response headers
 - **TTL** per key, **client circuit breaker**, connection pooling
 
 ## Quick start
@@ -116,8 +116,9 @@ Without a level, requests use the client's default (`ClientConfig.builder().cons
 otherwise the server's (QUORUM unless configured).
 
 The client spreads requests across nodes by consistent hashing, pools connections, fails over to
-another node on error, and tracks the newest version it has seen so its writes are always ordered
-after what it has read or written (see [clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
+another node on error, and chooses each write's version from its own hybrid logical clock, so its
+writes are always ordered after what it has read or written, including writes that failed (see
+[clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
 
 ## Consistency and failure behaviour
 
@@ -138,12 +139,17 @@ With replication factor 3:
 | A node shuts down (SIGTERM, rolling restart) | It tells its peers, which mark it DEAD at once. It stays a replica of its keys (a shutdown is not a decommission), so its writes become hints until it is back. |
 | It comes back | Gossip sees a newer heartbeat and hints are delivered; if the process restarted, an immediate Merkle-tree repair sends it only the keys it is missing; read repair fixes anything else it serves. |
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
-| A node is gone for good | `removenode <id>` drops it cluster-wide; anti-entropy re-replicates its keys to their new replicas. |
+| A node is gone for good | `removenode <id>` drops it cluster-wide; nodes that were down or cut off at the time learn of it from later gossip. Anti-entropy re-replicates its keys to their new replicas. |
 | A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
-| A restarted node has not learned the membership yet | It rejects client requests (`/ready` is 503) until a peer's digest has given it every member, down ones included, rather than serving with a partial ring. |
+| A node restarts | It has its saved member list at once, down members included, and rejects client requests (`/ready` is 503) until a peer that knows the whole membership confirms it, or 5 seconds pass without one doing so. A node with nothing saved waits for such a peer, or for every seed. |
+| The whole cluster stops and only some nodes return | They know the full ring from disk, so they refuse QUORUM for keys whose replicas are still down instead of accepting them onto the wrong nodes. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
-| Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and ignores a torn final record. |
-| Clock skew | Hybrid logical clocks never go backwards past a version already seen; clients carry causal context. |
+| Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and cuts a torn final record off the log. |
+| The WAL or a snapshot is damaged anywhere else | The node refuses to start and leaves the files as they are, rather than drop every write after the damage. Moving the file aside lets it start and be repaired from its peers. |
+| A WAL write or fsync fails | The node stops accepting writes (`/health` returns 503) until it is restarted; it does not carry on appending behind a possibly half-written record. |
+| Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. Node clocks still decide when a TTL runs out and when a tombstone is purged: a key expires when the first replica's clock says so. |
+| A client's clock is wrong | A write behind a newer version is reported (STALE) and sent again with a later one, so at QUORUM a write that starts after another was acknowledged still wins. A version over 60s ahead of a node's clock is refused. Other clients do not adopt a version more than 30s ahead of their own clock: a key written by a client that far ahead cannot be overwritten until real time reaches it, and the writer is told so. |
+| A client sends part of a request and goes quiet | The server closes the connection after 30 seconds without a whole request. Connections idle between requests are kept; at most 10,000 are open at once. |
 | Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
 ## Configuration
@@ -158,16 +164,18 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_INTERNAL_TOKEN` | cluster secret | Token for node-to-node and admin commands |
 | `TITANKV_READ_CONSISTENCY` / `_WRITE_` / `_DELETE_` | `QUORUM` | Default level for requests that do not choose one |
 | `TITANKV_SPECULATIVE_RETRY_MS` | `50` | Also ask a spare replica when one has not answered a read by then; `0` disables |
-| `TITANKV_DATA_DIR` | `data` | WAL, snapshots and hints go in `<dir>/node-<port>` |
+| `TITANKV_DATA_DIR` | `data` | WAL, snapshots, hints and the saved member list go in `<dir>/node-<port>` |
 | `TITANKV_WAL_ENABLED` | on unless dev mode | Write-ahead log |
 | `TITANKV_WAL_FSYNC` | `true` | fsync before acknowledging a write (group-committed) |
 | `TITANKV_WAL_MAX_MB` | `128` | WAL size that triggers a snapshot |
-| `TITANKV_MAX_MEMORY_MB` | `512` | Writes beyond this are rejected (never silently evicted) |
-| `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long deleted-key tombstones are kept |
+| `TITANKV_MAX_MEMORY_MB` | `512` | Writes beyond this are rejected (never silently evicted); deletes always pass |
+| `TITANKV_MAX_CONNECTIONS` | `10000` | Connections beyond this are refused |
+| `TITANKV_FRAME_TIMEOUT_MS` | `30000` | How long a connection may take to deliver a whole request |
+| `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long tombstones of deleted and expired keys are kept |
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
 | `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
 | `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
-| `TITANKV_REPLICATION_THREADS` | max(16, 4 × CPUs) | Threads for replica I/O |
+| `TITANKV_REPLICATION_THREADS` | max(16, 4 × CPUs) | Threads for replica I/O, per peer node |
 
 Ports per node: client TCP on `--port`, gossip UDP on port + 1000, metrics HTTP on port + 90.
 
@@ -181,8 +189,9 @@ Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE]
 Big-endian; `VAL_LEN` of -1 means no value (distinct from an empty value). The low 6 bits of `CMD`
 are the command and the top 2 bits an optional consistency level for GET, EXISTS, PUT and DELETE
 (0 = server default, 1 = ONE, 2 = QUORUM, 3 = ALL), so choosing a level costs no bytes. For client
-PUT/DELETE, `TIMESTAMP` is optional causal context and `EXPIRES` carries the TTL in milliseconds;
-responses to PUT/DELETE return the version assigned. Replica messages carry absolute versions and
+PUT/DELETE, `TIMESTAMP` is the write's version, chosen by the client (0 lets the node choose), and
+`EXPIRES` carries the TTL in milliseconds; responses to PUT/DELETE return the newest version the
+node has seen, which the client's clock follows. Replica messages carry absolute versions and
 expiry times.
 
 | Command | Code | Command | Code | Status | Code |
@@ -192,7 +201,10 @@ expiry times.
 | DELETE | 0x03 | CLEANUP | 0x0A | ERROR | 0x02 |
 | PING | 0x04 | GET/PUT/DELETE_INTERNAL | 0x11–0x13 | PONG | 0x03 |
 | EXISTS | 0x05 | MERKLE_TREE / MERKLE_LEAF | 0x14–0x15 | EXISTS_TRUE / _FALSE | 0x04 / 0x05 |
-| AUTH | 0x07 | | | | |
+| AUTH | 0x07 | | | STALE | 0x06 |
+
+STALE answers a PUT or DELETE that was replicated but is already superseded: a replica holds a
+newer version of the key, returned in `TIMESTAMP`. The client library retries with a later version.
 
 Internal commands (0x11 and up) are node-to-node; they need the cluster token and a connection from
 a cluster member. REMOVE_NODE and CLEANUP need the cluster token too.
@@ -215,6 +227,10 @@ a cluster member. REMOVE_NODE and CLEANUP need the cluster token too.
 clocks, the three convergence mechanisms, WAL recovery and the design trade-offs.
 
 ## Performance
+
+**These numbers were measured on 2 October 2026 at commit `612ad48` and have not been re-measured.**
+The request path has changed since (one thread pool per peer, versions chosen by the client, replies
+that report superseded writes), so treat them as the earlier code's.
 
 Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator together
 ([method, spreads and all scenarios](benchmark/results/benchmark_results.md)):
@@ -243,8 +259,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 164 unit tests
-mvn verify     # + 57 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 204 unit tests
+mvn verify     # + 76 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -253,18 +269,30 @@ The integration suite includes:
   and again with graceful rolling restarts. No read may go back past an acknowledged write, and at
   the end every key must hold a version between its last acknowledged and last attempted write
 - production mode (auth, signed gossip, fsynced WAL), 32 concurrent clients with read-your-writes checks
-- QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, clock skew with
-  and without causal context, concurrent writes with equal versions
-- gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode`, join + `cleanup`,
-  admin commands requiring the cluster token
+- QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, node and client
+  clocks that are wrong (including clients 30 seconds apart taking turns on one key), racing
+  writers, concurrent writes with equal versions
+- gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode` (also
+  reaching a node that was cut off at the time), join + `cleanup`, admin commands requiring the cluster token
+- stalled connections, the connection limit, WAL damage in the middle of the log, a failing WAL,
+  torn hint files, a full store that must still take deletes
+- restarts with saved membership: a full stop after which only two of five nodes return, a node
+  that returns alone, and nodes with nothing saved restarting together
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
+- **Network faults**, injected between nodes: a 2 | 3 partition (each side serves exactly the keys it
+  holds a quorum of, and refuses the rest), an isolated node, a link cut in one direction, a replica
+  that answers a second late, and a second chaos test that mixes all of these with crashes and
+  with node and client clocks up to 20 seconds wrong, then checks that every replica converges
 
-WAL tests cover crash recovery across snapshots, concurrent writers during snapshots and torn writes.
+WAL tests cover crash recovery across snapshots, concurrent writers during snapshots, torn writes
+(including writes made after recovering from one) and expired values.
 
 ## Known limitations
 
 - **Last write wins.** Concurrent writes to the same key resolve by version; the losing write is
   discarded rather than surfaced as a conflict (vector clocks with siblings would expose it).
+- **At ONE, client clocks can misorder writes.** A write behind a newer version is only reported if
+  an acknowledging replica holds that version, which QUORUM guarantees and ONE does not.
 - **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
 - **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
 - **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is
@@ -273,8 +301,17 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
 - **Fixed failure-detection timeouts** (3s/10s) rather than an adaptive phi-accrual detector.
 - **Snapshots pause writes** while all entries are written out (when the WAL passes 128 MB).
 - **Hints are not fsynced**; a coordinator crash can lose some, which anti-entropy then repairs.
+  Hints are also dropped beyond 100,000 or 64 MB per down node.
+- **TTL precision is the clock skew between nodes.** Each replica expires a key by its own clock,
+  and the first to do so wins: a node whose clock runs fast ends a TTL early for the whole cluster.
 - **Gossip digests fit in one UDP packet** (about 30 members with short node IDs; larger clusters
-  send a rotating subset each round).
+  send a rotating subset each round). A node with nothing saved only trusts a digest that lists
+  the whole membership, so a brand-new node cannot join a cluster too large for one packet.
+- **A new cluster needs every seed once.** Until a member list has been saved, a node serves only
+  when it has learned as many members as it has seeds, so list every initial node as a seed and
+  start them all. Nodes without a WAL (dev mode) save nothing and need this after every full stop.
+- **Node ids are identities.** Ring positions come from the node id (`--node-id`, by default
+  `hostname:port`), so a node must keep its id across restarts.
 - Traffic is not encrypted (no TLS).
 
 ## License
