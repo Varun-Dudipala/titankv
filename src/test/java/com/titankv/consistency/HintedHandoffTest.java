@@ -62,6 +62,29 @@ class HintedHandoffTest {
         assertThat(handoff.pendingHints(replica.getId())).isZero();
     }
 
+    /**
+     * Delivery and removal update the hints in memory first and the file just after, on the
+     * handoff thread, so tests that look at the file wait for it.
+     */
+    private void awaitHintFile(java.util.function.Predicate<Path> condition, String description)
+            throws InterruptedException {
+        Path file = hintsDir.resolve("replica.hints");
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (!condition.test(file) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(condition.test(file)).as(description).isTrue();
+    }
+
+    private static boolean holdsNoHints(Path file) {
+        try {
+            // Only the header is left: a length and the node id
+            return java.nio.file.Files.size(file) == 4 + "replica".length();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     @Test
     void hintsAreDeliveredWhenTheReplicaRecovers() throws Exception {
         HintedHandoff handoff = handoff(null);
@@ -116,6 +139,143 @@ class HintedHandoffTest {
         assertThat(replicas.writes.get("k2").expiresAt).isEqualTo(5_000);
     }
 
+    /**
+     * Hints loaded from disk after a restart must leave the file once delivered, or every later
+     * restart loads and delivers them again.
+     */
+    @Test
+    void hintsDeliveredAfterARestartAreNotLoadedAgain() throws Exception {
+        HintedHandoff before = handoff(hintsDir);
+        before.store(replica, "k1", bytes("v1"), 100, 0);
+        before.store(replica, "k2", null, 200, 0);
+        before.shutdown();
+
+        HintedHandoff restarted = handoff(hintsDir);
+        assertThat(restarted.pendingHints(replica.getId())).isEqualTo(2);
+        recover();
+        awaitDelivered(restarted);
+        awaitHintFile(HintedHandoffTest::holdsNoHints, "delivered hints removed from the file");
+        restarted.shutdown();
+        replicas.writes.clear();
+        replica.setStatus(Node.Status.DEAD);
+
+        HintedHandoff restartedAgain = handoff(hintsDir);
+        assertThat(restartedAgain.pendingHints(replica.getId())).isZero();
+
+        // The emptied file still takes new hints
+        restartedAgain.store(replica, "k3", bytes("v3"), 300, 0);
+        restartedAgain.shutdown();
+        HintedHandoff last = handoff(hintsDir);
+        assertThat(last.pendingHints(replica.getId())).isEqualTo(1);
+        recover();
+        awaitDelivered(last);
+        assertThat(replicas.writes).containsOnlyKeys("k3");
+    }
+
+    @Test
+    void hintsLoadedAfterARestartAreDroppedWithTheirFileWhenTheNodeIsRemoved() throws Exception {
+        HintedHandoff before = handoff(hintsDir);
+        before.store(replica, "k", bytes("v"), 100, 0);
+        before.shutdown();
+
+        HintedHandoff restarted = handoff(hintsDir);
+        assertThat(restarted.pendingHints(replica.getId())).isEqualTo(1);
+        clusterManager.removeDeadNode(replica.getId()); // fires NODE_LEFT
+
+        awaitHintFile(file -> !java.nio.file.Files.exists(file), "the removed node's hint file deleted");
+        assertThat(restarted.totalPendingHints()).isZero();
+    }
+
+    /**
+     * A crash in the middle of an append leaves a torn record at the end of a hint file. The file
+     * is appended to after the restart, so the torn record must go: hints written behind it would
+     * be skipped by the next load.
+     */
+    @Test
+    void hintsStoredAfterATornRecordSurviveTheNextRestart() throws Exception {
+        HintedHandoff before = handoff(hintsDir);
+        for (int i = 0; i < 6; i++) {
+            before.store(replica, "k" + i, bytes("v" + i), 100 + i, 0);
+        }
+        before.shutdown();
+        Path file = hintsDir.resolve("replica.hints");
+        try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(file,
+                java.nio.file.StandardOpenOption.WRITE)) {
+            channel.truncate(channel.size() - 3); // the sixth record is torn
+        }
+
+        HintedHandoff restarted = handoff(hintsDir);
+        assertThat(restarted.pendingHints(replica.getId())).isEqualTo(5);
+        restarted.store(replica, "after-1", bytes("a"), 200, 0);
+        restarted.store(replica, "after-2", null, 201, 0);
+        restarted.shutdown();
+
+        HintedHandoff restartedAgain = handoff(hintsDir);
+        assertThat(restartedAgain.pendingHints(replica.getId())).isEqualTo(7);
+        recover();
+        awaitDelivered(restartedAgain);
+        assertThat(replicas.writes).containsKeys("k0", "k4", "after-1", "after-2").doesNotContainKey("k5");
+    }
+
+    /**
+     * Bytes that are not a record must not be trusted as lengths: a garbage length used to size
+     * an array before the checksum was looked at, and a large one stopped the node from starting.
+     */
+    @Test
+    void garbageAtTheEndOfAHintFileIsDroppedWithoutBeingTrusted() throws Exception {
+        HintedHandoff before = handoff(hintsDir);
+        before.store(replica, "k", bytes("v"), 100, 0);
+        before.shutdown();
+        Path file = hintsDir.resolve("replica.hints");
+        java.nio.file.Files.write(file, new byte[] {0x7F, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 1, 2, 3},
+                java.nio.file.StandardOpenOption.APPEND); // reads as a 2 GB key length
+
+        HintedHandoff restarted = handoff(hintsDir);
+        assertThat(restarted.pendingHints(replica.getId())).isEqualTo(1);
+        long size = java.nio.file.Files.size(file);
+        restarted.shutdown();
+        assertThat(handoff(hintsDir).pendingHints(replica.getId())).isEqualTo(1);
+        assertThat(java.nio.file.Files.size(file)).as("the garbage is gone from the file").isEqualTo(size);
+    }
+
+    @Test
+    void equalVersionsAreCoalescedByTheVersionOrderNotByArrival() throws Exception {
+        HintedHandoff handoff = handoff(null);
+        handoff.store(replica, "tie", null, 300, 0);
+        handoff.store(replica, "tie", bytes("value"), 300, 0);
+        handoff.store(replica, "other", bytes("a"), 300, 0);
+        handoff.store(replica, "other", bytes("b"), 300, 0);
+        handoff.store(replica, "other", bytes("a"), 300, 0);
+
+        recover();
+        awaitDelivered(handoff);
+        assertThat(replicas.writes.get("tie").value).as("the delete wins the tie").isNull();
+        assertThat(new String(replicas.writes.get("other").value, StandardCharsets.UTF_8)).isEqualTo("b");
+    }
+
+    /**
+     * Hints are kept in memory with their values. They are limited by size too, so a replica that
+     * is down for a while under large writes cannot exhaust its coordinators' memory.
+     */
+    @Test
+    void hintsAreLimitedByTheMemoryTheyHold() throws Exception {
+        HintedHandoff handoff = handoff(null);
+        byte[] large = new byte[8 * 1024 * 1024];
+        for (int i = 0; i < 12; i++) {
+            handoff.store(replica, "large-" + i, large, 100 + i, 0);
+        }
+        assertThat(handoff.pendingHints(replica.getId())).isEqualTo(7);
+        assertThat(handoff.totalPendingHintBytes()).isLessThanOrEqualTo(HintedHandoff.MAX_HINT_BYTES_PER_NODE);
+
+        // A newer version of a key already held replaces it and is not refused
+        handoff.store(replica, "large-0", bytes("small"), 500, 0);
+        assertThat(handoff.pendingHints(replica.getId())).isEqualTo(7);
+        recover();
+        awaitDelivered(handoff);
+        assertThat(handoff.totalPendingHintBytes()).isZero();
+        assertThat(new String(replicas.writes.get("large-0").value, StandardCharsets.UTF_8)).isEqualTo("small");
+    }
+
     @Test
     void hintFileIsCompactedWhenOverwritesMakeItLarge() throws Exception {
         HintedHandoff handoff = handoff(hintsDir);
@@ -147,7 +307,7 @@ class HintedHandoffTest {
             Thread.sleep(20);
         }
         assertThat(handoff.totalPendingHints()).isZero();
-        assertThat(hintsDir.resolve("replica.hints")).doesNotExist();
+        awaitHintFile(file -> !java.nio.file.Files.exists(file), "the removed node's hint file deleted");
     }
 
     /**

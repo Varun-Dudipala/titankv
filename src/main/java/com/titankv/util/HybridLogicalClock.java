@@ -10,12 +10,15 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * A timestamp packs wall-clock milliseconds in the high 48 bits and a logical counter in the low
  * 16 bits, so it stays close to real time but can still order events whose clocks disagree. Every
- * timestamp this clock issues is greater than every timestamp it has issued or observed. Observing
- * the timestamps of replicated writes, and those clients have seen, is what keeps last-write-wins
- * from discarding a newer write whose coordinator's clock runs behind.
+ * timestamp this clock issues is greater than every timestamp it has issued or observed.
+ *
+ * Clients choose the versions of their writes with the same scheme (see TitanKVClient). A node's
+ * clock observes every version the node stores or coordinates: it tells clients the newest
+ * version the node has seen, so a client whose clock is behind catches up, and it versions the
+ * writes of a client that sends no version.
  *
  * Remote timestamps more than {@link #MAX_FORWARD_DRIFT_MS} ahead of local time are not adopted,
- * so one node with a badly wrong clock cannot drag every clock into the future.
+ * so one badly wrong clock cannot drag every clock into the future.
  */
 public final class HybridLogicalClock {
 
@@ -43,11 +46,26 @@ public final class HybridLogicalClock {
         if (timestamp <= 0) {
             return;
         }
-        if (physicalMillis(timestamp) > now() + MAX_FORWARD_DRIFT_MS) {
+        if (isTooFarAhead(timestamp)) {
             logger.warn("Ignoring timestamp {}ms ahead of the local clock", physicalMillis(timestamp) - now());
             return;
         }
         last.accumulateAndGet(timestamp, Math::max);
+    }
+
+    /**
+     * @return whether a timestamp is more than {@link #MAX_FORWARD_DRIFT_MS} ahead of this clock's
+     *         wall time, which a correct clock elsewhere cannot have issued
+     */
+    public boolean isTooFarAhead(long timestamp) {
+        return physicalMillis(timestamp) > now() + MAX_FORWARD_DRIFT_MS;
+    }
+
+    /**
+     * @return the newest timestamp this clock has issued or observed (0 if none)
+     */
+    public long current() {
+        return last.get();
     }
 
     /**

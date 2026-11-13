@@ -1,5 +1,6 @@
 package com.titankv.core;
 
+import com.titankv.util.HybridLogicalClock;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -253,6 +254,44 @@ class KeyValuePairTest {
 
         byte[] retrieved = pair.getValue();
         assertThat(retrieved).containsExactly(0x00, 0x01, (byte) 0xFF, 0x7F, (byte) 0x80);
+    }
+
+    @Test
+    void expiredValue_turnsIntoATombstoneWithTheSameVersion() {
+        long expiresAt = System.currentTimeMillis() - 1000;
+        KeyValuePair expired = new KeyValuePair("value".getBytes(), 5000, expiresAt);
+
+        KeyValuePair tombstone = expired.toTombstone();
+
+        assertThat(tombstone.isTombstone()).isTrue();
+        assertThat(tombstone.getTimestamp()).isEqualTo(5000);
+        assertThat(tombstone.isExpired()).as("a tombstone does not expire").isFalse();
+        assertThat(tombstone.deletedAtMillis()).isEqualTo(expiresAt);
+        assertThat(tombstone.isNewerThan(expired)).as("the tombstone wins the tie with its own value").isTrue();
+        assertThat(new KeyValuePair("older".getBytes(), 4999, 0).isNewerThan(tombstone)).isFalse();
+    }
+
+    @Test
+    void deleteTombstone_countsItsAgeFromTheDelete() {
+        long deletedAt = System.currentTimeMillis();
+        KeyValuePair tombstone = new KeyValuePair(null, HybridLogicalClock.encode(deletedAt) + 7, 0);
+
+        assertThat(tombstone.deletedAtMillis()).isEqualTo(deletedAt);
+    }
+
+    @Test
+    void copiesOfOneWriteWithDifferentExpiryAreOrderedButNotSuperseded() {
+        byte[] value = "v".getBytes();
+        KeyValuePair shorter = new KeyValuePair(value, 5, 1_000);
+        KeyValuePair longer = new KeyValuePair(value, 5, 2_000);
+
+        assertThat(longer.isNewerThan(shorter)).as("replicas settle on the later expiry").isTrue();
+        assertThat(shorter.isNewerThan(longer)).isFalse();
+        assertThat(longer.isNewerThan(new KeyValuePair(value, 5, 2_000))).isFalse();
+        assertThat(KeyValuePair.compareVersions(5, value, 5, value)).as("they are the same write").isZero();
+        // The version still decides first
+        assertThat(new KeyValuePair(value, 6, 0).isNewerThan(longer)).isTrue();
+        assertThat(new KeyValuePair(null, 5, 0).isNewerThan(longer)).as("a delete wins the tie").isTrue();
     }
 
     @Test

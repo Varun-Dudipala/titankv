@@ -22,8 +22,8 @@ public class ReadRepairHandler {
     private final ClusterManager clusterManager;
     private final int replicationFactor;
     private final ReplicaIO replicaIO;
-    private final ExecutorService executor;
-    private final boolean ownsExecutor;
+    private final ReplicaExecutor replicaExecutor;
+    private final ExecutorService ownedExecutor;
     private final java.util.concurrent.atomic.AtomicLong replicasRepaired = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong speculativeReads = new java.util.concurrent.atomic.AtomicLong();
 
@@ -34,19 +34,44 @@ public class ReadRepairHandler {
 
     /**
      * @param replicaIO how to read and write individual replicas
-     * @param executor  pool for blocking replica calls, or null to create a private one
+     * @param executor  one pool for all blocking replica calls, or null to create a private one
      */
     public ReadRepairHandler(ClusterManager clusterManager, int replicationFactor,
             ReplicaIO replicaIO, ExecutorService executor) {
-        this.clusterManager = clusterManager;
-        this.replicationFactor = replicationFactor;
-        this.replicaIO = Objects.requireNonNull(replicaIO);
-        this.ownsExecutor = executor == null;
-        this.executor = executor != null ? executor : Executors.newFixedThreadPool(4, r -> {
+        this(clusterManager, replicationFactor, replicaIO, executor != null ? executor : privatePool(),
+                executor == null);
+    }
+
+    private ReadRepairHandler(ClusterManager clusterManager, int replicationFactor,
+            ReplicaIO replicaIO, ExecutorService pool, boolean owned) {
+        this(clusterManager, replicationFactor, replicaIO, (replica, task) -> pool.execute(task),
+                owned ? pool : null);
+    }
+
+    /**
+     * @param replicaIO       how to read and write individual replicas
+     * @param replicaExecutor runs blocking replica calls, keeping each replica's calls apart
+     */
+    public ReadRepairHandler(ClusterManager clusterManager, int replicationFactor,
+            ReplicaIO replicaIO, ReplicaExecutor replicaExecutor) {
+        this(clusterManager, replicationFactor, replicaIO, replicaExecutor, null);
+    }
+
+    private static ExecutorService privatePool() {
+        return Executors.newFixedThreadPool(4, r -> {
             Thread t = new Thread(r, "read-repair");
             t.setDaemon(true);
             return t;
         });
+    }
+
+    private ReadRepairHandler(ClusterManager clusterManager, int replicationFactor,
+            ReplicaIO replicaIO, ReplicaExecutor replicaExecutor, ExecutorService ownedExecutor) {
+        this.clusterManager = clusterManager;
+        this.replicationFactor = replicationFactor;
+        this.replicaIO = Objects.requireNonNull(replicaIO);
+        this.replicaExecutor = Objects.requireNonNull(replicaExecutor);
+        this.ownedExecutor = ownedExecutor;
         if (speculativeRetryNanos > 0) {
             // One periodic sweep instead of a timer per read, so fast reads pay nothing for it
             this.speculationSweeper = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -223,9 +248,12 @@ public class ReadRepairHandler {
 
         private void submit(Node replica) {
             try {
-                executor.execute(() -> read(replica));
+                replicaExecutor.execute(replica, () -> read(replica));
             } catch (RejectedExecutionException e) {
-                read(replica); // shutting down: answer on this thread
+                // The replica has too many calls waiting (it is slow or unreachable), or this node
+                // is shutting down: count it as a failed read, so the next replica is asked
+                logger.debug("Read from {} not started: {}", replica.getId(), e.getMessage());
+                record(null);
             }
         }
 
@@ -236,7 +264,13 @@ public class ReadRepairHandler {
             } catch (IOException | RuntimeException e) {
                 logger.debug("Read from {} failed: {}", replica.getId(), e.getMessage());
             }
+            record(response);
+        }
 
+        /**
+         * Count one contacted replica's answer, or its failure if {@code response} is null.
+         */
+        private void record(NodeValue response) {
             Node spare = null;
             RepairResult complete = null;
             boolean fail = false;
@@ -317,7 +351,7 @@ public class ReadRepairHandler {
         replicasRepaired.addAndGet(stale.size());
         for (Node node : stale) {
             try {
-                executor.execute(() -> {
+                replicaExecutor.execute(node, () -> {
                     try {
                         replicaIO.write(node, key, newest.value, newest.timestamp, newest.expiresAt);
                     } catch (IOException | RuntimeException e) {
@@ -325,7 +359,8 @@ public class ReadRepairHandler {
                     }
                 });
             } catch (RejectedExecutionException e) {
-                return; // shutting down
+                // Overloaded replica or shutdown: a later read or anti-entropy repairs it
+                logger.debug("Repair of {} on {} not started: {}", key, node.getId(), e.getMessage());
             }
         }
     }
@@ -340,7 +375,8 @@ public class ReadRepairHandler {
                 continue;
             }
             if (newest == null
-                    || KeyValuePair.compareVersions(nv.timestamp, nv.value, newest.timestamp, newest.value) > 0) {
+                    || KeyValuePair.compareVersions(nv.timestamp, nv.value, nv.expiresAt,
+                            newest.timestamp, newest.value, newest.expiresAt) > 0) {
                 newest = nv;
             }
         }
@@ -351,7 +387,8 @@ public class ReadRepairHandler {
         List<Node> stale = new ArrayList<>();
         for (NodeValue nv : results) {
             if (!nv.node.equals(newest.node)
-                    && (nv.timestamp < newest.timestamp || !Arrays.equals(nv.value, newest.value))) {
+                    && (nv.timestamp < newest.timestamp || !Arrays.equals(nv.value, newest.value)
+                            || nv.expiresAt != newest.expiresAt)) {
                 stale.add(nv.node);
             }
         }
@@ -376,14 +413,14 @@ public class ReadRepairHandler {
         if (speculationSweeper != null) {
             speculationSweeper.shutdownNow();
         }
-        if (ownsExecutor) {
-            executor.shutdown();
+        if (ownedExecutor != null) {
+            ownedExecutor.shutdown();
             try {
-                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                    executor.shutdownNow();
+                if (!ownedExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    ownedExecutor.shutdownNow();
                 }
             } catch (InterruptedException e) {
-                executor.shutdownNow();
+                ownedExecutor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
         }

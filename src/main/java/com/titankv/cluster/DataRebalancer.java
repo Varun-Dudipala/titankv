@@ -105,7 +105,11 @@ public class DataRebalancer {
         // A new node starts empty: stream it every key it now replicates. A restarted node is
         // repaired by hints and anti-entropy instead, which only transfer what it is missing, and a
         // removed node's keys are re-replicated by anti-entropy.
-        if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_JOINED) {
+        //
+        // While this node is still learning the membership, the members it hears of are not new
+        // to the cluster, only to this node: it has just restarted. Without this check it sent
+        // each of them every key it shares with them, one request per key.
+        if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_JOINED && event.isNewToCluster()) {
             transferPool.submit(() -> handleNodeJoin(event.getNode()));
         }
     }
@@ -128,6 +132,7 @@ public class DataRebalancer {
             }
             KeyValuePair kv = entry.get();
             try {
+                clusterManager.getLinkFilter().beforeRequest(clusterManager.getLocalNode(), newNode);
                 if (kv.isTombstone()) {
                     client.deleteInternal(key, kv.getTimestamp(), kv.getExpiresAt());
                 } else {

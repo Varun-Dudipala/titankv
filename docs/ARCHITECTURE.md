@@ -24,7 +24,9 @@ node can serve any request.
 ## Data placement
 
 `ConsistentHash` places 150 virtual nodes per physical node on a 64-bit ring (MurmurHash3 of
-`host:port#i` in a `ConcurrentSkipListMap`). A key's **replicas** are the first 3 distinct nodes
+`<node id>#i` in a `ConcurrentSkipListMap`). Positions come from the node's id, not its address:
+the id is the same on every node and survives a change of IP. They used to come from the resolved
+IP, so a container that came back with another address silently took over different ranges. A key's **replicas** are the first 3 distinct nodes
 clockwise from the key's hash. Adding or removing a node moves about 1/N of the keys, and virtual
 nodes spread that movement across all nodes.
 
@@ -43,8 +45,9 @@ to another node if one is down.
 
 ### Write (PUT / DELETE)
 
-1. The coordinator assigns a version from its hybrid logical clock, after observing the client's
-   causal context (see below). A PUT with TTL also gets an absolute expiry.
+1. The write arrives with the version its client chose (see below); the coordinator checks it is
+   not far ahead of its own clock. A PUT with TTL also gets an absolute expiry, from the
+   coordinator's clock.
 2. It sends the versioned value to the key's replicas that are up, in parallel on the replication
    pool. The local replica is written in-process; remote replicas get `PUT_INTERNAL` /
    `DELETE_INTERNAL` over authenticated connections.
@@ -53,8 +56,11 @@ to another node if one is down.
 4. Replicas that are down, or whose write fails, get a **hint** (below). Hints never count toward
    the consistency level.
 5. The coordinator replies once 1, 2 or 3 replicas acknowledge (ONE, QUORUM, ALL: the level the
-   client put in the request, or the server's default), with the assigned version. If too few replicas are up it fails immediately; if too many fail, or 5 seconds pass,
-   the client gets an error.
+   client put in the request, or the server's default). If too few replicas are up it fails
+   immediately; if too many fail, or 5 seconds pass, the client gets an error.
+6. A replica that already holds a newer version of the key keeps it and says so. If any
+   acknowledging replica did, the coordinator replies STALE with that version instead of OK, and
+   the client sends the write again with a later version (see below).
 
 The acknowledgements needed come from the replication factor (capped by cluster size), never from
 how many replicas happen to be up.
@@ -84,24 +90,54 @@ write quorum, so a QUORUM read returns the latest acknowledged QUORUM write.
 Every write carries a 64-bit version from a **hybrid logical clock** (HLC): wall-clock milliseconds in
 the high 48 bits and a logical counter in the low 16. Last write wins by version.
 
-Plain wall clocks make last-write-wins lose data under clock skew: if a coordinator's clock is 30
-seconds behind, its writes carry older versions than writes it follows and are silently discarded.
-TitanKV prevents this in two ways:
+**The client chooses the version**, as Cassandra's drivers do. Each client has an HLC and issues
+`max(wall clock, last issued or seen + 1)` for every PUT and DELETE. Three things follow:
 
-- **Node clocks never move backwards past a version they have seen.** An HLC issues
-  `max(wall clock, last issued or observed + 1)`, and a node observes the version of every replicated
-  write it receives and every read it coordinates. A replica with a slow clock therefore still
-  versions its next write after the writes it has stored.
-- **Clients carry causal context.** A client remembers the newest version it has read or written and
-  sends it with each PUT and DELETE; the coordinator observes it before assigning a version. A client's
-  later write therefore always wins over anything it saw, even if the coordinator never saw that
-  version. Context can be handed between clients (`getCausalContext` / `observeCausalContext`).
+- **A client's writes keep their order**, whichever nodes coordinate them and whatever those
+  nodes' clocks say, including writes that failed or timed out: the client knows the version of
+  every write it attempted. A call that fails over to another node carries the same version, so
+  the two nodes store one version, not two competing ones.
+- **A write is ordered after everything its client has seen.** A read moves the client's clock
+  past the version read, and the reply to a write carries the newest version the coordinator has
+  seen. A client whose wall clock is behind therefore catches up to the cluster with its first
+  reply. The clock value can be handed to another client or process (`getCausalContext` /
+  `observeCausalContext`), which then writes after everything the first one did and saw.
+- **Node clocks do not decide which write wins.** They are used for expiry times, tombstone age,
+  and one check: a node refuses a version more than 60 seconds ahead of its own clock. Accepted,
+  such a version would outrank every write to the key until real time caught up.
+- **A client follows other clocks only so far.** It adopts a version from a reply or a read only
+  if it is at most 30 seconds ahead of its own wall clock. Without that limit, one client 58
+  seconds fast (inside what nodes accept) pulled every node's and client's clock forward with it,
+  and a correct client then had every write refused by any node whose clock ran a few seconds
+  slow. Now the damage stays with the keys that client wrote: another client cannot overwrite
+  them until real time catches up, and gets an error saying so.
+- **A write that would lose is sent again.** A version is only as good as its client's clock: a
+  client 30 seconds behind another, or writing in the same millisecond, can issue a lower version
+  for a later write. The replicas would take it, acknowledge it, and never return it. Instead a
+  replica that holds a newer version reports it, the coordinator answers STALE, and the client
+  retries with a version after the one it lost to (up to three times; after that it is racing
+  other writers and last-write-wins picks one). At QUORUM a write's acknowledging replicas always
+  include one that holds any write acknowledged before it, so **a write that starts after another
+  was acknowledged wins, whatever the two clients' clocks say.** At ONE there is no such overlap.
 
-Versions more than 60 seconds ahead of the local clock are not adopted, so one node with a badly
-wrong clock cannot drag the whole cluster into the future. `ClockSkewTest` runs a node 30 seconds
-slow and shows a write losing without context and winning with it.
+An earlier version had the coordinator choose the version from its own HLC, after observing the
+newest version the client had seen. A fault-injection test broke it. A write that fails for lack
+of a quorum can stay on its coordinator, with a version the client never learned. When that
+coordinator's clock was ahead and the client's next write was acknowledged through another node,
+the failed write carried the higher version and replaced the acknowledged one on every replica
+once the network healed. `ClockSkewTest` keeps that scenario, and runs node and client clocks
+wrong in both directions.
 
-**One order for versions, everywhere.** Two coordinators can issue the same HLC timestamp for
+The first version of this change left that last point out, and a test of two clients writing one
+key in turn failed one run in three: a delete and the put after it, from different clients, fell
+in the same millisecond, and the put got the lower version. `ClockSkewTest` now has four clients
+with clocks up to 30 seconds apart taking 400 turns on one key.
+
+What remains is inherent to last-write-wins: writes that overlap in time resolve to one winner,
+by version. A write sent without a version (the wire protocol allows it) gets one from the
+coordinator's HLC, which is newer than anything that node has stored or coordinated.
+
+**One order for versions, everywhere.** Two clients can issue the same HLC timestamp for
 concurrent writes to a key (same millisecond, counter 0). So versions are totally ordered: higher
 timestamp, then a tombstone (deletes win ties, as in Cassandra), then the greater value. Replicas
 (`putIfNewer`), the read coordinator and anti-entropy all use this one comparison
@@ -130,8 +166,12 @@ When a replica is down or a write to it fails, the coordinator stores the write 
 node. Hints are coalesced per key (only the newest version matters) and appended, CRC-checked, to
 `<data dir>/node-<port>/hints/<node>.hints` so they survive a coordinator restart. When gossip reports
 the node as recovered, joined or restarted (and every 2 seconds after that), hints are delivered;
-delivery stops at the first failure and resumes later. No hints are kept for a node that has
-been down longer than 3 hours, or beyond 100,000 per node; anti-entropy covers those cases.
+delivery stops at the first failure and resumes later. Once all of a node's hints are delivered
+its file is emptied, including hints that were loaded from disk after a restart. A hint file that
+ends in a record torn by a crash is rewritten on load, for the same reason the WAL is cut back.
+No hints are kept for a node that has been down longer than 3 hours, or beyond 100,000 hints or
+64 MB per node (hints are held in memory with their values, outside the store's limit);
+anti-entropy covers those cases.
 
 ### Merkle-tree anti-entropy
 
@@ -154,9 +194,9 @@ data, so every node immediately runs a round with each peer.
 ## Threading model
 
 ```
-selector thread ──► worker pool (max(4, CPUs)) ──► replication pool (max(16, 4×CPUs))
+selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool per peer (max(16, 4×CPUs) each)
   accepts, reads,     decodes auth, runs local      blocking socket I/O to
-  writes sockets      commands, starts replicated   remote replicas
+  writes sockets      commands, starts replicated   that peer
                       ones and returns at once
 ```
 
@@ -164,9 +204,17 @@ selector thread ──► worker pool (max(4, CPUs)) ──► replication pool 
 - **Worker threads never wait on replicas.** A replicated command returns a `CompletableFuture`;
   when it completes, the response is queued and the connection's next command is scheduled. Commands
   on one connection still run in order, so responses match request order.
-- **Replica I/O** runs on a separate pool because it uses blocking client sockets. Node-to-node
+- **Replica I/O** runs on separate pools because it uses blocking client sockets, one pool per
+  peer. Calls stuck on a slow or unreachable peer fill only that peer's threads and its queue of
+  1,024; further calls to it fail at once (writes become hints, reads go to another replica),
+  and calls to healthy peers are unaffected. An earlier version shared one pool between all
+  peers. A fault-injection test with one replica answering a second late showed the coordinator
+  falling to about 20 requests a second (threads ÷ the slow peer's latency), for every key,
+  including keys that replica did not hold; with a pool per peer it stays above 800. Node-to-node
   clients retry once on a fresh connection if a pooled one turns out to be stale (the peer
   restarted), and do not use the client circuit breaker, since gossip already tracks liveness.
+  A client's connection pool allows a fixed number of connections per node; a thread that finds
+  them all in use waits and takes the next one returned.
 - **Repair traffic is kept apart.** Hint delivery and Merkle repair use their own small connection
   pool per peer (2 connections), so a burst of repair after a node restarts cannot make client
   reads wait for a connection.
@@ -213,14 +261,27 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
   anti-entropy repair with it.
 - **Every member is on the ring, up or down.** A node adopts every member a digest lists, including
   ones reported down (as DEAD), because a down member is still a replica of its keys.
+- **Saved membership.** A node with a WAL also saves its member list, and the nodes that were
+  removed, to `<data dir>/node-<port>/members` (checksummed, replaced atomically) whenever the
+  list changes. On restart every saved member is back on the ring at once, marked DEAD until gossip
+  hears from it. The ring is whole from the first moment, whoever happens to be up.
 - **Readiness.** A node started with seeds rejects client requests, and `/ready` reports 503, until
-  it has applied a peer's full membership digest. A node that receives its first digest answers with
-  its own, so the peer it joined through is synced at once too. Without this gate, a restarted node
-  would act as a one-node cluster and acknowledge writes with a single copy, as the chaos test found
-  when a seed node restarted. A weaker gate ("knows one other member") also failed: a restarted node
-  served with a partial ring, missing members that were down, and sent their keys to the wrong
-  replicas. The chaos test's stale-read check caught that on a slow CI runner, and
-  `MembershipTest` now reproduces it.
+  it knows the whole membership. Every digest says whether its sender knows the whole membership
+  and whether the packet lists all of it. A node is ready when one of these holds:
+  - a digest with both flags has been applied;
+  - it restarted with a saved membership and 5 seconds have passed without such a digest (its
+    peers may all be down; what it saved was complete when it stopped);
+  - it has nothing saved and has learned as many members as it has seeds: a new cluster forming,
+    where the seed list is the membership.
+
+  Three weaker gates each failed. With none, a restarted node acted as a one-node cluster and
+  acknowledged writes with a single copy, as the chaos test found when a seed node restarted.
+  "Knows one other member" let a restarted node serve with a partial ring, missing members that
+  were down; the chaos test's stale-read check caught that on a slow CI runner. "Has applied any
+  digest" let two nodes that restarted together take each other's two-node view for the cluster:
+  after a full stop of five nodes, the first two back reported ready and acknowledged QUORUM
+  writes for keys whose three replicas were all still down. `MembershipTest` and
+  `SavedMembershipTest` reproduce the last two.
 - **Shutting down is not leaving.** On graceful shutdown a node broadcasts LEAVE. Its peers mark it
   DEAD at once instead of after 10 seconds, but it stays a member and stays on the ring, as in
   Cassandra: a shutdown is usually a restart, and taking the node off the ring would give its keys
@@ -230,8 +291,11 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
   then believed it had lost its seeds and refused every request, even at ONE.
 - **Removal.** An operator removes a dead node for good with `removenode`: the coordinating node
   removes it and gossips REMOVE to every member three times. The removed generation is remembered,
-  so stale digests cannot re-add the node, while a restart (newer generation) can. Hints held for it
-  are dropped.
+  saved, and repeated in every digest (16 removed nodes per packet, in rotation), so stale digests
+  cannot re-add the node, while a restart (newer generation) can. Hints held for it are dropped.
+  The three REMOVE messages alone were not enough: a node that was down or partitioned for those
+  two seconds never heard of the removal, kept the node on its ring, and placed keys differently
+  from everyone else. `MembershipTest` cuts a node off during a removal and requires it to catch up.
 - **Clocks.** Silence is measured with `System.nanoTime()`, so an NTP step of the wall clock cannot
   make every peer look dead at once.
 
@@ -258,16 +322,52 @@ record `[magic][version][op][key len][value len][timestamp][expires][key][value]
   read lock and snapshots the write lock, so the WAL is only truncated once every record in it is
   already in the map, and therefore in the snapshot.
 - **Recovery** replays the snapshot and then the WAL, stopping at the first truncated or corrupt
-  record, which is what a crash in the middle of an append leaves behind.
+  record. If nothing intact follows it, it is what a crash in the middle of an append leaves
+  behind, and the WAL is cut back to that point, so new records are never appended behind an
+  unreadable one. If intact records do follow (every place the record magic appears after it is
+  tried), the log is damaged in the middle: the node refuses to start and leaves the file as it
+  is. A snapshot is written whole and renamed into place, so any unreadable record in one is
+  damage. Two earlier versions got this wrong in opposite directions. The first left a torn record
+  in place: writes after the restart were acknowledged, then lost at the next restart, when replay
+  stopped at the torn record before reaching them. The second cut the log at the first bad record
+  wherever it was: one flipped byte early in a log of 1,000 records left the node running with 10
+  of them and deleted the other 990 from disk.
+- **A WAL failure stops the store.** After a failed append the log may end in half a record, and
+  after a failed fsync the kernel may have dropped the pages it could not write, so a later fsync
+  that succeeds proves nothing. Either way the store refuses every further write and `/health`
+  reports 503 until the node is restarted; reads still work.
+- **Renames are made durable.** After a snapshot is renamed into place, and after the member list
+  is, the directory is fsynced, before the WAL is emptied. Otherwise a power cut could leave the
+  old snapshot beside an empty log.
+- A snapshot that cannot be written (a full disk) is retried after 30 seconds, not on every write.
 
 **Memory limit.** Writes that would exceed `TITANKV_MAX_MEMORY_MB` are rejected with an error, after
 purging expired entries. Live data is never evicted, since that would silently lose acknowledged
-writes.
+writes. Deletes, and overwrites no larger than what they replace, are always accepted: they used to
+be refused like any other write, so a full node could not be emptied.
 
-**Expiry.** Expired entries are removed lazily on access and by a cleanup task every minute, which
-also purges tombstones older than the grace period (24 hours by default). A replica that is away
-longer than that and missed a delete could resurrect the key. This is the same trade-off as
-Cassandra's `gc_grace_seconds`.
+**Expiry.** A value whose TTL has run out becomes a tombstone with the same version, as in
+Cassandra: lazily on access, and by a cleanup task every minute. Reads, anti-entropy, snapshots and
+WAL replay all see an expired value as that tombstone, whether or not it has been converted yet.
+The value's memory is released; the key and its version stay. An earlier version removed expired
+entries outright. If a replica had missed the short-lived write, its older version then looked
+newest: a QUORUM read returned a value that an acknowledged write had replaced, and read repair
+copied it back to the other replicas.
+
+The cleanup task also purges tombstones older than the grace period (24 hours by default, counted
+from the delete or from the expiry time). A replica that is away longer than that and missed a
+delete or an expired write could resurrect the key. This is the same trade-off as Cassandra's
+`gc_grace_seconds`. Until then an expired key still costs its key and about 48 bytes.
+
+Each replica judges expiry by its own wall clock, and an expiry tombstone wins the tie with its own
+value. So a TTL ends when the first replica's clock says so: a node whose clock runs fast ends it
+early for the whole cluster, by as much as its clock is ahead. (When expired values simply
+vanished, the fast node dropped only its own copy.)
+
+A write with a TTL that is sent twice with one version, after a failover or on a retried
+connection, gets its expiry from each coordinator's clock. The later expiry wins between such
+copies, as the last step of the version order, so the replicas settle on one. Before that, neither
+copy replaced the other, and anti-entropy exchanged the key on every round without converging.
 
 ## Topology changes
 
@@ -279,13 +379,14 @@ Cassandra's `gc_grace_seconds`.
   which writes each such key to all its current replicas and only then deletes the local copy.
 - **Restart** (after a crash or a graceful shutdown). Peers deliver the node's hints and run a
   Merkle-tree repair with it, which sends only the keys its WAL did not have (all of them if it ran
-  without a WAL).
+  without a WAL). The restarted node sends nothing: the members it rediscovers are not new to the
+  cluster. It used to treat each as a node that had just joined and send it every key they share.
 - **Removal.** `removenode` on a DEAD node changes the ring; anti-entropy fills the new replicas.
 
 ## Testing strategy
 
 - **Unit tests** for the protocol, hash ring, store, WAL recovery (including torn writes and
-  concurrent snapshots), hinted handoff and configuration.
+  concurrent snapshots), hinted handoff, the client connection pool and configuration.
 - **Integration tests** start real clusters of 1–5 nodes inside the JVM, on real sockets.
 - **Chaos test.** Eight writers overwrite 200 keys with increasing versions at QUORUM on a 5-node
   production-mode cluster while nodes restart one at a time: once crashing (no LEAVE), once shutting
@@ -295,6 +396,24 @@ Cassandra's `gc_grace_seconds`.
   and no value appears that was never written. It found three real bugs: sloppy quorums, stale
   connections combined with the circuit breaker, and the seed-restart split brain.
 
+- **Fault injection.** Every node consults a `LinkFilter` before it sends a gossip datagram or a
+  node-to-node request; production nodes use a no-op. In tests a `FaultInjector` cuts links in one
+  or both directions (refusing requests at once, or swallowing them until a timeout) and adds
+  latency, the way Cassandra's in-JVM tests filter messages. `PartitionTest` uses it for a 2 | 3
+  split, an isolated node, a one-way cut and a slow replica. `PartitionChaosTest` runs the chaos
+  workload while a nemesis cycles through isolation, splits, one-way cuts, crashes, and crashes
+  during a partition, and a node cut off and then crashed, once with correct clocks and once with
+  node clocks up to 20 seconds and client clocks up to 15 seconds wrong, and afterwards also
+  requires all three replicas of every key to hold the same version. Clients
+  are not partitioned: they can always reach every node.
+- **What the tests do not show.** Nodes run in one JVM. A "crash" stops a node's threads without
+  losing data the OS had not yet written, so the tests cannot find a missing fsync or directory
+  sync. Tests skew the clocks that issue and check versions (clients' and nodes' hybrid clocks);
+  expiry, tombstone age and gossip freshness read the machine's wall clock directly, which no test
+  skews. The chaos workloads have one writer per key and no deletes or TTLs, so ordering between
+  clients is covered only by the scripted cases in `ClockSkewTest`, not under faults. The fault
+  injector fails a request before it is sent; it cannot lose the reply to a request that was applied.
+
 ## Security summary
 
 | Surface | Protection |
@@ -303,6 +422,7 @@ Cassandra's `gc_grace_seconds`.
 | Internal replica commands | Cluster token (AUTH) and source IP must belong to a cluster member |
 | Admin commands (`removenode`, `cleanup`) | Cluster token |
 | Client commands | Optional client token (`TITANKV_CLIENT_TOKEN`) |
-| Protocol parsing | Magic bytes, length limits (64 KB keys, 16 MB values), incomplete-frame timeout |
+| Protocol parsing | Magic bytes, length limits (64 KB keys, 16 MB values) |
+| Connections | Closed by the selector after 30 seconds without a whole request; at most 10,000 at once |
 
 Token comparison is constant-time. Traffic is not encrypted.

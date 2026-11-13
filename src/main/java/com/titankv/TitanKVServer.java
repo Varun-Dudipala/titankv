@@ -63,7 +63,8 @@ public class TitanKVServer {
         this.store = new InMemoryStore(nodeDataDir(port));
         this.metrics = new MetricsCollector();
         this.shutdownLatch = new CountDownLatch(1);
-        this.clusterManager = new ClusterManager(new Node(this.nodeId, getHostFromId(this.nodeId), port));
+        this.clusterManager = new ClusterManager(new Node(this.nodeId, getHostFromId(this.nodeId), port),
+                membershipFile(store, port));
         this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
@@ -83,6 +84,15 @@ public class TitanKVServer {
     private static Path hintsDir(KVStore store, int port) {
         boolean durable = store instanceof InMemoryStore && ((InMemoryStore) store).isWalEnabled();
         return durable ? nodeDataDir(port).resolve("hints") : null;
+    }
+
+    /**
+     * The member list is saved next to the WAL when the store is durable, so a restarted node
+     * knows the whole ring at once. A node without a WAL keeps nothing across restarts.
+     */
+    private static Path membershipFile(KVStore store, int port) {
+        boolean durable = store instanceof InMemoryStore && ((InMemoryStore) store).isWalEnabled();
+        return durable ? nodeDataDir(port).resolve("members") : null;
     }
 
     /**
@@ -137,7 +147,12 @@ public class TitanKVServer {
         if (seedNodes != null && !seedNodes.isEmpty()) {
             logger.info("Joining cluster via seeds: {}", seedNodes);
         }
-        clusterManager.start(seedNodes);
+        try {
+            clusterManager.start(seedNodes);
+        } catch (IllegalStateException e) {
+            stop();
+            throw new IOException(e.getMessage(), e);
+        }
 
         // Initialize and start metrics HTTP server
         if (store instanceof InMemoryStore) {
@@ -165,6 +180,10 @@ public class TitanKVServer {
         io.micrometer.core.instrument.Gauge.builder("titankv.hints.pending", replicationManager,
                 rm -> rm.getHintedHandoff().totalPendingHints())
                 .description("Writes waiting to be handed off to replicas that missed them")
+                .register(registry);
+        io.micrometer.core.instrument.Gauge.builder("titankv.hints.bytes", replicationManager,
+                rm -> rm.getHintedHandoff().totalPendingHintBytes())
+                .description("Estimated memory held by writes waiting to be handed off")
                 .register(registry);
         io.micrometer.core.instrument.FunctionCounter.builder("titankv.read.repairs", replicationManager,
                 rm -> rm.getReadRepairHandler().getReplicasRepaired())

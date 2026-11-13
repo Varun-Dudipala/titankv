@@ -38,15 +38,24 @@ public class TitanKVClient implements AutoCloseable {
     private static final long CIRCUIT_RESET_TIMEOUT_MS = 5_000;
     // Error a node returns while it is (re)joining the cluster; see ConnectionHandler
     static final String NOT_READY_PREFIX = "Node is joining the cluster";
+    // How often a write that lost to a newer version is sent again with a later one
+    private static final int MAX_STALE_RETRIES = 3;
+    // The furthest ahead of its own wall clock this client lets a version from elsewhere move its
+    // clock. Nodes accept versions up to 60s ahead of theirs, so this leaves half of that for the
+    // difference between this client's clock and a node's.
+    static final long MAX_ADOPT_AHEAD_MS = 30_000;
 
     private final String[] hosts;
     private final ClientConfig config;
     private final ConnectionPool connectionPool;
     private final ConsistentHash hashRing;
     private volatile boolean closed = false;
-    // Newest version timestamp this client has read or written; sent with every write so the
-    // write is ordered after it even if the coordinating node's clock is behind.
-    private final AtomicLong causalContext = new AtomicLong();
+    // This client's hybrid logical clock: the newest version it has issued, read or been told of.
+    // The client, not the coordinating node, chooses each write's version, so it knows the
+    // version of every write it attempted, including ones whose outcome it never learned, and
+    // every later write is ordered after them whichever node coordinates it.
+    private final AtomicLong lastVersion = new AtomicLong();
+    private volatile long clockSkewMillis;
 
     // Circuit breaker state per host
     private final Map<String, CircuitBreaker> circuitBreakers = new ConcurrentHashMap<>();
@@ -255,12 +264,45 @@ public class TitanKVClient implements AutoCloseable {
         if (ttlMillis < 0) {
             throw new IllegalArgumentException("ttlMillis must not be negative");
         }
-        Command command = new Command(Command.PUT, key, value, causalContext.get(), ttlMillis, level);
-        Response response = execute(command, key);
-        if (response.isError()) {
-            throw new IOException("Server error: " + response.getErrorMessage());
+        write(Command.PUT, key, value, ttlMillis, level);
+    }
+
+    /**
+     * Send a PUT or DELETE with a version from this client's clock. If the replicas already hold
+     * a newer version of the key (written by a client whose clock is ahead of this one's, or in
+     * the same millisecond), the write would be acknowledged and then never read back. The node
+     * says so, and the write is sent again with a version after the one it lost to: a write that
+     * starts after another has been acknowledged wins, whatever the two clients' clocks say.
+     * Writes that keep losing are racing other writers, and then last-write-wins picks one.
+     *
+     * @throws IOException if the request fails, or the key holds a version too far ahead of this
+     *                     client's clock to write after (see {@link #adopt})
+     */
+    private void write(byte type, String key, byte[] value, long ttlMillis, ConsistencyLevel level)
+            throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            // One version per attempt: if it fails over to another node, both nodes store the
+            // same version, not two competing ones
+            Response response = execute(new Command(type, key, value, nextVersion(), ttlMillis, level), key);
+            if (response.isError()) {
+                throw new IOException("Server error: " + response.getErrorMessage());
+            }
+            if (response.isStale()) {
+                if (!adopt(response.getTimestamp())) {
+                    throw new IOException("Key '" + key + "' holds a version " + aheadSeconds(response.getTimestamp())
+                            + "s ahead of this client's clock, written by a client whose clock is wrong; "
+                            + "it cannot be overwritten until real time reaches it");
+                }
+                if (attempt < MAX_STALE_RETRIES) {
+                    continue;
+                }
+                // Still superseded after several tries: other writers are writing this key at the
+                // same moment, and between overlapping writes last-write-wins picks one. This
+                // write counts as having happened just before the one that replaced it.
+            }
+            observe(response);
+            return;
         }
-        observe(response);
     }
 
     /**
@@ -293,29 +335,74 @@ public class TitanKVClient implements AutoCloseable {
      */
     public void delete(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(new Command(Command.DELETE, key, null, causalContext.get(), 0, level), key);
-
-        if (response.isError()) {
-            throw new IOException("Server error: " + response.getErrorMessage());
-        }
-        observe(response);
+        write(Command.DELETE, key, null, 0, level);
     }
 
     /**
-     * The newest version timestamp this client has seen. Another client (or process) can pass it to
-     * {@link #observeCausalContext(long)} so its writes are ordered after everything this one saw.
+     * The newest version this client has issued or seen, including the versions of writes that
+     * failed or timed out. Another client (or process) can pass it to
+     * {@link #observeCausalContext(long)} so its writes are ordered after everything this one
+     * did and saw.
      */
     public long getCausalContext() {
-        return causalContext.get();
+        return lastVersion.get();
     }
 
-    public void observeCausalContext(long timestamp) {
-        causalContext.accumulateAndGet(timestamp, Math::max);
+    /**
+     * @return false if the version is too far ahead of this client's clock to be adopted
+     *         (see {@link #adopt})
+     */
+    public boolean observeCausalContext(long timestamp) {
+        return adopt(timestamp);
     }
 
+    /**
+     * Move this client's clock past a version from elsewhere, unless that version is more than
+     * {@value #MAX_ADOPT_AHEAD_MS} ms ahead of this client's wall clock. Adopting whatever a node
+     * returns let one client with a fast clock pull every node and client forward with it: a
+     * client 58s ahead wrote a key, a correct client read it, and from then on that client's
+     * writes to any key were refused by every node whose own clock ran a few seconds slow.
+     */
+    private boolean adopt(long version) {
+        if (version <= 0) {
+            return true;
+        }
+        long wallClock = System.currentTimeMillis() + clockSkewMillis;
+        if (com.titankv.util.HybridLogicalClock.physicalMillis(version) > wallClock + MAX_ADOPT_AHEAD_MS) {
+            return false;
+        }
+        lastVersion.accumulateAndGet(version, Math::max);
+        return true;
+    }
+
+    private long aheadSeconds(long version) {
+        return (com.titankv.util.HybridLogicalClock.physicalMillis(version)
+                - (System.currentTimeMillis() + clockSkewMillis)) / 1000;
+    }
+
+    /**
+     * Fault injection for tests: shift this client's view of wall time.
+     */
+    public void setClockSkewMillis(long clockSkewMillis) {
+        this.clockSkewMillis = clockSkewMillis;
+    }
+
+    /**
+     * @return a version greater than every version this client has issued or seen: the wall clock,
+     *         or one more than the last version if the wall clock is not past it
+     */
+    private long nextVersion() {
+        long physical = com.titankv.util.HybridLogicalClock.encode(System.currentTimeMillis() + clockSkewMillis);
+        return lastVersion.updateAndGet(previous -> Math.max(previous + 1, physical));
+    }
+
+    /**
+     * Advance this client's clock past a version a node returned: the version of a value read,
+     * or, after a write, the newest version that node has seen.
+     */
     private void observe(Response response) {
-        if (response.isOk() && response.getTimestamp() > 0) {
-            causalContext.accumulateAndGet(response.getTimestamp(), Math::max);
+        if (response.isOk()) {
+            adopt(response.getTimestamp());
         }
     }
 
@@ -327,9 +414,10 @@ public class TitanKVClient implements AutoCloseable {
      * @param value     the value
      * @param timestamp the authoritative timestamp for conflict resolution
      * @param expiresAt the expiration timestamp (0 = no expiration)
+     * @return 0 if the replica stored this version, otherwise the newer version it kept instead
      * @throws IOException if the request fails
      */
-    public void putInternal(String key, byte[] value, long timestamp, long expiresAt) throws IOException {
+    public long putInternal(String key, byte[] value, long timestamp, long expiresAt) throws IOException {
         validateKey(key);
         Command internalPut = new Command(Command.PUT_INTERNAL, key, value, timestamp, expiresAt);
         Response response = execute(internalPut, key);
@@ -337,6 +425,7 @@ public class TitanKVClient implements AutoCloseable {
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
+        return response.isStale() ? response.getTimestamp() : 0;
     }
 
     /**
@@ -348,9 +437,10 @@ public class TitanKVClient implements AutoCloseable {
      * @param key       the key to delete
      * @param timestamp the authoritative timestamp for conflict resolution
      * @param expiresAt the expiration timestamp (0 = no expiration)
+     * @return 0 if the replica stored the tombstone, otherwise the newer version it kept instead
      * @throws IOException if the request fails
      */
-    public void deleteInternal(String key, long timestamp, long expiresAt) throws IOException {
+    public long deleteInternal(String key, long timestamp, long expiresAt) throws IOException {
         validateKey(key);
         Command internalDelete = new Command(Command.DELETE_INTERNAL, key, null, timestamp, expiresAt);
         Response response = execute(internalDelete, key);
@@ -358,6 +448,7 @@ public class TitanKVClient implements AutoCloseable {
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
+        return response.isStale() ? response.getTimestamp() : 0;
     }
 
     /**

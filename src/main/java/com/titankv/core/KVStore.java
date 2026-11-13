@@ -53,11 +53,28 @@ public interface KVStore {
      *
      * @param key       the key
      * @param value     the value, or null to write a tombstone
-     * @param timestamp the version timestamp assigned by the coordinator
+     * @param timestamp the write's version
      * @param expiresAt absolute expiration time in epoch millis (0 = never)
      * @return true if the value was stored, false if the existing entry is newer
      */
     boolean putIfNewer(String key, byte[] value, long timestamp, long expiresAt);
+
+    /**
+     * Store a value with an explicit version, and say whether it lost to a newer one.
+     *
+     * @return 0 if this version is now stored (or already was), otherwise the version of the
+     *         newer entry that the store kept instead
+     */
+    default long putOrSuperseded(String key, byte[] value, long timestamp, long expiresAt) {
+        if (putIfNewer(key, value, timestamp, expiresAt)) {
+            return 0;
+        }
+        return getRaw(key)
+                .filter(current -> KeyValuePair.compareVersions(current.getTimestamp(), current.getValueUnsafe(),
+                        timestamp, value) > 0)
+                .map(KeyValuePair::getTimestamp)
+                .orElse(0L);
+    }
 
     /**
      * Delete a key-value pair.
