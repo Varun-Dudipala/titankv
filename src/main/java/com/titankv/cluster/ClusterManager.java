@@ -31,11 +31,22 @@ public class ClusterManager {
     private final Map<String, Long> shutdownGenerations = new ConcurrentHashMap<>();
     private final HybridLogicalClock clock = new HybridLogicalClock();
 
+    // How long a node restarted with a saved membership waits to hear from a peer before it
+    // serves on what it saved
+    static final long SAVED_MEMBERSHIP_GRACE_MS = 5_000;
+
+    private final java.nio.file.Path membershipFile; // null: membership is not saved
+    private final Object membershipFileLock = new Object();
     private GossipProtocol gossipProtocol;
     private volatile LinkFilter linkFilter = LinkFilter.NONE;
     private volatile boolean running;
     private volatile boolean seedsConfigured;
-    private volatile boolean membershipLearned;
+    private volatile int seedCount;
+    private volatile long startedAtNanos;
+    // This node restarted with the membership it had saved
+    private volatile boolean savedMembership;
+    // A peer whose own membership was complete has sent this node its whole member list
+    private volatile boolean learnedFromPeer;
 
     /**
      * Create a new cluster manager.
@@ -53,8 +64,29 @@ public class ClusterManager {
      * @param clusterSecret optional cluster secret for gossip authentication (null to disable)
      */
     public ClusterManager(Node localNode, String clusterSecret) {
+        this(localNode, clusterSecret, null);
+    }
+
+    /**
+     * Create a cluster manager that saves its membership, with the cluster secret from the
+     * environment.
+     *
+     * @param membershipFile where to save the member list, and load it from on a restart
+     */
+    public ClusterManager(Node localNode, java.nio.file.Path membershipFile) {
+        this(localNode, getDefaultClusterSecret(), membershipFile);
+    }
+
+    /**
+     * @param localNode      the local node
+     * @param clusterSecret  optional cluster secret for gossip authentication (null to disable)
+     * @param membershipFile where to save the member list and load it from on a restart, or null
+     *                       to keep it in memory only
+     */
+    public ClusterManager(Node localNode, String clusterSecret, java.nio.file.Path membershipFile) {
         this.localNode = localNode;
         this.clusterSecret = clusterSecret;
+        this.membershipFile = membershipFile;
         this.hashRing = new ConsistentHash();
         this.nodes = new ConcurrentHashMap<>();
         this.eventListeners = new CopyOnWriteArrayList<>();
@@ -69,6 +101,7 @@ public class ClusterManager {
         localNode.setStatus(Node.Status.ALIVE);
         nodes.put(localNode.getId(), localNode);
         hashRing.addNode(localNode);
+        loadMembership();
 
         if (clusterSecret != null && !clusterSecret.isEmpty()) {
             logger.info("Gossip authentication enabled with cluster secret");
@@ -98,15 +131,77 @@ public class ClusterManager {
     }
 
     /**
+     * Restore the members and removed nodes this node knew before it restarted. Members come
+     * back as DEAD, on the ring, until gossip hears from them: the ring is whole from the first
+     * moment, whoever happens to be up.
+     */
+    private void loadMembership() {
+        if (membershipFile == null) {
+            return;
+        }
+        MembershipFile.Contents saved;
+        try {
+            saved = MembershipFile.load(membershipFile);
+        } catch (java.io.IOException e) {
+            logger.warn("Ignoring saved membership, it will be learned from peers again: {}", e.getMessage());
+            return;
+        }
+        if (saved == null) {
+            return;
+        }
+        departedGenerations.putAll(saved.removed());
+        for (MembershipFile.Member member : saved.members()) {
+            if (member.id().equals(localNode.getId()) || nodes.containsKey(member.id())) {
+                continue;
+            }
+            Node node = new Node(member.id(), member.host(), member.port());
+            node.advanceHeartbeat(member.generation(), 0);
+            node.setStatus(Node.Status.DEAD);
+            nodes.put(node.getId(), node);
+            hashRing.addNode(node);
+        }
+        savedMembership = true;
+        logger.info("Restored {} cluster members and {} removed nodes from {}", nodes.size() - 1,
+                saved.removed().size(), membershipFile.toAbsolutePath());
+    }
+
+    /**
+     * Save the member list after it changed. A failure is logged, not thrown: the node keeps
+     * working, and would only have to learn the membership from its peers after a restart.
+     */
+    private void saveMembership() {
+        if (membershipFile == null) {
+            return;
+        }
+        synchronized (membershipFileLock) {
+            List<MembershipFile.Member> members = new ArrayList<>();
+            for (Node node : nodes.values()) {
+                if (!node.equals(localNode)) {
+                    members.add(new MembershipFile.Member(node.getId(), node.getHost(), node.getPort(),
+                            node.getGeneration()));
+                }
+            }
+            try {
+                MembershipFile.save(membershipFile, new MembershipFile.Contents(members,
+                        new HashMap<>(departedGenerations)));
+            } catch (java.io.IOException | RuntimeException e) {
+                logger.warn("Failed to save cluster membership to {}: {}", membershipFile, e.getMessage());
+            }
+        }
+    }
+
+    /**
      * Start the cluster manager.
      *
      * @param seedNodes comma-separated list of seed node addresses
+     * @throws IllegalStateException if the gossip port cannot be opened
      */
     public void start(String seedNodes) {
         if (running) {
             return;
         }
         running = true;
+        startedAtNanos = System.nanoTime();
 
         gossipProtocol = new GossipProtocol(localNode, this, clusterSecret);
 
@@ -126,8 +221,14 @@ public class ClusterManager {
             }
         }
         seedsConfigured = !seeds.isEmpty();
+        seedCount = seeds.size();
         gossipProtocol.setSeeds(seeds);
-        gossipProtocol.start();
+        try {
+            gossipProtocol.start();
+        } catch (RuntimeException e) {
+            running = false; // without gossip this node could neither join nor be found
+            throw e;
+        }
 
         // Start health check task
         scheduler.scheduleAtFixedRate(this::checkHealth,
@@ -194,12 +295,16 @@ public class ClusterManager {
         if (node.getStatus() == Node.Status.JOINING) {
             node.setStatus(Node.Status.ALIVE);
         }
+        // If this node already knew the whole membership, the node is new to the cluster.
+        // Otherwise this node is the one catching up, on members that were there all along.
+        boolean newToCluster = hasCompleteMembership();
         node.updateHeartbeat();
         departedGenerations.remove(node.getId());
         nodes.put(node.getId(), node);
         hashRing.addNode(node); // down members are replicas too (strict quorum)
+        saveMembership();
 
-        fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_JOINED, node));
+        fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_JOINED, node, newToCluster));
         logger.info("Node {} joined the cluster", node.getId());
     }
 
@@ -217,6 +322,7 @@ public class ClusterManager {
         if (removed != null) {
             departedGenerations.put(removed.getId(), removed.getGeneration());
             hashRing.removeNode(removed);
+            saveMembership();
             fireEvent(new ClusterEvent(ClusterEvent.Type.NODE_LEFT, removed));
             logger.info("Node {} left the cluster", node.getId());
         }
@@ -256,7 +362,20 @@ public class ClusterManager {
         if (node != null && node.getGeneration() <= generation) {
             removeNode(node);
         }
-        departedGenerations.merge(nodeId, generation, Math::max);
+        Long known = departedGenerations.get(nodeId);
+        if (known == null || known < generation) {
+            departedGenerations.merge(nodeId, generation, Math::max);
+            saveMembership();
+        }
+    }
+
+    /**
+     * The nodes removed from the cluster, with the generation each had when it was removed.
+     * Gossiped with every digest, so a node that was down or cut off when a node was removed
+     * still learns of it.
+     */
+    Map<String, Long> getRemovedNodes() {
+        return Collections.unmodifiableMap(departedGenerations);
     }
 
     /**
@@ -468,24 +587,45 @@ public class ClusterManager {
 
     /**
      * Whether this node may serve client requests. A node started with seeds belongs to a cluster,
-     * so until it has learned the cluster's membership from a peer it must not serve: as a one-node
-     * cluster it would accept writes with a single copy, and with a partial ring it would send keys
-     * to the wrong replicas.
+     * so it must not serve until it knows the cluster's whole membership: as a one-node cluster it
+     * would accept writes with a single copy, and with a partial ring it would send keys to the
+     * wrong replicas. It knows the membership once one of these holds:
+     * <ul>
+     *   <li>a peer that itself has the complete membership has sent its whole member list;</li>
+     *   <li>it restarted with a saved membership and {@value #SAVED_MEMBERSHIP_GRACE_MS} ms have
+     *       passed without such a peer answering (the rest of the cluster may be down; what it
+     *       saved was complete when it stopped);</li>
+     *   <li>it has nothing saved and every seed has joined: a new cluster forming, where the
+     *       seed list is the membership.</li>
+     * </ul>
      */
     public boolean isReady() {
-        return running && (!seedsConfigured || membershipLearned);
+        if (!running) {
+            return false;
+        }
+        if (!seedsConfigured || learnedFromPeer) {
+            return true;
+        }
+        if (savedMembership) {
+            return System.nanoTime() - startedAtNanos >= TimeUnit.MILLISECONDS.toNanos(SAVED_MEMBERSHIP_GRACE_MS);
+        }
+        return nodes.size() > seedCount;
     }
 
     /**
-     * Called when a peer's membership digest has been applied. Hearing from one member is not
-     * enough to serve: until the full membership is known, this node's ring may miss replicas.
+     * Whether another node may take this node's member list as the whole membership. A node
+     * that has only begun to learn it says no, so two nodes starting at the same time cannot
+     * convince each other that the two of them are the cluster.
      */
-    void membershipLearned() {
-        membershipLearned = true;
+    public boolean hasCompleteMembership() {
+        return !seedsConfigured || learnedFromPeer || savedMembership || nodes.size() > seedCount;
     }
 
-    boolean hasLearnedMembership() {
-        return membershipLearned;
+    /**
+     * Called when the whole member list of a peer with complete membership has been applied.
+     */
+    void learnedFromPeer() {
+        learnedFromPeer = true;
     }
 
     /**
@@ -511,11 +651,25 @@ public class ClusterManager {
         private final Type type;
         private final Node node;
         private final long timestamp;
+        private final boolean newToCluster;
 
         public ClusterEvent(Type type, Node node) {
+            this(type, node, false);
+        }
+
+        public ClusterEvent(Type type, Node node, boolean newToCluster) {
             this.type = type;
             this.node = node;
             this.timestamp = System.currentTimeMillis();
+            this.newToCluster = newToCluster;
+        }
+
+        /**
+         * For NODE_JOINED: whether the node is new to the cluster, as opposed to an existing
+         * member this node has only now learned of because it is itself starting up.
+         */
+        public boolean isNewToCluster() {
+            return newToCluster;
         }
 
         public Type getType() {

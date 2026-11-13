@@ -43,7 +43,7 @@ public class VirtualNode {
      * @return the hash key string
      */
     public String getHashKey() {
-        return physicalNode.getHashKey() + "#" + replicaIndex;
+        return physicalNode.getId() + "#" + replicaIndex;
     }
 
     /**

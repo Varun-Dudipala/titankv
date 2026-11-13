@@ -86,6 +86,72 @@ class MembershipTest {
         }
     }
 
+    /**
+     * Nodes that keep nothing on disk and restart at the same moment must not take each other's
+     * word for the membership: neither knows it. They wait until every seed is back.
+     */
+    @Test
+    void nodesRestartedTogetherWithNothingSavedWaitForTheWholeCluster() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 40, 5)) {
+            for (int i = 0; i < 5; i++) {
+                cluster.crashNode(i);
+            }
+            ClusterManager first = cluster.startNode(0).getClusterManager();
+            ClusterManager second = cluster.startNode(1).getClusterManager();
+
+            TestCluster.awaitCondition(() -> first.getNodeCount() == 2 && second.getNodeCount() == 2,
+                    10_000, "the two restarted nodes to find each other");
+            Thread.sleep(2_500); // several gossip rounds
+            assertThat(first.isReady()).as("ready knowing 2 of 5 members").isFalse();
+            assertThat(second.isReady()).as("ready knowing 2 of 5 members").isFalse();
+            assertThat(first.hasCompleteMembership()).isFalse();
+            try (com.titankv.TitanKVClient client = cluster.client(cluster.address(0), cluster.address(1))) {
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> client.put("too-early", "value"))
+                        .isInstanceOf(java.io.IOException.class).hasMessageContaining("joining the cluster");
+            }
+
+            for (int i = 2; i < 5; i++) {
+                cluster.startNode(i);
+            }
+            cluster.awaitConverged(30_000);
+            for (int i = 0; i < 5; i++) {
+                assertThat(cluster.node(i).getClusterManager().getHashRing().getNodeCount()).isEqualTo(5);
+            }
+        }
+    }
+
+    /**
+     * A node that was cut off while a dead node was removed must still drop it. The removal is
+     * announced three times over UDP, which a partitioned node never receives; it used to keep
+     * the removed node on its ring for good and place keys differently from everyone else.
+     */
+    @Test
+    void removalReachesANodeThatWasCutOffWhenItHappened() throws Exception {
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 50, 4)) {
+            String removedId = cluster.node(3).getNodeId();
+            cluster.crashNode(3);
+            TestCluster.awaitCondition(() -> allOthersSee(cluster, 3, removedId, Node.Status.DEAD),
+                    20_000, "peers to mark " + removedId + " DEAD");
+
+            cluster.isolate(2);
+            try (com.titankv.TitanKVClient admin = cluster.client(cluster.address(0))) {
+                admin.removeClusterNode(removedId);
+            }
+            TestCluster.awaitCondition(() -> cluster.node(1).getClusterManager().getNode(removedId) == null,
+                    10_000, "the removal to reach the connected node");
+            Thread.sleep(3_500); // all three announcements have been sent, and dropped by the partition
+            assertThat(cluster.node(2).getClusterManager().getNode(removedId)).isNotNull();
+
+            cluster.heal();
+            TestCluster.awaitCondition(() -> cluster.node(2).getClusterManager().getNode(removedId) == null,
+                    15_000, "the node that was cut off to learn of the removal");
+            for (int i = 0; i < 3; i++) {
+                assertThat(cluster.node(i).getClusterManager().getHashRing().getNodeCount())
+                        .as("ring size on node " + (i + 1)).isEqualTo(3);
+            }
+        }
+    }
+
     private static boolean allOthersSee(TestCluster cluster, int excluded, String nodeId, Node.Status status) {
         for (int i = 0; i < cluster.size(); i++) {
             if (i == excluded) {

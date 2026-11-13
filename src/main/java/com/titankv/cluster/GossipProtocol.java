@@ -32,9 +32,16 @@ import java.util.concurrent.atomic.AtomicLong;
  *   JOIN:    header [host:str][port:4][generation:8][version:8]
  *   LEAVE:   header                                     (the sender is shutting down)
  *   REMOVE:  header [removed id:str][removed generation:8]   (an operator removed a dead node)
- *   DIGEST:  header [count:4] then per member [id:str][host:str][port:4][status:1][generation:8][version:8]
+ *   DIGEST:  header [flags:1]
+ *                   [removed count:2] then per removed node [id:str][generation:8]
+ *                   [count:4] then per member [id:str][host:str][port:4][status:1][generation:8][version:8]
  * where str is [length:2][UTF-8 bytes]. sentAt strictly increases per sender, which lets the
  * receiver reject replayed packets.
+ *
+ * Digest flags: COMPLETE means the sender knows the cluster's whole membership, and ALL_MEMBERS
+ * that this packet lists all of it. Only a digest with both lets a node that is still learning
+ * the membership start serving. A digest also repeats the nodes that were removed: REMOVE is
+ * sent three times and can miss a node that is down, while digests keep coming.
  */
 public class GossipProtocol {
 
@@ -53,6 +60,9 @@ public class GossipProtocol {
     private static final int HMAC_SIZE = 32;
     private static final int MAX_STRING_LENGTH = 1024;
     private static final int MAX_MEMBERS_COUNT = 1000;
+    private static final int MAX_REMOVED_PER_DIGEST = 16;
+    private static final byte FLAG_COMPLETE = 0x01;
+    private static final byte FLAG_ALL_MEMBERS = 0x02;
     private static final String HMAC_ALGORITHM = "HmacSHA256";
     private static final long MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
     private static final long MAX_MESSAGE_FUTURE_MS = 60 * 1000;
@@ -66,6 +76,7 @@ public class GossipProtocol {
     private final AtomicLong lastSentAt = new AtomicLong();
     private final ConcurrentHashMap<String, Long> lastReceivedAt = new ConcurrentHashMap<>();
     private volatile List<Node> seeds = List.of();
+    private volatile boolean digestReceived;
 
     private DatagramSocket socket;
     private ExecutorService receiver;
@@ -107,6 +118,10 @@ public class GossipProtocol {
         this.seeds = List.copyOf(seeds);
     }
 
+    /**
+     * @throws IllegalStateException if the gossip port cannot be opened. The node must not carry
+     *                               on without it: it could not join the cluster or be found.
+     */
     public void start() {
         if (running) {
             return;
@@ -115,8 +130,7 @@ public class GossipProtocol {
             socket = new DatagramSocket(gossipPort);
             socket.setSoTimeout(500);
         } catch (SocketException e) {
-            logger.error("Failed to start gossip on port {}: {}", gossipPort, e.getMessage());
-            return;
+            throw new IllegalStateException("Cannot open gossip port " + gossipPort + ": " + e.getMessage(), e);
         }
         running = true;
 
@@ -259,11 +273,24 @@ public class GossipProtocol {
     }
 
     /**
-     * Digest of member heartbeats. The local node always comes first; others are shuffled so
-     * that when a large cluster does not fit in one packet, each round carries a different subset.
+     * Digest of member heartbeats, and of removed nodes. The local node always comes first;
+     * others are shuffled so that when a large cluster does not fit in one packet, each round
+     * carries a different subset (and the packet says it is not the whole membership).
      */
     private ByteBuffer createDigest() {
         ByteBuffer buffer = newMessage(MSG_DIGEST);
+        int flagsPosition = buffer.position();
+        buffer.put((byte) 0);
+
+        List<Map.Entry<String, Long>> removed = new ArrayList<>(clusterManager.getRemovedNodes().entrySet());
+        Collections.shuffle(removed, ThreadLocalRandom.current());
+        removed = removed.subList(0, Math.min(MAX_REMOVED_PER_DIGEST, removed.size()));
+        buffer.putShort((short) removed.size());
+        for (Map.Entry<String, Long> entry : removed) {
+            writeString(buffer, entry.getKey());
+            buffer.putLong(entry.getValue());
+        }
+
         int countPosition = buffer.position();
         buffer.putInt(0);
 
@@ -294,6 +321,14 @@ public class GossipProtocol {
             }
         }
         buffer.putInt(countPosition, count);
+        byte flags = 0;
+        if (clusterManager.hasCompleteMembership()) {
+            flags |= FLAG_COMPLETE;
+        }
+        if (count == members.size()) {
+            flags |= FLAG_ALL_MEMBERS;
+        }
+        buffer.put(flagsPosition, flags);
         return buffer;
     }
 
@@ -374,8 +409,9 @@ public class GossipProtocol {
                     clusterManager.markShutdown(senderId);
                     break;
                 case MSG_DIGEST:
-                    boolean firstDigest = !clusterManager.hasLearnedMembership();
+                    boolean firstDigest = !digestReceived;
                     handleDigest(buffer);
+                    digestReceived = true;
                     Node sender = clusterManager.getNode(senderId);
                     if (firstDigest && sender != null) {
                         // Answer with ours, so a peer that has only seen our JOIN learns the
@@ -413,9 +449,25 @@ public class GossipProtocol {
     }
 
     private void handleDigest(ByteBuffer buffer) {
+        byte flags = buffer.get();
+        int removedCount = buffer.getShort();
+        if (removedCount < 0 || removedCount > MAX_MEMBERS_COUNT) {
+            throw new IllegalArgumentException("Invalid removed-node count: " + removedCount);
+        }
+        for (int i = 0; i < removedCount; i++) {
+            String removedId = readString(buffer);
+            long removedGeneration = buffer.getLong();
+            if (!removedId.equals(localNode.getId())) {
+                clusterManager.markRemoved(removedId, removedGeneration);
+            }
+        }
         handleMembers(buffer);
-        // A digest lists the sender's whole membership, so this node now knows the ring
-        clusterManager.membershipLearned();
+        // Only the whole member list of a sender that itself knows the whole membership means
+        // this node knows the ring. Taking any digest as the membership let two nodes that were
+        // both starting up tell each other that the two of them were the cluster.
+        if ((flags & FLAG_COMPLETE) != 0 && (flags & FLAG_ALL_MEMBERS) != 0) {
+            clusterManager.learnedFromPeer();
+        }
     }
 
     private void handleMembers(ByteBuffer buffer) {

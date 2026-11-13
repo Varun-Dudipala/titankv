@@ -140,9 +140,10 @@ With replication factor 3:
 | A node shuts down (SIGTERM, rolling restart) | It tells its peers, which mark it DEAD at once. It stays a replica of its keys (a shutdown is not a decommission), so its writes become hints until it is back. |
 | It comes back | Gossip sees a newer heartbeat and hints are delivered; if the process restarted, an immediate Merkle-tree repair sends it only the keys it is missing; read repair fixes anything else it serves. |
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
-| A node is gone for good | `removenode <id>` drops it cluster-wide; anti-entropy re-replicates its keys to their new replicas. |
+| A node is gone for good | `removenode <id>` drops it cluster-wide; nodes that were down or cut off at the time learn of it from later gossip. Anti-entropy re-replicates its keys to their new replicas. |
 | A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
-| A restarted node has not learned the membership yet | It rejects client requests (`/ready` is 503) until a peer's digest has given it every member, down ones included, rather than serving with a partial ring. |
+| A node restarts | It has its saved member list at once, down members included, and rejects client requests (`/ready` is 503) until a peer that knows the whole membership confirms it, or 5 seconds pass with no peer up. A node with nothing saved waits for such a peer, or for every seed. |
+| The whole cluster stops and only some nodes return | They know the full ring from disk, so they refuse QUORUM for keys whose replicas are still down instead of accepting them onto the wrong nodes. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
 | Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and cuts a torn final record off the log. |
 | Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. |
@@ -161,7 +162,7 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_INTERNAL_TOKEN` | cluster secret | Token for node-to-node and admin commands |
 | `TITANKV_READ_CONSISTENCY` / `_WRITE_` / `_DELETE_` | `QUORUM` | Default level for requests that do not choose one |
 | `TITANKV_SPECULATIVE_RETRY_MS` | `50` | Also ask a spare replica when one has not answered a read by then; `0` disables |
-| `TITANKV_DATA_DIR` | `data` | WAL, snapshots and hints go in `<dir>/node-<port>` |
+| `TITANKV_DATA_DIR` | `data` | WAL, snapshots, hints and the saved member list go in `<dir>/node-<port>` |
 | `TITANKV_WAL_ENABLED` | on unless dev mode | Write-ahead log |
 | `TITANKV_WAL_FSYNC` | `true` | fsync before acknowledging a write (group-committed) |
 | `TITANKV_WAL_MAX_MB` | `128` | WAL size that triggers a snapshot |
@@ -247,8 +248,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 179 unit tests
-mvn verify     # + 67 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 187 unit tests
+mvn verify     # + 72 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -259,8 +260,10 @@ The integration suite includes:
 - production mode (auth, signed gossip, fsynced WAL), 32 concurrent clients with read-your-writes checks
 - QUORUM with one and two replicas down, per-request ONE when QUORUM is impossible, node and client
   clocks that are wrong, concurrent writes with equal versions
-- gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode`, join + `cleanup`,
-  admin commands requiring the cluster token
+- gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode` (also
+  reaching a node that was cut off at the time), join + `cleanup`, admin commands requiring the cluster token
+- restarts with saved membership: a full stop after which only two of five nodes return, a node
+  that returns alone, and nodes with nothing saved restarting together
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
 - **Network faults**, injected between nodes: a 2 | 3 partition (each side serves exactly the keys it
   holds a quorum of, and refuses the rest), an isolated node, a link cut in one direction, a replica
@@ -286,7 +289,13 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
 - **Snapshots pause writes** while all entries are written out (when the WAL passes 128 MB).
 - **Hints are not fsynced**; a coordinator crash can lose some, which anti-entropy then repairs.
 - **Gossip digests fit in one UDP packet** (about 30 members with short node IDs; larger clusters
-  send a rotating subset each round).
+  send a rotating subset each round). A node with nothing saved only trusts a digest that lists
+  the whole membership, so a brand-new node cannot join a cluster too large for one packet.
+- **A new cluster needs every seed once.** Until a member list has been saved, a node serves only
+  when it has learned as many members as it has seeds, so list every initial node as a seed and
+  start them all. Nodes without a WAL (dev mode) save nothing and need this after every full stop.
+- **Node ids are identities.** Ring positions come from the node id (`--node-id`, by default
+  `hostname:port`), so a node must keep its id across restarts.
 - Traffic is not encrypted (no TLS).
 
 ## License

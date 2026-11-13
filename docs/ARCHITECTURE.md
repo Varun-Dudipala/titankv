@@ -24,7 +24,9 @@ node can serve any request.
 ## Data placement
 
 `ConsistentHash` places 150 virtual nodes per physical node on a 64-bit ring (MurmurHash3 of
-`host:port#i` in a `ConcurrentSkipListMap`). A key's **replicas** are the first 3 distinct nodes
+`<node id>#i` in a `ConcurrentSkipListMap`). Positions come from the node's id, not its address:
+the id is the same on every node and survives a change of IP. They used to come from the resolved
+IP, so a container that came back with another address silently took over different ranges. A key's **replicas** are the first 3 distinct nodes
 clockwise from the key's hash. Adding or removing a node moves about 1/N of the keys, and virtual
 nodes spread that movement across all nodes.
 
@@ -236,14 +238,27 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
   anti-entropy repair with it.
 - **Every member is on the ring, up or down.** A node adopts every member a digest lists, including
   ones reported down (as DEAD), because a down member is still a replica of its keys.
+- **Saved membership.** A node with a WAL also saves its member list, and the nodes that were
+  removed, to `<data dir>/node-<port>/members` (checksummed, replaced atomically) whenever the
+  list changes. On restart every saved member is back on the ring at once, marked DEAD until gossip
+  hears from it. The ring is whole from the first moment, whoever happens to be up.
 - **Readiness.** A node started with seeds rejects client requests, and `/ready` reports 503, until
-  it has applied a peer's full membership digest. A node that receives its first digest answers with
-  its own, so the peer it joined through is synced at once too. Without this gate, a restarted node
-  would act as a one-node cluster and acknowledge writes with a single copy, as the chaos test found
-  when a seed node restarted. A weaker gate ("knows one other member") also failed: a restarted node
-  served with a partial ring, missing members that were down, and sent their keys to the wrong
-  replicas. The chaos test's stale-read check caught that on a slow CI runner, and
-  `MembershipTest` now reproduces it.
+  it knows the whole membership. Every digest says whether its sender knows the whole membership
+  and whether the packet lists all of it. A node is ready when one of these holds:
+  - a digest with both flags has been applied;
+  - it restarted with a saved membership and 5 seconds have passed without such a digest (its
+    peers may all be down; what it saved was complete when it stopped);
+  - it has nothing saved and has learned as many members as it has seeds: a new cluster forming,
+    where the seed list is the membership.
+
+  Three weaker gates each failed. With none, a restarted node acted as a one-node cluster and
+  acknowledged writes with a single copy, as the chaos test found when a seed node restarted.
+  "Knows one other member" let a restarted node serve with a partial ring, missing members that
+  were down; the chaos test's stale-read check caught that on a slow CI runner. "Has applied any
+  digest" let two nodes that restarted together take each other's two-node view for the cluster:
+  after a full stop of five nodes, the first two back reported ready and acknowledged QUORUM
+  writes for keys whose three replicas were all still down. `MembershipTest` and
+  `SavedMembershipTest` reproduce the last two.
 - **Shutting down is not leaving.** On graceful shutdown a node broadcasts LEAVE. Its peers mark it
   DEAD at once instead of after 10 seconds, but it stays a member and stays on the ring, as in
   Cassandra: a shutdown is usually a restart, and taking the node off the ring would give its keys
@@ -253,8 +268,11 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
   then believed it had lost its seeds and refused every request, even at ONE.
 - **Removal.** An operator removes a dead node for good with `removenode`: the coordinating node
   removes it and gossips REMOVE to every member three times. The removed generation is remembered,
-  so stale digests cannot re-add the node, while a restart (newer generation) can. Hints held for it
-  are dropped.
+  saved, and repeated in every digest (16 removed nodes per packet, in rotation), so stale digests
+  cannot re-add the node, while a restart (newer generation) can. Hints held for it are dropped.
+  The three REMOVE messages alone were not enough: a node that was down or partitioned for those
+  two seconds never heard of the removal, kept the node on its ring, and placed keys differently
+  from everyone else. `MembershipTest` cuts a node off during a removal and requires it to catch up.
 - **Clocks.** Silence is measured with `System.nanoTime()`, so an NTP step of the wall clock cannot
   make every peer look dead at once.
 
@@ -313,7 +331,8 @@ delete or an expired write could resurrect the key. This is the same trade-off a
   which writes each such key to all its current replicas and only then deletes the local copy.
 - **Restart** (after a crash or a graceful shutdown). Peers deliver the node's hints and run a
   Merkle-tree repair with it, which sends only the keys its WAL did not have (all of them if it ran
-  without a WAL).
+  without a WAL). The restarted node sends nothing: the members it rediscovers are not new to the
+  cluster. It used to treat each as a node that had just joined and send it every key they share.
 - **Removal.** `removenode` on a DEAD node changes the ring; anti-entropy fills the new replicas.
 
 ## Testing strategy
