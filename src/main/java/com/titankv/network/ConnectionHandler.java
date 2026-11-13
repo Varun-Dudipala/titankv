@@ -674,10 +674,20 @@ public class ConnectionHandler {
 
         if (isDistributed()) {
             return replicated(replicationManager.write(command.getKey(), command.getValueUnsafe(), timestamp,
-                    expiresAt, level(command, writeConsistency)), "Write", command.getKey(), ok -> written);
+                    expiresAt, level(command, writeConsistency)), "Write", command.getKey(),
+                    newer -> acknowledge(written, newer));
         }
-        store.putIfNewer(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt);
-        return done(written);
+        return done(acknowledge(written,
+                store.putOrSuperseded(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt)));
+    }
+
+    /**
+     * The reply to a write the replicas have taken: OK, or STALE with the newer version if one of
+     * them already held a newer version of the key. Without this a write behind a newer version
+     * is acknowledged and never read back, and its client cannot tell.
+     */
+    private static Response acknowledge(Response ok, long newerVersion) {
+        return newerVersion > 0 ? Response.stale(newerVersion) : ok;
     }
 
     /**
@@ -721,14 +731,14 @@ public class ConnectionHandler {
             return Response.error("Timestamp required for internal PUT");
         }
         clock().observe(command.getTimestamp());
-        boolean written = store.putIfNewer(
+        long newer = store.putOrSuperseded(
                 command.getKey(),
                 command.getValueUnsafe(),
                 command.getTimestamp(),
                 command.getExpiresAt());
         logger.trace("PUT_INTERNAL {}: key={}, timestamp={}",
-                written ? "accepted" : "rejected (stale)", command.getKey(), command.getTimestamp());
-        return Response.ok();
+                newer == 0 ? "accepted" : "superseded", command.getKey(), command.getTimestamp());
+        return acknowledge(Response.ok(), newer);
     }
 
     private CompletableFuture<Response> handleDelete(Command command) {
@@ -744,10 +754,9 @@ public class ConnectionHandler {
 
         if (isDistributed()) {
             return replicated(replicationManager.delete(command.getKey(), timestamp, 0, level(command, deleteConsistency)),
-                    "Delete", command.getKey(), ok -> deleted);
+                    "Delete", command.getKey(), newer -> acknowledge(deleted, newer));
         }
-        store.putIfNewer(command.getKey(), null, timestamp, 0);
-        return done(deleted);
+        return done(acknowledge(deleted, store.putOrSuperseded(command.getKey(), null, timestamp, 0)));
     }
 
     /**
@@ -764,14 +773,14 @@ public class ConnectionHandler {
         }
         clock().observe(command.getTimestamp());
         // null value = tombstone, so stale replicas cannot resurrect the deleted value
-        boolean written = store.putIfNewer(
+        long newer = store.putOrSuperseded(
                 command.getKey(),
                 null,
                 command.getTimestamp(),
                 command.getExpiresAt());
         logger.trace("DELETE_INTERNAL tombstone {}: key={}, timestamp={}",
-                written ? "written" : "rejected (stale)", command.getKey(), command.getTimestamp());
-        return Response.ok();
+                newer == 0 ? "written" : "superseded", command.getKey(), command.getTimestamp());
+        return acknowledge(Response.ok(), newer);
     }
 
     /**

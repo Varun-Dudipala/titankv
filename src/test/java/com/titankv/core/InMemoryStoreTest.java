@@ -230,6 +230,22 @@ class InMemoryStoreTest {
         assertThat(store.get("key1")).isEmpty();
     }
 
+    @Test
+    void putOrSuperseded_reportsTheNewerVersionThatWasKept() {
+        byte[] a = "a".getBytes(StandardCharsets.UTF_8);
+        byte[] b = "b".getBytes(StandardCharsets.UTF_8);
+
+        assertThat(store.putOrSuperseded("key1", a, 100, 0)).as("stored").isZero();
+        assertThat(store.putOrSuperseded("key1", a, 100, 0)).as("the same version again").isZero();
+        assertThat(store.putOrSuperseded("key1", a, 50, 0)).as("older").isEqualTo(100);
+        assertThat(store.putOrSuperseded("key1", b, 100, 0)).as("same timestamp, greater value").isZero();
+        assertThat(store.putOrSuperseded("key1", a, 100, 0)).as("same timestamp, lesser value").isEqualTo(100);
+        assertThat(store.putOrSuperseded("key1", null, 100, 0)).as("a delete wins the tie").isZero();
+        assertThat(store.putOrSuperseded("key1", b, 100, 0)).as("a value loses the tie to a delete").isEqualTo(100);
+        assertThat(store.putOrSuperseded("key1", b, 101, 0)).as("newer").isZero();
+        assertThat(store.get("key1").orElseThrow().getValueUnsafe()).isEqualTo(b);
+    }
+
     /**
      * An expired value keeps its version as a tombstone. If it vanished, an older version held by
      * a replica that missed the write would look newest and come back.

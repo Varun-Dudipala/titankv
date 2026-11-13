@@ -60,6 +60,23 @@ public interface KVStore {
     boolean putIfNewer(String key, byte[] value, long timestamp, long expiresAt);
 
     /**
+     * Store a value with an explicit version, and say whether it lost to a newer one.
+     *
+     * @return 0 if this version is now stored (or already was), otherwise the version of the
+     *         newer entry that the store kept instead
+     */
+    default long putOrSuperseded(String key, byte[] value, long timestamp, long expiresAt) {
+        if (putIfNewer(key, value, timestamp, expiresAt)) {
+            return 0;
+        }
+        return getRaw(key)
+                .filter(current -> KeyValuePair.compareVersions(current.getTimestamp(), current.getValueUnsafe(),
+                        timestamp, value) > 0)
+                .map(KeyValuePair::getTimestamp)
+                .orElse(0L);
+    }
+
+    /**
      * Delete a key-value pair.
      *
      * @param key the key to delete

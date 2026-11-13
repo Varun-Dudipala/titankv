@@ -15,6 +15,9 @@ public final class Response {
     public static final byte PONG = 0x03;
     public static final byte EXISTS_TRUE = 0x04;
     public static final byte EXISTS_FALSE = 0x05;
+    // A write was replicated but a newer version of the key already exists, so it will not be
+    // read back; the timestamp field carries that newer version
+    public static final byte STALE = 0x06;
 
     private final byte status;
     private final byte[] value;
@@ -125,6 +128,19 @@ public final class Response {
     /**
      * Create an EXISTS response.
      */
+    /**
+     * A write that lost to a newer version of its key.
+     *
+     * @param newerVersion the version that superseded it
+     */
+    public static Response stale(long newerVersion) {
+        return new Response(STALE, null, newerVersion, 0);
+    }
+
+    public boolean isStale() {
+        return status == STALE;
+    }
+
     public static Response exists(boolean exists) {
         return new Response(exists ? EXISTS_TRUE : EXISTS_FALSE, null);
     }
@@ -229,6 +245,7 @@ public final class Response {
             case PONG: return "PONG";
             case EXISTS_TRUE: return "EXISTS_TRUE";
             case EXISTS_FALSE: return "EXISTS_FALSE";
+            case STALE: return "STALE";
             default: return "UNKNOWN(" + status + ")";
         }
     }

@@ -38,6 +38,8 @@ public class TitanKVClient implements AutoCloseable {
     private static final long CIRCUIT_RESET_TIMEOUT_MS = 5_000;
     // Error a node returns while it is (re)joining the cluster; see ConnectionHandler
     static final String NOT_READY_PREFIX = "Node is joining the cluster";
+    // How often a write that lost to a newer version is sent again with a later one
+    private static final int MAX_STALE_RETRIES = 3;
 
     private final String[] hosts;
     private final ClientConfig config;
@@ -258,14 +260,35 @@ public class TitanKVClient implements AutoCloseable {
         if (ttlMillis < 0) {
             throw new IllegalArgumentException("ttlMillis must not be negative");
         }
-        // One version for the whole call: if it fails over to another node, both nodes store
-        // the same version, not two competing ones
-        Command command = new Command(Command.PUT, key, value, nextVersion(), ttlMillis, level);
-        Response response = execute(command, key);
-        if (response.isError()) {
-            throw new IOException("Server error: " + response.getErrorMessage());
+        write(Command.PUT, key, value, ttlMillis, level);
+    }
+
+    /**
+     * Send a PUT or DELETE with a version from this client's clock. If the replicas already hold
+     * a newer version of the key (written by a client whose clock is ahead of this one's, or in
+     * the same millisecond), the write would be acknowledged and then never read back. The node
+     * says so, and the write is sent again with a version after the one it lost to: a write that
+     * starts after another has been acknowledged wins, whatever the two clients' clocks say.
+     * Writes that keep losing are racing other writers, and then last-write-wins picks one.
+     */
+    private void write(byte type, String key, byte[] value, long ttlMillis, ConsistencyLevel level)
+            throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            // One version per attempt: if it fails over to another node, both nodes store the
+            // same version, not two competing ones
+            Response response = execute(new Command(type, key, value, nextVersion(), ttlMillis, level), key);
+            if (response.isError()) {
+                throw new IOException("Server error: " + response.getErrorMessage());
+            }
+            if (response.isStale()) {
+                lastVersion.accumulateAndGet(response.getTimestamp(), Math::max);
+                if (attempt < MAX_STALE_RETRIES) {
+                    continue;
+                }
+            }
+            observe(response);
+            return;
         }
-        observe(response);
     }
 
     /**
@@ -298,12 +321,7 @@ public class TitanKVClient implements AutoCloseable {
      */
     public void delete(String key, ConsistencyLevel level) throws IOException {
         validateKey(key);
-        Response response = execute(new Command(Command.DELETE, key, null, nextVersion(), 0, level), key);
-
-        if (response.isError()) {
-            throw new IOException("Server error: " + response.getErrorMessage());
-        }
-        observe(response);
+        write(Command.DELETE, key, null, 0, level);
     }
 
     /**
@@ -354,9 +372,10 @@ public class TitanKVClient implements AutoCloseable {
      * @param value     the value
      * @param timestamp the authoritative timestamp for conflict resolution
      * @param expiresAt the expiration timestamp (0 = no expiration)
+     * @return 0 if the replica stored this version, otherwise the newer version it kept instead
      * @throws IOException if the request fails
      */
-    public void putInternal(String key, byte[] value, long timestamp, long expiresAt) throws IOException {
+    public long putInternal(String key, byte[] value, long timestamp, long expiresAt) throws IOException {
         validateKey(key);
         Command internalPut = new Command(Command.PUT_INTERNAL, key, value, timestamp, expiresAt);
         Response response = execute(internalPut, key);
@@ -364,6 +383,7 @@ public class TitanKVClient implements AutoCloseable {
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
+        return response.isStale() ? response.getTimestamp() : 0;
     }
 
     /**
@@ -375,9 +395,10 @@ public class TitanKVClient implements AutoCloseable {
      * @param key       the key to delete
      * @param timestamp the authoritative timestamp for conflict resolution
      * @param expiresAt the expiration timestamp (0 = no expiration)
+     * @return 0 if the replica stored the tombstone, otherwise the newer version it kept instead
      * @throws IOException if the request fails
      */
-    public void deleteInternal(String key, long timestamp, long expiresAt) throws IOException {
+    public long deleteInternal(String key, long timestamp, long expiresAt) throws IOException {
         validateKey(key);
         Command internalDelete = new Command(Command.DELETE_INTERNAL, key, null, timestamp, expiresAt);
         Response response = execute(internalDelete, key);
@@ -385,6 +406,7 @@ public class TitanKVClient implements AutoCloseable {
         if (response.isError()) {
             throw new IOException("Server error: " + response.getErrorMessage());
         }
+        return response.isStale() ? response.getTimestamp() : 0;
     }
 
     /**

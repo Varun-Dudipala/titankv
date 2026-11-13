@@ -194,8 +194,12 @@ public final class ReplicationManager implements ReplicaIO {
      * The replica set is fixed (strict quorum): replicas that are down are not replaced by other
      * nodes. They get a hint instead, as does any replica whose write fails, and hints never count
      * toward the consistency level.
+     *
+     * @return 0 if the replicas that acknowledged all stored this version; otherwise the newest
+     *         version one of them already held and kept instead. The write was superseded: it
+     *         is replicated, but reads will return the newer version.
      */
-    public CompletableFuture<Boolean> write(String key, byte[] value, long timestamp, long expiresAt,
+    public CompletableFuture<Long> write(String key, byte[] value, long timestamp, long expiresAt,
             ConsistencyLevel consistency) {
         return replicate(key, value, timestamp, expiresAt, consistency, "Write");
     }
@@ -204,12 +208,12 @@ public final class ReplicationManager implements ReplicaIO {
      * Delete from replicas by writing a tombstone with the given timestamp, which
      * prevents stale replicas from resurrecting the value.
      */
-    public CompletableFuture<Boolean> delete(String key, long timestamp, long expiresAt,
+    public CompletableFuture<Long> delete(String key, long timestamp, long expiresAt,
             ConsistencyLevel consistency) {
         return replicate(key, null, timestamp, expiresAt, consistency, "Delete");
     }
 
-    private CompletableFuture<Boolean> replicate(String key, byte[] value, long timestamp, long expiresAt,
+    private CompletableFuture<Long> replicate(String key, byte[] value, long timestamp, long expiresAt,
             ConsistencyLevel consistency, String name) {
         int required = consistency.getRequired(effectiveReplicationFactor());
         List<Node> replicas = clusterManager.getReplicasForKey(key, replicationFactor);
@@ -226,7 +230,10 @@ public final class ReplicationManager implements ReplicaIO {
             hintedHandoff.store(replica, key, value, timestamp, expiresAt);
         }
 
-        CompletableFuture<Boolean> result = new CompletableFuture<>();
+        CompletableFuture<Long> result = new CompletableFuture<>();
+        // Newest version any acknowledging replica held instead of this one. Each replica adds
+        // to it before it counts as acknowledged, so it is final when the count is reached.
+        java.util.concurrent.atomic.AtomicLong superseded = new java.util.concurrent.atomic.AtomicLong();
         AtomicInteger successes = new AtomicInteger();
         AtomicInteger failures = new AtomicInteger();
         int allowedFailures = live.size() - required;
@@ -243,9 +250,10 @@ public final class ReplicationManager implements ReplicaIO {
             };
             Runnable task = () -> {
                 try {
-                    write(replica, key, value, timestamp, expiresAt);
+                    long newer = write(replica, key, value, timestamp, expiresAt, false);
+                    superseded.accumulateAndGet(newer, Math::max);
                     if (successes.incrementAndGet() >= required) {
-                        result.complete(true);
+                        result.complete(superseded.get());
                     }
                 } catch (IOException | RuntimeException e) {
                     failed.accept(e);
@@ -403,18 +411,18 @@ public final class ReplicationManager implements ReplicaIO {
                 .map(m -> new ReadResult(m.getValue(), m.getTimestamp(), m.getExpiresAt()));
     }
 
-    private void write(Node replica, String key, byte[] value, long timestamp, long expiresAt, boolean background)
+    /**
+     * @return 0 if the replica stored this version, otherwise the newer version it kept instead
+     */
+    private long write(Node replica, String key, byte[] value, long timestamp, long expiresAt, boolean background)
             throws IOException {
         if (isLocal(replica)) {
-            localStore.putIfNewer(key, value, timestamp, expiresAt);
-            return;
+            return localStore.putOrSuperseded(key, value, timestamp, expiresAt);
         }
         TitanKVClient client = client(replica, background);
-        if (value == null) {
-            client.deleteInternal(key, timestamp, expiresAt);
-        } else {
-            client.putInternal(key, value, timestamp, expiresAt);
-        }
+        return value == null
+                ? client.deleteInternal(key, timestamp, expiresAt)
+                : client.putInternal(key, value, timestamp, expiresAt);
     }
 
     /**
