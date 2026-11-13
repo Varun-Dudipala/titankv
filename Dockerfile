@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Build stage: compile and package the server jar
-FROM maven:3.9-eclipse-temurin-21 AS build
+# Same Maven version as .mvn/wrapper/maven-wrapper.properties
+FROM maven:3.9.16-eclipse-temurin-21 AS build
 WORKDIR /src
 COPY pom.xml .
 COPY src ./src

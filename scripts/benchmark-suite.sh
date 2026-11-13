@@ -22,7 +22,7 @@ mkdir -p "$RAW"
 rm -f "$RAW"/*.log
 echo "scenario,setup,clients,workload,rep,ops_per_sec,p50_ms,p95_ms,p99_ms,max_ms,errors,misses,stale,ops" > "$OUT/summary.csv"
 
-(cd "$PROJECT_DIR" && mvn -q -B package -DskipTests)
+(cd "$PROJECT_DIR" && ./mvnw -q -B package -DskipTests)
 
 hosts() {
     local list=""
