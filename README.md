@@ -32,7 +32,7 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 - **Merkle-tree anti-entropy**: replica pairs compare 1024-leaf hash trees every minute and sync only the keys that differ
 - **Last-write-wins with hybrid logical clocks**, plus client causal context, so clock skew cannot make a
   client's later write lose to its earlier one; equal versions break ties the same way on every node;
-  deletes are tombstones, so nothing is resurrected
+  deletes and expired values leave tombstones, so nothing is resurrected
 
 **Membership and operations**
 - **Gossip** (UDP, Cassandra-style heartbeat digests) with HMAC-SHA256 authentication and replay
@@ -142,7 +142,7 @@ With replication factor 3:
 | A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
 | A restarted node has not learned the membership yet | It rejects client requests (`/ready` is 503) until a peer's digest has given it every member, down ones included, rather than serving with a partial ring. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
-| Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and ignores a torn final record. |
+| Crash mid-write | The WAL is fsynced before acknowledging; recovery replays snapshot + WAL and cuts a torn final record off the log. |
 | Clock skew | Hybrid logical clocks never go backwards past a version already seen; clients carry causal context. |
 | Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
@@ -163,7 +163,7 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_WAL_FSYNC` | `true` | fsync before acknowledging a write (group-committed) |
 | `TITANKV_WAL_MAX_MB` | `128` | WAL size that triggers a snapshot |
 | `TITANKV_MAX_MEMORY_MB` | `512` | Writes beyond this are rejected (never silently evicted) |
-| `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long deleted-key tombstones are kept |
+| `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long tombstones of deleted and expired keys are kept |
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
 | `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
 | `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
@@ -243,8 +243,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 164 unit tests
-mvn verify     # + 57 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 179 unit tests
+mvn verify     # + 58 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -259,7 +259,8 @@ The integration suite includes:
   admin commands requiring the cluster token
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
 
-WAL tests cover crash recovery across snapshots, concurrent writers during snapshots and torn writes.
+WAL tests cover crash recovery across snapshots, concurrent writers during snapshots, torn writes
+(including writes made after recovering from one) and expired values.
 
 ## Known limitations
 

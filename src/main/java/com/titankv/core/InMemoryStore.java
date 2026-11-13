@@ -97,7 +97,7 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
-     * @param cleanupIntervalMs how often expired entries and old tombstones are purged
+     * @param cleanupIntervalMs how often expired values become tombstones and old tombstones are purged
      * @param maxMemoryBytes    writes that would exceed this estimated size are rejected
      * @param dataDir           directory for the WAL and snapshot (used only if the WAL is enabled)
      */
@@ -171,8 +171,9 @@ public class InMemoryStore implements KVStore {
                 logger.info("Loaded snapshot from {}", snapshotPath.toAbsolutePath());
             }
             if (Files.exists(walPath)) {
-                replayFile(walPath);
+                long intact = replayFile(walPath);
                 logger.info("Replayed WAL from {}", walPath.toAbsolutePath());
+                discardWalTail(intact);
             }
             walChannel = FileChannel.open(walPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                     StandardOpenOption.APPEND);
@@ -187,21 +188,42 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
+     * Cut the WAL back to its last intact record. Replay stops at a torn or corrupt record, and
+     * the log is appended to from here on: records written behind that garbage would be
+     * acknowledged now but never reached by the next replay.
+     */
+    private void discardWalTail(long intactBytes) throws IOException {
+        long size = Files.size(walPath);
+        if (intactBytes >= size) {
+            return;
+        }
+        try (FileChannel channel = FileChannel.open(walPath, StandardOpenOption.WRITE)) {
+            channel.truncate(intactBytes);
+            channel.force(true);
+        }
+        logger.warn("Discarded {} unreadable bytes at the end of {} (a write interrupted by a crash)",
+                size - intactBytes, walPath.toAbsolutePath());
+    }
+
+    /**
      * Apply every intact record in order. Stops at the first truncated or corrupt record, which
      * is what a crash in the middle of an append leaves behind.
+     *
+     * @return the number of bytes replayed: the offset just past the last intact record
      */
-    private void replayFile(Path path) throws IOException {
+    private long replayFile(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             ByteBuffer header = ByteBuffer.allocate(WAL_HEADER_SIZE);
+            long intact = 0;
             while (true) {
                 header.clear();
                 int read = readFully(channel, header);
                 if (read == -1) {
-                    return;
+                    return intact;
                 }
                 if (read < WAL_HEADER_SIZE) {
                     logger.warn("Truncated record header in {}, stopping replay", path);
-                    return;
+                    return intact;
                 }
                 header.flip();
                 int magic = header.getInt();
@@ -216,14 +238,14 @@ public class InMemoryStore implements KVStore {
                         || keyLen < 0 || keyLen > BinaryProtocol.MAX_KEY_LENGTH
                         || valueLen < -1 || valueLen > BinaryProtocol.MAX_VALUE_LENGTH) {
                     logger.warn("Corrupt record header in {}, stopping replay", path);
-                    return;
+                    return intact;
                 }
 
                 int valueSize = Math.max(valueLen, 0);
                 ByteBuffer payload = ByteBuffer.allocate(keyLen + valueSize + 4);
                 if (readFully(channel, payload) < payload.capacity()) {
                     logger.warn("Truncated record in {}, stopping replay", path);
-                    return;
+                    return intact;
                 }
                 payload.flip();
                 byte[] keyBytes = new byte[keyLen];
@@ -242,9 +264,10 @@ public class InMemoryStore implements KVStore {
                 }
                 if ((int) crc.getValue() != checksum) {
                     logger.warn("Checksum mismatch in {}, stopping replay", path);
-                    return;
+                    return intact;
                 }
                 applyRecord(op, new String(keyBytes, StandardCharsets.UTF_8), value, timestamp, expiresAt);
+                intact = channel.position();
             }
         }
     }
@@ -264,11 +287,9 @@ public class InMemoryStore implements KVStore {
     private void applyRecord(byte op, String key, byte[] value, long timestamp, long expiresAt) {
         switch (op) {
             case WAL_OP_PUT:
-                if (expiresAt > 0 && System.currentTimeMillis() > expiresAt) {
-                    applyDelete(key);
-                } else {
-                    applyPut(key, new KeyValuePair(value, timestamp, expiresAt));
-                }
+                // A value that expired while the node was down comes back as its tombstone, so
+                // it still outranks older versions
+                applyPut(key, asStored(new KeyValuePair(value, timestamp, expiresAt)));
                 break;
             case WAL_OP_DELETE:
                 applyDelete(key);
@@ -381,11 +402,9 @@ public class InMemoryStore implements KVStore {
         try (FileChannel out = FileChannel.open(tempSnapshot, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             for (var entry : store.entrySet()) {
-                KeyValuePair kv = entry.getValue();
-                if (!kv.isExpired()) {
-                    writeRecord(out, WAL_OP_PUT, entry.getKey(), kv.getValueUnsafe(), kv.getTimestamp(),
-                            kv.getExpiresAt());
-                }
+                KeyValuePair kv = asStored(entry.getValue());
+                writeRecord(out, WAL_OP_PUT, entry.getKey(), kv.getValueUnsafe(), kv.getTimestamp(),
+                        kv.getExpiresAt());
             }
             out.force(true);
         } catch (IOException e) {
@@ -538,24 +557,18 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
-     * Visit every unexpired entry, tombstones included. Weakly consistent with concurrent writes.
+     * Visit every entry, tombstones included; an expired value is seen as its tombstone, as
+     * {@link #getRaw} returns it. Weakly consistent with concurrent writes.
      */
     public void forEachEntry(java.util.function.BiConsumer<String, KeyValuePair> action) {
-        store.forEach((key, value) -> {
-            if (!value.isExpired()) {
-                action.accept(key, value);
-            }
-        });
+        store.forEach((key, value) -> action.accept(key, asStored(value)));
     }
 
     /**
-     * All unexpired keys, including deleted keys whose tombstones are still retained.
+     * All keys with an entry, including deleted and expired keys whose tombstones are still retained.
      */
     public Set<String> keysIncludingTombstones() {
-        return store.entrySet().stream()
-                .filter(e -> !e.getValue().isExpired())
-                .map(e -> e.getKey())
-                .collect(Collectors.toSet());
+        return new java.util.HashSet<>(store.keySet());
     }
 
     @Override
@@ -628,45 +641,68 @@ public class InMemoryStore implements KVStore {
     // ==================== Housekeeping ====================
 
     /**
-     * The entry for a key, removing it first if it has expired.
+     * An entry as the rest of the system should see it: a value whose time-to-live has run out
+     * is its tombstone.
+     */
+    private static KeyValuePair asStored(KeyValuePair entry) {
+        return entry.isExpired() ? entry.toTombstone() : entry;
+    }
+
+    /**
+     * The entry for a key, turning it into a tombstone first if it has expired. An expired value
+     * keeps its version instead of being removed: a replica that missed this write still holds an
+     * older version, which would otherwise look newest and be read, and repaired back, as if the
+     * overwrite had never happened.
      */
     private KeyValuePair liveEntry(String key) {
         KeyValuePair entry = store.get(key);
-        if (entry != null && entry.isExpired()) {
-            if (store.remove(key, entry)) {
-                adjustMemory(key, entry, null);
+        while (entry != null && entry.isExpired()) {
+            KeyValuePair tombstone = entry.toTombstone();
+            if (store.replace(key, entry, tombstone)) {
+                adjustMemory(key, entry, tombstone);
+                return tombstone;
             }
-            return null;
+            entry = store.get(key); // a write got in first
         }
         return entry;
     }
 
     /**
-     * Purge expired entries, and tombstones older than the grace period. Tombstones are kept that
-     * long so a replica that missed the delete gets repaired instead of resurrecting the value.
-     * Purges are not written to the WAL: replay re-derives expiry, and a replayed old tombstone is
-     * purged again on the next run.
+     * Turn expired values into tombstones (which frees the value), and purge tombstones older
+     * than the grace period. Tombstones are kept that long so a replica that missed the delete or
+     * the expired write gets repaired instead of resurrecting an older value. Neither step is
+     * written to the WAL: replay re-derives expiry, and a replayed old tombstone is purged again
+     * on the next run.
      */
     private void cleanupExpired() {
         long tombstoneCutoff = System.currentTimeMillis() - tombstoneGraceMs;
-        int removed = 0;
+        int expired = 0;
+        int purged = 0;
         for (var entry : store.entrySet()) {
+            String key = entry.getKey();
             KeyValuePair value = entry.getValue();
-            boolean purge = value.isExpired()
-                    || (value.isTombstone() && HybridLogicalClock.physicalMillis(value.getTimestamp()) < tombstoneCutoff);
-            if (purge && store.remove(entry.getKey(), value)) {
-                adjustMemory(entry.getKey(), value, null);
-                removed++;
+            if (value.isExpired()) {
+                KeyValuePair tombstone = value.toTombstone();
+                if (!store.replace(key, value, tombstone)) {
+                    continue; // a write got in first
+                }
+                adjustMemory(key, value, tombstone);
+                expired++;
+                value = tombstone;
+            }
+            if (value.isTombstone() && value.deletedAtMillis() < tombstoneCutoff && store.remove(key, value)) {
+                adjustMemory(key, value, null);
+                purged++;
             }
         }
-        if (removed > 0) {
-            logger.debug("Purged {} expired entries and old tombstones, memoryUsed={}", removed,
+        if (expired + purged > 0) {
+            logger.debug("Expired {} values and purged {} old tombstones, memoryUsed={}", expired, purged,
                     currentMemoryBytes.get());
         }
     }
 
     /**
-     * Reject a write that would exceed the memory limit, after first purging expired entries.
+     * Reject a write that would exceed the memory limit, after first freeing expired values.
      * Live data is never evicted: silently dropping acknowledged writes would be data loss.
      */
     private void ensureCapacity(String key, KeyValuePair entry) {

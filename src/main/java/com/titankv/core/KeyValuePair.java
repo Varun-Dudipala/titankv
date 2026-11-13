@@ -87,12 +87,32 @@ public final class KeyValuePair {
     }
 
     /**
-     * Check if this entry has expired.
+     * Check if this entry is a value whose time-to-live has run out. A tombstone never expires;
+     * it is purged once it is older than the tombstone grace period.
      *
      * @return true if expired
      */
     public boolean isExpired() {
-        return expiresAt > 0 && System.currentTimeMillis() > expiresAt;
+        return value != null && expiresAt > 0 && System.currentTimeMillis() > expiresAt;
+    }
+
+    /**
+     * The tombstone that takes this entry's place once it has expired: the same version without
+     * the value. An expired entry must keep its version rather than vanish, or an older version
+     * still held by a replica that missed this write would win and come back. The expiry time is
+     * kept as the time the key stopped existing (see {@link #deletedAtMillis()}).
+     */
+    public KeyValuePair toTombstone() {
+        return new KeyValuePair(null, timestamp, expiresAt);
+    }
+
+    /**
+     * When this tombstone's key stopped existing, in epoch milliseconds: the expiry time for a
+     * value that expired, otherwise the time of the delete. The tombstone grace period counts
+     * from here.
+     */
+    public long deletedAtMillis() {
+        return expiresAt > 0 ? expiresAt : HybridLogicalClock.physicalMillis(timestamp);
     }
 
     /**

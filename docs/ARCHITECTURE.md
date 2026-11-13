@@ -130,7 +130,8 @@ When a replica is down or a write to it fails, the coordinator stores the write 
 node. Hints are coalesced per key (only the newest version matters) and appended, CRC-checked, to
 `<data dir>/node-<port>/hints/<node>.hints` so they survive a coordinator restart. When gossip reports
 the node as recovered, joined or restarted (and every 2 seconds after that), hints are delivered;
-delivery stops at the first failure and resumes later. No hints are kept for a node that has
+delivery stops at the first failure and resumes later. Once all of a node's hints are delivered
+its file is emptied, including hints that were loaded from disk after a restart. No hints are kept for a node that has
 been down longer than 3 hours, or beyond 100,000 per node; anti-entropy covers those cases.
 
 ### Merkle-tree anti-entropy
@@ -167,6 +168,8 @@ selector thread ──► worker pool (max(4, CPUs)) ──► replication pool 
 - **Replica I/O** runs on a separate pool because it uses blocking client sockets. Node-to-node
   clients retry once on a fresh connection if a pooled one turns out to be stale (the peer
   restarted), and do not use the client circuit breaker, since gossip already tracks liveness.
+  A client's connection pool allows a fixed number of connections per node; a thread that finds
+  them all in use waits and takes the next one returned.
 - **Repair traffic is kept apart.** Hint delivery and Merkle repair use their own small connection
   pool per peer (2 connections), so a burst of repair after a node restarts cannot make client
   reads wait for a connection.
@@ -258,16 +261,27 @@ record `[magic][version][op][key len][value len][timestamp][expires][key][value]
   read lock and snapshots the write lock, so the WAL is only truncated once every record in it is
   already in the map, and therefore in the snapshot.
 - **Recovery** replays the snapshot and then the WAL, stopping at the first truncated or corrupt
-  record, which is what a crash in the middle of an append leaves behind.
+  record, which is what a crash in the middle of an append leaves behind. The WAL is then cut back
+  to that point, so new records are never appended behind an unreadable one. An earlier version
+  left the torn record in place: writes after the restart were acknowledged, then lost at the next
+  restart, when replay stopped at the torn record before reaching them.
 
 **Memory limit.** Writes that would exceed `TITANKV_MAX_MEMORY_MB` are rejected with an error, after
 purging expired entries. Live data is never evicted, since that would silently lose acknowledged
 writes.
 
-**Expiry.** Expired entries are removed lazily on access and by a cleanup task every minute, which
-also purges tombstones older than the grace period (24 hours by default). A replica that is away
-longer than that and missed a delete could resurrect the key. This is the same trade-off as
-Cassandra's `gc_grace_seconds`.
+**Expiry.** A value whose TTL has run out becomes a tombstone with the same version, as in
+Cassandra: lazily on access, and by a cleanup task every minute. Reads, anti-entropy, snapshots and
+WAL replay all see an expired value as that tombstone, whether or not it has been converted yet.
+The value's memory is released; the key and its version stay. An earlier version removed expired
+entries outright. If a replica had missed the short-lived write, its older version then looked
+newest: a QUORUM read returned a value that an acknowledged write had replaced, and read repair
+copied it back to the other replicas.
+
+The cleanup task also purges tombstones older than the grace period (24 hours by default, counted
+from the delete or from the expiry time). A replica that is away longer than that and missed a
+delete or an expired write could resurrect the key. This is the same trade-off as Cassandra's
+`gc_grace_seconds`. Until then an expired key still costs its key and about 48 bytes.
 
 ## Topology changes
 
