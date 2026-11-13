@@ -280,6 +280,21 @@ class KeyValuePairTest {
     }
 
     @Test
+    void copiesOfOneWriteWithDifferentExpiryAreOrderedButNotSuperseded() {
+        byte[] value = "v".getBytes();
+        KeyValuePair shorter = new KeyValuePair(value, 5, 1_000);
+        KeyValuePair longer = new KeyValuePair(value, 5, 2_000);
+
+        assertThat(longer.isNewerThan(shorter)).as("replicas settle on the later expiry").isTrue();
+        assertThat(shorter.isNewerThan(longer)).isFalse();
+        assertThat(longer.isNewerThan(new KeyValuePair(value, 5, 2_000))).isFalse();
+        assertThat(KeyValuePair.compareVersions(5, value, 5, value)).as("they are the same write").isZero();
+        // The version still decides first
+        assertThat(new KeyValuePair(value, 6, 0).isNewerThan(longer)).isTrue();
+        assertThat(new KeyValuePair(null, 5, 0).isNewerThan(longer)).as("a delete wins the tie").isTrue();
+    }
+
+    @Test
     void versionsAreOrderedByTimestampThenTombstoneThenValue() {
         byte[] a = "a".getBytes();
         byte[] b = "b".getBytes();

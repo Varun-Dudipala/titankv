@@ -375,7 +375,8 @@ public class ReadRepairHandler {
                 continue;
             }
             if (newest == null
-                    || KeyValuePair.compareVersions(nv.timestamp, nv.value, newest.timestamp, newest.value) > 0) {
+                    || KeyValuePair.compareVersions(nv.timestamp, nv.value, nv.expiresAt,
+                            newest.timestamp, newest.value, newest.expiresAt) > 0) {
                 newest = nv;
             }
         }
@@ -386,7 +387,8 @@ public class ReadRepairHandler {
         List<Node> stale = new ArrayList<>();
         for (NodeValue nv : results) {
             if (!nv.node.equals(newest.node)
-                    && (nv.timestamp < newest.timestamp || !Arrays.equals(nv.value, newest.value))) {
+                    && (nv.timestamp < newest.timestamp || !Arrays.equals(nv.value, newest.value)
+                            || nv.expiresAt != newest.expiresAt)) {
                 stale.add(nv.node);
             }
         }

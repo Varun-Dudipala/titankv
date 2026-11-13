@@ -153,7 +153,22 @@ public final class KeyValuePair {
      * @param other the current entry, or null if there is none
      */
     public boolean isNewerThan(KeyValuePair other) {
-        return other == null || compareVersions(timestamp, value, other.timestamp, other.value) > 0;
+        return other == null
+                || compareVersions(timestamp, value, expiresAt, other.timestamp, other.value, other.expiresAt) > 0;
+    }
+
+    /**
+     * The order replicas store by: {@link #compareVersions(long, byte[], long, byte[])}, and
+     * between entries that are the same write, the later expiry. A write with a TTL that is sent
+     * twice with one version (a failover, or a retry on a stale connection) gets its expiry from
+     * each coordinator's clock, so replicas can hold the same version with different expiry
+     * times. Without an order between those, neither replaced the other, while anti-entropy saw
+     * them differ and exchanged them on every round without ever converging.
+     */
+    public static int compareVersions(long timestamp1, byte[] value1, long expiresAt1,
+            long timestamp2, byte[] value2, long expiresAt2) {
+        int byVersion = compareVersions(timestamp1, value1, timestamp2, value2);
+        return byVersion != 0 ? byVersion : Long.compare(expiresAt1, expiresAt2);
     }
 
     /**
@@ -162,6 +177,9 @@ public final class KeyValuePair {
      * issue the same hybrid-clock timestamp for concurrent writes, so ties must be broken the same
      * way on every node, or replicas that applied the writes in different orders would disagree
      * forever.
+     *
+     * This compares writes. Whether one write supersedes another is decided here; two copies of
+     * the same write that differ only in expiry compare as equal.
      *
      * @return negative, zero or positive as version 1 is older than, the same as, or newer than version 2
      */

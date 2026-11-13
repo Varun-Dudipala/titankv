@@ -181,6 +181,10 @@ public class TitanKVServer {
                 rm -> rm.getHintedHandoff().totalPendingHints())
                 .description("Writes waiting to be handed off to replicas that missed them")
                 .register(registry);
+        io.micrometer.core.instrument.Gauge.builder("titankv.hints.bytes", replicationManager,
+                rm -> rm.getHintedHandoff().totalPendingHintBytes())
+                .description("Estimated memory held by writes waiting to be handed off")
+                .register(registry);
         io.micrometer.core.instrument.FunctionCounter.builder("titankv.read.repairs", replicationManager,
                 rm -> rm.getReadRepairHandler().getReplicasRepaired())
                 .description("Stale replica copies repaired by reads")

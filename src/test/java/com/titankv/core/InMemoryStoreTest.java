@@ -230,6 +230,41 @@ class InMemoryStoreTest {
         assertThat(store.get("key1")).isEmpty();
     }
 
+    /**
+     * A full store must still take deletes, and overwrites that do not grow it: otherwise the
+     * only way to free memory is refused for lack of memory.
+     */
+    @Test
+    void fullStore_stillTakesDeletesAndOverwritesThatDoNotGrowIt() {
+        InMemoryStore small = new InMemoryStore(60_000, 10_000);
+        try {
+            byte[] value = new byte[100];
+            int stored = 0;
+            try {
+                for (; ; stored++) {
+                    small.putIfNewer("key" + stored, value, 100, 0);
+                }
+            } catch (IllegalStateException full) {
+                assertThat(full).hasMessageContaining("memory limit");
+            }
+            assertThat(stored).isGreaterThan(10);
+            long usedWhenFull = small.getMemoryUsedBytes();
+
+            assertThat(small.putIfNewer("key0", new byte[100], 101, 0)).as("same-size overwrite").isTrue();
+            assertThat(small.putIfNewer("key1", new byte[10], 101, 0)).as("smaller overwrite").isTrue();
+            assertThat(small.putIfNewer("key2", null, 101, 0)).as("delete").isTrue();
+            assertThat(small.putIfNewer("never-stored", null, 101, 0)).as("delete of a key not held").isTrue();
+            assertThat(small.get("key2")).isEmpty();
+            assertThat(small.getMemoryUsedBytes()).isLessThan(usedWhenFull);
+
+            assertThatThrownBy(() -> small.putIfNewer("key0", new byte[5_000], 102, 0))
+                    .as("an overwrite that grows past the limit").isInstanceOf(IllegalStateException.class);
+            assertThat(small.putIfNewer("key2", value, 102, 0)).as("the freed space is usable").isTrue();
+        } finally {
+            small.shutdown();
+        }
+    }
+
     @Test
     void putOrSuperseded_reportsTheNewerVersionThatWasKept() {
         byte[] a = "a".getBytes(StandardCharsets.UTF_8);

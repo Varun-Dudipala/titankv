@@ -74,6 +74,51 @@ class TtlTest {
         }
     }
 
+    /**
+     * A write with a TTL that is sent twice with one version (a failover, or a retry on a stale
+     * connection) gets its expiry from each coordinator's clock. The replicas then hold the same
+     * version with two expiry times. They must settle on one: before expiry was part of the
+     * version order, neither copy replaced the other, and anti-entropy exchanged the key on
+     * every round without ever bringing the replicas together.
+     */
+    @Test
+    void writeRetriedThroughAnotherNodeEndsWithOneExpiryEverywhere() throws Exception {
+        System.setProperty("titankv.anti.entropy.interval.ms", "0"); // only the explicit rounds below
+        try (TestCluster cluster = TestCluster.start(BASE_PORT + 30, 3);
+             java.net.Socket viaNode1 = new java.net.Socket("localhost", BASE_PORT + 30);
+             java.net.Socket viaNode2 = new java.net.Socket("localhost", BASE_PORT + 31)) {
+            long version = com.titankv.util.HybridLogicalClock.encode(System.currentTimeMillis());
+            byte[] value = "v".getBytes(StandardCharsets.UTF_8);
+            com.titankv.network.protocol.Command put = new com.titankv.network.protocol.Command(
+                    com.titankv.network.protocol.Command.PUT, "ttl-retry", value, version, 600_000);
+
+            // First attempt through node 1, which cannot reach node 3: nodes 1 and 2 take it
+            cluster.cutOneWay(0, 2);
+            assertThat(ClockSkewTest.send(viaNode1, put).isOk()).isTrue();
+            Thread.sleep(50);
+            // The retry, with the same version, through node 2: a later expiry, on all three
+            assertThat(ClockSkewTest.send(viaNode2, put).isOk()).as("a retry of the same write is not stale").isTrue();
+            cluster.heal();
+            TestCluster.awaitCondition(() -> cluster.node(0).getReplicationManager().getHintedHandoff()
+                    .totalPendingHints() == 0, 10_000, "node 1 to deliver its hint for node 3");
+
+            com.titankv.consistency.AntiEntropy repair = cluster.node(0).getReplicationManager().getAntiEntropy();
+            for (int peer = 1; peer < 3; peer++) {
+                Node node = cluster.node(0).getClusterManager().getNode(cluster.node(peer).getNodeId());
+                repair.repairWith(node);
+                assertThat(repair.repairWith(node).differingLeaves()).as("after one repair round").isZero();
+            }
+            long expiry = cluster.node(0).getStore().getRaw("ttl-retry").orElseThrow().getExpiresAt();
+            for (int i = 0; i < 3; i++) {
+                KeyValuePair copy = cluster.node(i).getStore().getRaw("ttl-retry").orElseThrow();
+                assertThat(copy.getTimestamp()).isEqualTo(version);
+                assertThat(copy.getExpiresAt()).as("expiry on node " + (i + 1)).isEqualTo(expiry);
+            }
+        } finally {
+            System.clearProperty("titankv.anti.entropy.interval.ms");
+        }
+    }
+
     private static void assertExpires(TitanKVClient client) throws Exception {
         client.put("ttl-key", "short-lived".getBytes(StandardCharsets.UTF_8), 500);
         client.put("durable-key", "stays");

@@ -40,6 +40,10 @@ public class TitanKVClient implements AutoCloseable {
     static final String NOT_READY_PREFIX = "Node is joining the cluster";
     // How often a write that lost to a newer version is sent again with a later one
     private static final int MAX_STALE_RETRIES = 3;
+    // The furthest ahead of its own wall clock this client lets a version from elsewhere move its
+    // clock. Nodes accept versions up to 60s ahead of theirs, so this leaves half of that for the
+    // difference between this client's clock and a node's.
+    static final long MAX_ADOPT_AHEAD_MS = 30_000;
 
     private final String[] hosts;
     private final ClientConfig config;
@@ -270,6 +274,9 @@ public class TitanKVClient implements AutoCloseable {
      * says so, and the write is sent again with a version after the one it lost to: a write that
      * starts after another has been acknowledged wins, whatever the two clients' clocks say.
      * Writes that keep losing are racing other writers, and then last-write-wins picks one.
+     *
+     * @throws IOException if the request fails, or the key holds a version too far ahead of this
+     *                     client's clock to write after (see {@link #adopt})
      */
     private void write(byte type, String key, byte[] value, long ttlMillis, ConsistencyLevel level)
             throws IOException {
@@ -281,10 +288,17 @@ public class TitanKVClient implements AutoCloseable {
                 throw new IOException("Server error: " + response.getErrorMessage());
             }
             if (response.isStale()) {
-                lastVersion.accumulateAndGet(response.getTimestamp(), Math::max);
+                if (!adopt(response.getTimestamp())) {
+                    throw new IOException("Key '" + key + "' holds a version " + aheadSeconds(response.getTimestamp())
+                            + "s ahead of this client's clock, written by a client whose clock is wrong; "
+                            + "it cannot be overwritten until real time reaches it");
+                }
                 if (attempt < MAX_STALE_RETRIES) {
                     continue;
                 }
+                // Still superseded after several tries: other writers are writing this key at the
+                // same moment, and between overlapping writes last-write-wins picks one. This
+                // write counts as having happened just before the one that replaced it.
             }
             observe(response);
             return;
@@ -334,8 +348,36 @@ public class TitanKVClient implements AutoCloseable {
         return lastVersion.get();
     }
 
-    public void observeCausalContext(long timestamp) {
-        lastVersion.accumulateAndGet(timestamp, Math::max);
+    /**
+     * @return false if the version is too far ahead of this client's clock to be adopted
+     *         (see {@link #adopt})
+     */
+    public boolean observeCausalContext(long timestamp) {
+        return adopt(timestamp);
+    }
+
+    /**
+     * Move this client's clock past a version from elsewhere, unless that version is more than
+     * {@value #MAX_ADOPT_AHEAD_MS} ms ahead of this client's wall clock. Adopting whatever a node
+     * returns let one client with a fast clock pull every node and client forward with it: a
+     * client 58s ahead wrote a key, a correct client read it, and from then on that client's
+     * writes to any key were refused by every node whose own clock ran a few seconds slow.
+     */
+    private boolean adopt(long version) {
+        if (version <= 0) {
+            return true;
+        }
+        long wallClock = System.currentTimeMillis() + clockSkewMillis;
+        if (com.titankv.util.HybridLogicalClock.physicalMillis(version) > wallClock + MAX_ADOPT_AHEAD_MS) {
+            return false;
+        }
+        lastVersion.accumulateAndGet(version, Math::max);
+        return true;
+    }
+
+    private long aheadSeconds(long version) {
+        return (com.titankv.util.HybridLogicalClock.physicalMillis(version)
+                - (System.currentTimeMillis() + clockSkewMillis)) / 1000;
     }
 
     /**
@@ -359,8 +401,8 @@ public class TitanKVClient implements AutoCloseable {
      * or, after a write, the newest version that node has seen.
      */
     private void observe(Response response) {
-        if (response.isOk() && response.getTimestamp() > 0) {
-            lastVersion.accumulateAndGet(response.getTimestamp(), Math::max);
+        if (response.isOk()) {
+            adopt(response.getTimestamp());
         }
     }
 

@@ -44,8 +44,9 @@ public class ConnectionHandler {
     // Maximum read buffer size = header + max key + max value
     private static final int MAX_READ_BUFFER_SIZE = BinaryProtocol.REQUEST_HEADER_SIZE
             + BinaryProtocol.MAX_KEY_LENGTH + BinaryProtocol.MAX_VALUE_LENGTH;
-    // Timeout for completing a request frame (30 seconds)
-    private static final long INCOMPLETE_FRAME_TIMEOUT_MS = 30_000;
+    // How long a connection may take to deliver a whole request: from being accepted to its first
+    // request, and from the first byte of any later request to its last
+    private static final long DEFAULT_FRAME_TIMEOUT_MS = 30_000;
     private static final long OPERATION_TIMEOUT_MS = 5_000;
 
     private final SocketChannel channel;
@@ -67,9 +68,12 @@ public class ConnectionHandler {
     private boolean commandInProgress = false; // Track if a command is currently being processed
     private boolean writeInProgress = false;
 
-    // Frame timeout tracking to prevent memory DoS
+    // Frame timeout tracking to prevent memory DoS. Read and written on the selector thread only.
     private long incompleteFrameStartTime = 0; // When we first received data for current incomplete frame
     private boolean hasIncompleteFrame = false; // Whether we're currently waiting for more data
+    private boolean receivedRequest = false; // Whether a whole request has ever arrived
+    private final long acceptedAtMillis = System.currentTimeMillis();
+    private final long frameTimeoutMs = frameTimeoutMs();
 
     // Lock for protecting interestOps modifications (prevents race conditions)
     private final Object interestOpsLock = new Object();
@@ -204,6 +208,38 @@ public class ConnectionHandler {
         });
     }
 
+    private static long frameTimeoutMs() {
+        String configured = Env.get("TITANKV_FRAME_TIMEOUT_MS", "titankv.frame.timeout.ms");
+        if (configured != null) {
+            try {
+                long millis = Long.parseLong(configured.trim());
+                if (millis > 0) {
+                    return millis;
+                }
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+            logger.warn("Invalid TITANKV_FRAME_TIMEOUT_MS {}, using {}", configured, DEFAULT_FRAME_TIMEOUT_MS);
+        }
+        return DEFAULT_FRAME_TIMEOUT_MS;
+    }
+
+    /**
+     * Whether this connection has kept the server waiting too long for a whole request: it has
+     * sent part of one and stopped, or has sent nothing complete since it was accepted. Such a
+     * connection holds buffers (up to the size of the largest request) for as long as it stays
+     * open. Called by the selector thread about once a second: the check inside the read path
+     * only runs when more bytes arrive, which a client that goes quiet never sends.
+     *
+     * A connection that is idle between requests is not stalled: clients pool connections.
+     */
+    boolean isStalled(long nowMillis) {
+        if (hasIncompleteFrame) {
+            return nowMillis - incompleteFrameStartTime > frameTimeoutMs;
+        }
+        return !receivedRequest && nowMillis - acceptedAtMillis > frameTimeoutMs;
+    }
+
     private static ConsistencyLevel readConsistencyLevel(String envKey, String propKey, ConsistencyLevel fallback) {
         String value = Env.get(envKey, propKey);
         if (value == null) {
@@ -321,7 +357,7 @@ public class ConnectionHandler {
                     } else {
                         // Check if we've exceeded the timeout
                         long elapsed = System.currentTimeMillis() - incompleteFrameStartTime;
-                        if (elapsed > INCOMPLETE_FRAME_TIMEOUT_MS) {
+                        if (elapsed > frameTimeoutMs) {
                             logger.warn("Connection from {} exceeded incomplete frame timeout ({}ms), closing",
                                     clientAddress, elapsed);
                             return false;
@@ -331,10 +367,12 @@ public class ConnectionHandler {
 
                 processReadBuffer(key);
 
-                // Reset incomplete frame tracking if we processed a complete request
                 if (hasCompleteFrame) {
-                    hasIncompleteFrame = false;
-                    incompleteFrameStartTime = 0;
+                    receivedRequest = true;
+                    // Whatever is left after the requests just processed is the start of a new
+                    // one, and its time starts now
+                    hasIncompleteFrame = readBuffer.position() > 0;
+                    incompleteFrameStartTime = hasIncompleteFrame ? System.currentTimeMillis() : 0;
                 }
 
                 // After processing, buffer is in write mode (position=end of unprocessed data)
