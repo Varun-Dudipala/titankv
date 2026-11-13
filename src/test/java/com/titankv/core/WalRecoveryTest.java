@@ -127,6 +127,68 @@ class WalRecoveryTest {
         assertThat(recovered.get("second")).isEmpty();
     }
 
+    /**
+     * A value that expires must come back from the WAL, and from a snapshot, as a tombstone with
+     * its version, so the older version it replaced cannot return after a restart.
+     */
+    @Test
+    void expiredValuesAreRecoveredAsTombstones() throws Exception {
+        InMemoryStore store = open();
+        byte[] old = "old".getBytes(StandardCharsets.UTF_8);
+        store.putIfNewer("in-wal", old, 1_000, 0);
+        store.putIfNewer("in-wal", "short-lived".getBytes(StandardCharsets.UTF_8), 2_000, System.currentTimeMillis() + 50);
+        store.putIfNewer("in-snapshot", old, 1_000, 0);
+        store.putIfNewer("in-snapshot", "short-lived".getBytes(StandardCharsets.UTF_8), 2_000,
+                System.currentTimeMillis() + 50);
+        Thread.sleep(100);
+
+        InMemoryStore fromWal = open();
+        assertThat(fromWal.getRaw("in-wal").orElseThrow().isTombstone()).isTrue();
+        assertThat(fromWal.putIfNewer("in-wal", old, 1_000, 0)).isFalse();
+
+        byte[] filler = new byte[200_000];
+        for (int i = 0; i < 8; i++) {
+            store.put("filler-" + i, filler); // 1.6MB: past the 1MB WAL limit, so a snapshot is taken
+        }
+        assertThat(dataDir.resolve("snapshot.dat")).exists();
+
+        InMemoryStore fromSnapshot = open();
+        KeyValuePair recovered = fromSnapshot.getRaw("in-snapshot").orElseThrow();
+        assertThat(recovered.isTombstone()).isTrue();
+        assertThat(recovered.getTimestamp()).isEqualTo(2_000);
+        assertThat(fromSnapshot.putIfNewer("in-snapshot", old, 1_000, 0)).isFalse();
+        assertThat(fromSnapshot.get("in-snapshot")).isEmpty();
+    }
+
+    /**
+     * Recovery must cut the torn record off the log. Otherwise the writes after the first restart
+     * are appended behind it, and the next replay stops at the torn record and never reaches them.
+     */
+    @Test
+    void writesAfterRecoveringFromATornTailSurviveTheNextRestart() throws IOException {
+        InMemoryStore store = open();
+        store.put("first", "1".getBytes(StandardCharsets.UTF_8));
+        store.put("torn", "2".getBytes(StandardCharsets.UTF_8));
+
+        Path wal = dataDir.resolve("wal.log");
+        long tornSize;
+        try (FileChannel channel = FileChannel.open(wal, StandardOpenOption.WRITE)) {
+            channel.truncate(channel.size() - 3); // crash halfway through the last append
+            tornSize = channel.size();
+        }
+
+        InMemoryStore restarted = open();
+        assertThat(java.nio.file.Files.size(wal)).as("WAL size after discarding the torn record").isLessThan(tornSize);
+        restarted.put("after-crash", "3".getBytes(StandardCharsets.UTF_8));
+        restarted.putIfNewer("after-crash-deleted", null, 5_000, 0);
+
+        InMemoryStore restartedAgain = open();
+        assertThat(restartedAgain.get("first")).isPresent();
+        assertThat(restartedAgain.get("torn")).isEmpty();
+        assertThat(restartedAgain.get("after-crash")).isPresent();
+        assertThat(restartedAgain.getRaw("after-crash-deleted").orElseThrow().isTombstone()).isTrue();
+    }
+
     @Test
     void writesBeyondTheMemoryLimitAreRejectedNotEvicted() {
         InMemoryStore store = new InMemoryStore(60_000, 10_000, dataDir);

@@ -222,7 +222,10 @@ public class ConnectionPool {
     }
 
     /**
-     * Per-host connection pool with semaphore-based limit enforcement.
+     * Per-host connection pool. A permit stands for a connection that is checked out, so at most
+     * {@code maxConnectionsPerHost} are in use at once, and since a new connection is only opened
+     * when none is idle, no more than that many exist. Returning a connection frees its permit,
+     * which wakes a thread waiting in {@link #acquire()}.
      */
     private class HostPool {
         private final String host;
@@ -249,17 +252,7 @@ public class ConnectionPool {
             if (closed) {
                 throw new IOException("Connection pool is closed for " + host);
             }
-            // Try to get idle connection without blocking
-            PooledConnection conn = idle.poll();
-            if (conn != null && conn.isOpen()) {
-                conn.markReused();
-                return conn;
-            }
-            if (conn != null) {
-                invalidate(conn); // closed while idle
-            }
-
-            // Try to acquire permit (with timeout)
+            // Wait for a connection to be free: either one is idle, or there is room to open one
             boolean acquired;
             try {
                 acquired = permits.tryAcquire(connectTimeoutMs, TimeUnit.MILLISECONDS);
@@ -267,16 +260,33 @@ public class ConnectionPool {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted waiting for connection", e);
             }
-
             if (!acquired) {
                 throw new IOException("Connection pool exhausted for " + host);
             }
 
+            PooledConnection conn = null;
             try {
-                return createConnection();
-            } catch (IOException e) {
-                permits.release();
-                throw e;
+                if (closed) {
+                    throw new IOException("Connection pool is closed for " + host);
+                }
+                PooledConnection pooled;
+                while (conn == null && (pooled = idle.poll()) != null) {
+                    if (pooled.isOpen()) {
+                        pooled.markReused();
+                        conn = pooled;
+                    } else {
+                        discard(pooled); // closed while idle
+                    }
+                }
+                if (conn == null) {
+                    conn = createConnection();
+                }
+                conn.checkOut();
+                return conn;
+            } finally {
+                if (conn == null) {
+                    permits.release();
+                }
             }
         }
 
@@ -309,33 +319,48 @@ public class ConnectionPool {
         void evictIdle() {
             PooledConnection conn;
             while ((conn = idle.poll()) != null) {
-                invalidate(conn);
-            }
-        }
-
-        void release(PooledConnection conn) {
-            if (closed) {
-                invalidate(conn);
-                return;
-            }
-            synchronized (idle) {
-                if (conn.isOpen() && idle.size() < maxConnectionsPerHost) {
-                    idle.offer(conn);
-                } else {
-                    invalidate(conn);
-                }
+                discard(conn);
             }
         }
 
         /**
-         * Close a connection and give back its permit. Idempotent: a connection invalidated twice
-         * (say, by a failed request and then by a stale-pool eviction) must not free two permits.
+         * Return a connection after use. It goes back to the idle queue before its permit is
+         * freed, so the thread that permit wakes finds it there.
+         */
+        void release(PooledConnection conn) {
+            if (!conn.checkIn()) {
+                return; // already released or invalidated
+            }
+            if (!closed && conn.isOpen()) {
+                idle.offer(conn);
+                if (closed) {
+                    evictIdle(); // the pool was closed meanwhile
+                }
+            } else {
+                discard(conn);
+            }
+            permits.release();
+        }
+
+        /**
+         * Close a connection and, if it was checked out, give back its permit. Idempotent: a
+         * connection invalidated twice (say, by a failed request and then by a stale-pool
+         * eviction) must not free two permits.
          */
         void invalidate(PooledConnection conn) {
+            discard(conn);
+            if (conn.checkIn()) {
+                permits.release();
+            }
+        }
+
+        /**
+         * Close a connection and stop counting it.
+         */
+        private void discard(PooledConnection conn) {
             conn.closeQuietly();
             if (allConnections.remove(conn)) {
                 totalConnections.decrementAndGet();
-                permits.release();
             }
         }
 
@@ -378,6 +403,9 @@ public class ConnectionPool {
         private ByteBuffer writeBuffer; // Mutable for dynamic growth
         private boolean authenticated;
         private boolean reused;
+        // Whether a caller holds this connection, and with it one of the host pool's permits
+        private final java.util.concurrent.atomic.AtomicBoolean checkedOut =
+                new java.util.concurrent.atomic.AtomicBoolean();
 
         PooledConnection(String host, SocketChannel channel) {
             this.host = host;
@@ -422,6 +450,17 @@ public class ConnectionPool {
 
         void markReused() {
             reused = true;
+        }
+
+        void checkOut() {
+            checkedOut.set(true);
+        }
+
+        /**
+         * @return true if the connection was checked out, so the caller must free its permit
+         */
+        boolean checkIn() {
+            return checkedOut.compareAndSet(true, false);
         }
 
         public boolean isAuthenticated() {

@@ -194,15 +194,23 @@ public final class HintedHandoff {
     }
 
     private void truncate(String nodeId) {
-        FileChannel channel = files.get(nodeId);
         recordsInFile.remove(nodeId);
-        if (channel != null) {
-            try {
+        if (hintsDir == null) {
+            return;
+        }
+        try {
+            FileChannel channel = files.get(nodeId);
+            if (channel == null && Files.exists(hintFile(nodeId))) {
+                // Hints loaded at startup and not added to since: the file has not been opened
+                // yet. Left as it is, they would be loaded and delivered again on every restart.
+                channel = files.computeIfAbsent(nodeId, this::open);
+            }
+            if (channel != null) {
                 channel.truncate(0);
                 writeHeader(channel, nodeId);
-            } catch (IOException e) {
-                logger.warn("Failed to truncate hints for {}: {}", nodeId, e.getMessage());
             }
+        } catch (IOException | UncheckedIOException e) {
+            logger.warn("Failed to truncate hints for {}: {}", nodeId, e.getMessage());
         }
     }
 
@@ -230,13 +238,16 @@ public final class HintedHandoff {
             Map<String, Hint> dropped = pending.remove(nodeId);
             recordsInFile.remove(nodeId);
             FileChannel channel = files.remove(nodeId);
-            if (channel != null) {
-                try {
+            try {
+                if (channel != null) {
                     channel.close();
-                    Files.deleteIfExists(hintFile(nodeId));
-                } catch (IOException e) {
-                    logger.warn("Failed to delete hints for {}: {}", nodeId, e.getMessage());
                 }
+                if (hintsDir != null) {
+                    // Also when the file was only loaded at startup and never opened for writing
+                    Files.deleteIfExists(hintFile(nodeId));
+                }
+            } catch (IOException e) {
+                logger.warn("Failed to delete hints for {}: {}", nodeId, e.getMessage());
             }
             if (dropped != null && !dropped.isEmpty()) {
                 logger.info("Dropped {} hints for removed node {}", dropped.size(), nodeId);
