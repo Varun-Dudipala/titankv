@@ -15,13 +15,16 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * A cut link drops gossip datagrams and fails node-to-node requests. By default a request fails at
  * once, like a refused connection; with {@link #setBlackholeMillis} it first hangs for that long,
- * like packets that are silently dropped until the caller's timeout.
+ * like packets that are silently dropped until the caller's timeout. {@link #loseReplies} loses
+ * answers to requests that were carried out, between nodes and to clients.
  */
 public final class FaultInjector implements LinkFilter {
 
     private final Set<Long> cut = ConcurrentHashMap.newKeySet();
     private final Map<Long, Long> latencyMillis = new ConcurrentHashMap<>();
     private volatile long blackholeMillis;
+    private volatile double replyLossRate;
+    private volatile double clientReplyLossRate;
 
     private static long link(int fromPort, int toPort) {
         return ((long) fromPort << 32) | toPort;
@@ -54,10 +57,21 @@ public final class FaultInjector implements LinkFilter {
         this.blackholeMillis = millis;
     }
 
+    /**
+     * Lose this share of the replies between nodes, and of the replies to clients, after the
+     * request was carried out: the sender sees a failure for something that happened.
+     */
+    public void loseReplies(double betweenNodes, double toClients) {
+        this.replyLossRate = betweenNodes;
+        this.clientReplyLossRate = toClients;
+    }
+
     /** Restore every link. */
     public void heal() {
         cut.clear();
         latencyMillis.clear();
+        replyLossRate = 0;
+        clientReplyLossRate = 0;
     }
 
     public boolean isCut(int fromPort, int toPort) {
@@ -83,6 +97,20 @@ public final class FaultInjector implements LinkFilter {
         if (latency != null) {
             sleep(latency);
         }
+    }
+
+    @Override
+    public void afterRequest(Node from, Node to) throws IOException {
+        double rate = replyLossRate;
+        if (rate > 0 && java.util.concurrent.ThreadLocalRandom.current().nextDouble() < rate) {
+            throw new SocketTimeoutException("Injected fault: the reply from " + to.getId() + " was lost");
+        }
+    }
+
+    @Override
+    public boolean deliversClientReply(Node from) {
+        double rate = clientReplyLossRate;
+        return rate <= 0 || java.util.concurrent.ThreadLocalRandom.current().nextDouble() >= rate;
     }
 
     private static void sleep(long millis) throws IOException {

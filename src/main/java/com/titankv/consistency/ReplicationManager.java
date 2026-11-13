@@ -407,8 +407,10 @@ public final class ReplicationManager implements ReplicaIO {
             Optional<KeyValuePair> entry = localStore.getRaw(key);
             return entry.map(kv -> new ReadResult(kv.getValue(), kv.getTimestamp(), kv.getExpiresAt()));
         }
-        return client(replica, background).getInternalWithMetadata(key)
+        Optional<ReadResult> result = client(replica, background).getInternalWithMetadata(key)
                 .map(m -> new ReadResult(m.getValue(), m.getTimestamp(), m.getExpiresAt()));
+        clusterManager.getLinkFilter().afterRequest(clusterManager.getLocalNode(), replica);
+        return result;
     }
 
     /**
@@ -420,9 +422,11 @@ public final class ReplicationManager implements ReplicaIO {
             return localStore.putOrSuperseded(key, value, timestamp, expiresAt);
         }
         TitanKVClient client = client(replica, background);
-        return value == null
+        long newer = value == null
                 ? client.deleteInternal(key, timestamp, expiresAt)
                 : client.putInternal(key, value, timestamp, expiresAt);
+        clusterManager.getLinkFilter().afterRequest(clusterManager.getLocalNode(), replica);
+        return newer;
     }
 
     /**
