@@ -399,20 +399,37 @@ copy replaced the other, and anti-entropy exchanged the key on every round witho
 - **Fault injection.** Every node consults a `LinkFilter` before it sends a gossip datagram or a
   node-to-node request; production nodes use a no-op. In tests a `FaultInjector` cuts links in one
   or both directions (refusing requests at once, or swallowing them until a timeout) and adds
-  latency, the way Cassandra's in-JVM tests filter messages. `PartitionTest` uses it for a 2 | 3
-  split, an isolated node, a one-way cut and a slow replica. `PartitionChaosTest` runs the chaos
-  workload while a nemesis cycles through isolation, splits, one-way cuts, crashes, and crashes
-  during a partition, and a node cut off and then crashed, once with correct clocks and once with
-  node clocks up to 20 seconds and client clocks up to 15 seconds wrong, and afterwards also
-  requires all three replicas of every key to hold the same version. Clients
-  are not partitioned: they can always reach every node.
-- **What the tests do not show.** Nodes run in one JVM. A "crash" stops a node's threads without
-  losing data the OS had not yet written, so the tests cannot find a missing fsync or directory
-  sync. Tests skew the clocks that issue and check versions (clients' and nodes' hybrid clocks);
-  expiry, tombstone age and gossip freshness read the machine's wall clock directly, which no test
-  skews. The chaos workloads have one writer per key and no deletes or TTLs, so ordering between
-  clients is covered only by the scripted cases in `ClockSkewTest`, not under faults. The fault
-  injector fails a request before it is sent; it cannot lose the reply to a request that was applied.
+  latency, the way Cassandra's in-JVM tests filter messages. It can also lose the reply to a
+  request that was carried out, between nodes and to clients: the sender then sees a failure for
+  something that happened, which is what makes retries and failover with a reused version occur.
+  `PartitionTest` uses it for a 2 | 3 split, an isolated node, a one-way cut and a slow replica.
+  A shared `Nemesis` cycles through isolation, splits, one-way cuts, lost replies, crashes,
+  crashes during a partition, and a node cut off and then crashed. `PartitionChaosTest` runs the
+  chaos workload under it, once with correct clocks and once with node clocks up to 20 seconds
+  and client clocks up to 15 seconds wrong, and afterwards also requires all three replicas of
+  every key to hold the same entry. Clients are not partitioned: they can always reach every node.
+- **Many writers per key, with a checked history.** The chaos workloads above give each key one
+  writer, so one client's clock orders that key's writes whatever the cluster does; they could
+  not see a write from one client lost to another's, a delete undone, or a failed write surfacing
+  over a later one, and three bugs of exactly that kind got past them. `MultiWriterChaosTest` has
+  eight clients reading, writing (some with a TTL) and deleting the same twenty keys under the
+  nemesis, with correct and with skewed clocks. Every operation is recorded with its start and
+  end time, and `HistoryChecker` then checks the whole history: a read may not return a value
+  nobody wrote, a value before its write started, or a value (or a missing key) that another
+  write, acknowledged after it finished and before the read started, had replaced. A write whose
+  outcome is unknown may take effect at any later time. This is the guarantee QUORUM gives a
+  last-write-wins register; it is weaker than linearizability, which TitanKV does not claim. The
+  checker has its own tests, and the chaos test was checked against a deliberately broken build:
+  with the STALE reply switched off it reported 760 violations in one run.
+- **Real processes, killed.** `ProcessCrashTest` runs three nodes as separate JVMs and kills them
+  with SIGKILL under the same shared-key workload. A node then dies between any two instructions,
+  mid-append and mid-request, and returns as a new process with only what it wrote to disk.
+- **What the tests do not show.** SIGKILL does not lose data the kernel has accepted but not yet
+  written, so no test can find a missing fsync or directory sync; that needs a power cut or a
+  fault-injecting filesystem. Tests skew the clocks that issue and check versions (clients' and
+  nodes' hybrid clocks); expiry, tombstone age and gossip freshness read the machine's wall clock
+  directly, which no test skews. Nothing expires during a chaos run. Clients are never cut off
+  from nodes, only nodes from each other.
 
 ## Security summary
 

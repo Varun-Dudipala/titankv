@@ -34,4 +34,22 @@ public interface LinkFilter {
      * and throws to fail the request the way an unreachable peer would.
      */
     void beforeRequest(Node from, Node to) throws IOException;
+
+    /**
+     * Called after another node has carried out a request and answered. Throwing loses the
+     * answer: the sender sees a failure for something that did happen, which is the case that
+     * makes retries, hints for data the replica already has, and failover with a reused version
+     * occur.
+     */
+    default void afterRequest(Node from, Node to) throws IOException {
+        // no faults
+    }
+
+    /**
+     * @return false to lose this node's reply to a client request it has already carried out;
+     *         the connection is closed instead, as a network failure would leave it
+     */
+    default boolean deliversClientReply(Node from) {
+        return true;
+    }
 }
