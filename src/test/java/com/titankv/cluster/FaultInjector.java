@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class FaultInjector implements LinkFilter {
 
     private final Set<Long> cut = ConcurrentHashMap.newKeySet();
+    private final Set<Long> requestsCut = ConcurrentHashMap.newKeySet();
     private final Map<Long, Long> latencyMillis = new ConcurrentHashMap<>();
     private volatile long blackholeMillis;
     private volatile double replyLossRate;
@@ -33,6 +34,15 @@ public final class FaultInjector implements LinkFilter {
     /** Cut traffic from one node to another; the opposite direction is unaffected. */
     public void cut(int fromPort, int toPort) {
         cut.add(link(fromPort, toPort));
+    }
+
+    /**
+     * Fail the requests one node sends another while its gossip still gets through, so the two
+     * keep seeing each other as up. Lets a test hold a node in a state it would otherwise leave
+     * within milliseconds (a node that cannot yet repair itself from its peers, say).
+     */
+    public void cutRequests(int fromPort, int toPort) {
+        requestsCut.add(link(fromPort, toPort));
     }
 
     /** Cut every link between the two groups, in both directions. */
@@ -69,6 +79,7 @@ public final class FaultInjector implements LinkFilter {
     /** Restore every link. */
     public void heal() {
         cut.clear();
+        requestsCut.clear();
         latencyMillis.clear();
         replyLossRate = 0;
         clientReplyLossRate = 0;
@@ -85,7 +96,7 @@ public final class FaultInjector implements LinkFilter {
 
     @Override
     public void beforeRequest(Node from, Node to) throws IOException {
-        if (isCut(from.getPort(), to.getPort())) {
+        if (isCut(from.getPort(), to.getPort()) || requestsCut.contains(link(from.getPort(), to.getPort()))) {
             long hang = blackholeMillis;
             if (hang > 0) {
                 sleep(hang);

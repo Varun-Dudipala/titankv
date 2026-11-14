@@ -35,8 +35,10 @@ Try a change on a real cluster:
   integration test on a `TestCluster`, and consider whether the chaos test covers the failure mode.
 - A change that may affect performance includes before/after numbers from
   `./scripts/benchmark-suite.sh` (or the relevant scenario), measured on the same machine.
-- A wire-format change updates the protocol section of the README. The protocol has no version
-  field, so every node and client in a cluster must run the same build.
+- A change to the wire format, or to what a field means, increases `BinaryProtocol.PROTOCOL_VERSION`
+  (and `GossipProtocol.GOSSIP_VERSION` for gossip) and updates the protocol section of the README.
+  Nodes refuse frames of another version, so every node and client in a cluster must run builds
+  with the same versions; there is no rolling upgrade across a version change.
 
 ## Layout
 

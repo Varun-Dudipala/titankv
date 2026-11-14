@@ -651,6 +651,10 @@ public class ConnectionHandler {
         if (command.getKey() == null) {
             return Response.error("Key required for GET");
         }
+        if (clusterManager != null && clusterManager.isCatchingUp()) {
+            // An empty replica's "not found" must not count toward a read quorum
+            return Response.error("Node is catching up; it cannot answer reads yet");
+        }
         // Read directly from local store without replication (include tombstones)
         Optional<KeyValuePair> result = store.getRaw(command.getKey());
         if (result.isPresent()) {

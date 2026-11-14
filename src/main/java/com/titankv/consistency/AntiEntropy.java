@@ -45,6 +45,7 @@ public final class AntiEntropy {
     static final byte MODE_ROOT = 0;
     static final byte MODE_FULL = 1;
     static final int LEAVES_PER_REQUEST = 64;
+    private static final long CATCH_UP_POLL_MS = 200;
 
     private final ClusterManager clusterManager;
     private final InMemoryStore store;
@@ -93,6 +94,7 @@ public final class AntiEntropy {
             scheduler.scheduleWithFixedDelay(this::repairWithRandomPeer, intervalMs, intervalMs,
                     TimeUnit.MILLISECONDS);
         }
+        scheduler.scheduleWithFixedDelay(this::catchUp, CATCH_UP_POLL_MS, CATCH_UP_POLL_MS, TimeUnit.MILLISECONDS);
         // When a node leaves or is removed, its keys gain new replicas that have none of the data:
         // repair with every peer right away instead of waiting for the periodic rounds.
         clusterManager.addEventListener(event -> {
@@ -105,6 +107,39 @@ public final class AntiEntropy {
                 scheduler.schedule(() -> repairQuietly(restarted), 2, TimeUnit.SECONDS);
             }
         });
+    }
+
+    /**
+     * If this node started without data, repair it from every peer that is up, and only then let
+     * it answer reads (see {@link ClusterManager#isCatchingUp}). Runs until that has succeeded
+     * with each of them in one pass; a peer that cannot be reached yet is tried again.
+     */
+    private void catchUp() {
+        try {
+            if (!clusterManager.isCatchingUp() || !clusterManager.hasCompleteMembership()) {
+                return;
+            }
+            int peers = 0;
+            int pulled = 0;
+            for (Node node : clusterManager.getAllNodes()) {
+                if (node.equals(clusterManager.getLocalNode()) || !node.isAvailable()) {
+                    continue;
+                }
+                peers++;
+                try {
+                    pulled += repairWith(node).pulled();
+                } catch (IOException | RuntimeException e) {
+                    logger.debug("Catching up from {} failed, will retry: {}", node.getId(), e.getMessage());
+                    return;
+                }
+            }
+            if (peers > 0 || clusterManager.getNodeCount() == 1) {
+                logger.info("Caught up from {} peers ({} keys received)", peers, pulled);
+                clusterManager.caughtUp();
+            }
+        } catch (RuntimeException e) {
+            logger.warn("Catch-up round failed: {}", e.getMessage());
+        }
     }
 
     private void repairWithAllPeers() {

@@ -140,7 +140,8 @@ With replication factor 3:
 | It comes back | Gossip sees a newer heartbeat and hints are delivered; if the process restarted, an immediate Merkle-tree repair sends it only the keys it is missing; read repair fixes anything else it serves. |
 | Two of a key's three replicas are down | QUORUM and ALL fail with "Not enough replicas" instead of accepting a write on one copy; ONE still works. |
 | A node is gone for good | `removenode <id>` drops it cluster-wide; nodes that were down or cut off at the time learn of it from later gossip. Anti-entropy re-replicates its keys to their new replicas. |
-| A node joins | It takes over ranges at once and peers stream it their keys; a QUORUM read during that window can miss a write (see limitations). |
+| A node joins | It takes over ranges and receives writes at once, but answers no reads until it has been repaired from every peer that is up. Reads for its keys are served by the two older replicas meanwhile. |
+| A node restarts with no data (no WAL, or a replaced disk) | The same: it answers no reads, as coordinator or replica, until it has caught up from its peers. An empty replica's "not found" never counts toward a read quorum. |
 | A node restarts | It has its saved member list at once, down members included, and rejects client requests (`/ready` is 503) until a peer that knows the whole membership confirms it, or 5 seconds pass without one doing so. A node with nothing saved waits for such a peer, or for every seed. |
 | The whole cluster stops and only some nodes return | They know the full ring from disk, so they refuse QUORUM for keys whose replicas are still down instead of accepting them onto the wrong nodes. |
 | Network partition | Each side serves keys with enough reachable replicas; afterwards hints, read repair and anti-entropy converge them. |
@@ -182,9 +183,14 @@ Ports per node: client TCP on `--port`, gossip UDP on port + 1000, metrics HTTP 
 ## Binary protocol
 
 ```
-Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY][VALUE]
-Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE]
+Request:  [MAGIC:3][VERSION:1][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY][VALUE]
+Response: [MAGIC:3][VERSION:1][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE]
 ```
+
+Every frame starts with `TKV` and the protocol version (2). A node refuses frames of another
+version, and gossip messages carry a version of their own, so a client or node from a build with
+a different protocol is turned away with a message that says so instead of being misread. There
+is no rolling upgrade across a version change.
 
 Big-endian; `VAL_LEN` of -1 means no value (distinct from an empty value). The low 6 bits of `CMD`
 are the command and the top 2 bits an optional consistency level for GET, EXISTS, PUT and DELETE
@@ -259,8 +265,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 215 unit tests
-mvn verify     # + 79 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+mvn test       # 218 unit tests
+mvn verify     # + 82 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -274,6 +280,8 @@ The integration suite includes:
   writers, concurrent writes with equal versions
 - gossip convergence on 5 nodes, crash detection, graceful shutdown and restart, `removenode` (also
   reaching a node that was cut off at the time), join + `cleanup`, admin commands requiring the cluster token
+- a node that restarts empty or joins, held back from reads until it has caught up; frames and
+  gossip from another protocol version
 - stalled connections, the connection limit, WAL damage in the middle of the log, a failing WAL,
   torn hint files, a full store that must still take deletes
 - restarts with saved membership: a full stop after which only two of five nodes return, a node
@@ -300,9 +308,13 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
   an acknowledging replica holds that version, which QUORUM guarantees and ONE does not.
 - **No linearizable operations.** There is no compare-and-set or transactions (would need Paxos/Raft per key).
 - **Memory-bound storage.** All data lives in memory, backed by the WAL; there is no LSM tree.
-- **No pending ranges during a join.** A joining node becomes a replica as soon as it is known and is
-  streamed its data in the background, so for that window a QUORUM read can miss a recent write
-  (Cassandra writes to both old and new replicas until bootstrap completes).
+- **A join is not atomic.** A joining node answers no reads until it has caught up, which closes
+  the window in which it could answer "not found" for data it had not received yet. Two things
+  remain. While it catches up, its keys have two answering replicas, so QUORUM reads of them fail
+  if one of those is down. And nodes learn of the join a gossip round apart: a coordinator still on
+  the old ring after the new node has caught up can acknowledge a write on replicas a reader on the
+  new ring does not ask. Cassandra's pending ranges (write to old and new replicas until
+  bootstrap completes) close that too.
 - **Fixed failure-detection timeouts** (3s/10s) rather than an adaptive phi-accrual detector.
 - **Snapshots pause writes** while all entries are written out (when the WAL passes 128 MB).
 - **Hints are not fsynced**; a coordinator crash can lose some, which anti-entropy then repairs.

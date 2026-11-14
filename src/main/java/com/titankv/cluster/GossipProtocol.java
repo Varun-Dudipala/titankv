@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * members in a digest are added, so new nodes become known cluster-wide.
  *
  * Wire format (big endian), optionally followed by a 32-byte HMAC-SHA256 of the message:
- *   header:  [type:1][sentAt:8][senderId:str]
+ *   header:  [gossip version:1][type:1][sentAt:8][senderId:str]
  *   JOIN:    header [host:str][port:4][generation:8][version:8]
  *   LEAVE:   header                                     (the sender is shutting down)
  *   REMOVE:  header [removed id:str][removed generation:8]   (an operator removed a dead node)
@@ -46,6 +46,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public class GossipProtocol {
 
     private static final Logger logger = LoggerFactory.getLogger(GossipProtocol.class);
+
+    /** Increase with any change to the messages; a node drops messages of another version. */
+    static final byte GOSSIP_VERSION = 2;
 
     private static final byte MSG_JOIN = 0x01;
     private static final byte MSG_LEAVE = 0x02;
@@ -77,6 +80,7 @@ public class GossipProtocol {
     private final ConcurrentHashMap<String, Long> lastReceivedAt = new ConcurrentHashMap<>();
     private volatile List<Node> seeds = List.of();
     private volatile boolean digestReceived;
+    private long lastVersionWarningNanos = System.nanoTime() - TimeUnit.SECONDS.toNanos(60);
 
     private DatagramSocket socket;
     private ExecutorService receiver;
@@ -334,6 +338,7 @@ public class GossipProtocol {
 
     private ByteBuffer newMessage(byte type) {
         ByteBuffer buffer = ByteBuffer.allocate(MAX_PACKET_SIZE - HMAC_SIZE);
+        buffer.put(GOSSIP_VERSION);
         buffer.put(type);
         buffer.putLong(nextSentAt());
         writeString(buffer, localNode.getId());
@@ -395,6 +400,17 @@ public class GossipProtocol {
     private void handleMessage(ByteBuffer buffer, InetAddress from, int fromPort) {
         byte type = 0;
         try {
+            byte version = buffer.get();
+            if (version != GOSSIP_VERSION) {
+                long now = System.nanoTime();
+                if (now - lastVersionWarningNanos > TimeUnit.SECONDS.toNanos(30)) {
+                    lastVersionWarningNanos = now;
+                    logger.warn("Dropping gossip from {}:{}: it speaks gossip version {}, this node version {}. "
+                            + "Every node of a cluster must run a build with the same version.", from, fromPort,
+                            version, GOSSIP_VERSION);
+                }
+                return;
+            }
             type = buffer.get();
             long sentAt = buffer.getLong();
             String senderId = readString(buffer);
