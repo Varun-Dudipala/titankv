@@ -6,14 +6,15 @@ actual behaviour, and logs; for a feature, the use case and how it fits the desi
 
 ## Build and test
 
-Requires Java 17+ and Maven 3.6+.
+Requires Java 17+. Maven itself is not needed: `./mvnw` (or `mvnw.cmd` on Windows) downloads
+the pinned Maven version on first use.
 
 ```bash
-mvn clean package          # build target/titankv-1.0.0.jar and run the unit tests
-mvn verify                 # + integration tests (real in-JVM clusters, including the chaos test)
-                           #   and the 75% line-coverage gate
-mvn test -Dtest=ConsistentHashTest
-mvn verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test=ChaosTest
+./mvnw clean package          # build target/titankv-1.0.0.jar and run the unit tests
+./mvnw verify                 # + integration tests (real in-JVM clusters, including the chaos test)
+                               #   and the 75% line-coverage gate
+./mvnw test -Dtest=ConsistentHashTest
+./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test=ChaosTest
 ```
 
 Integration tests are tagged `integration` and run under Failsafe. They bind client ports from 19000
@@ -30,7 +31,7 @@ Try a change on a real cluster:
 
 ## Expectations for a pull request
 
-- `mvn verify` passes, and the build has no compiler warnings (it compiles with `-Xlint:all`).
+- `./mvnw verify` passes, and the build has no compiler warnings (it compiles with `-Xlint:all`).
 - A behaviour change comes with a test. For replication, membership or storage changes, prefer an
   integration test on a `TestCluster`, and consider whether the chaos test covers the failure mode.
 - A change that may affect performance includes before/after numbers from

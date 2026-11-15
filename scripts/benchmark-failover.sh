@@ -22,7 +22,7 @@ export TITANKV_CLUSTER_SECRET=failover-benchmark-secret
 export TITANKV_DATA_DIR="$PROJECT_DIR/data"
 HOSTS=localhost:9001,localhost:9002,localhost:9003
 
-(cd "$PROJECT_DIR" && mvn -q -B package -DskipTests)
+(cd "$PROJECT_DIR" && ./mvnw -q -B package -DskipTests)
 JAR_FILE=$(ls -t "$PROJECT_DIR"/target/titankv-*.jar | grep -v original | head -1)
 
 "$SCRIPT_DIR/stop-cluster.sh" > /dev/null

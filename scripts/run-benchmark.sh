@@ -15,7 +15,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 JAR_FILE=$(ls -t "$PROJECT_DIR"/target/titankv-*.jar 2>/dev/null | grep -v original | head -1 || true)
 if [ -z "$JAR_FILE" ]; then
     echo "JAR not found, building..."
-    (cd "$PROJECT_DIR" && mvn -q package -DskipTests)
+    (cd "$PROJECT_DIR" && ./mvnw -q package -DskipTests)
     JAR_FILE=$(ls -t "$PROJECT_DIR"/target/titankv-*.jar | grep -v original | head -1)
 fi
 

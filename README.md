@@ -64,10 +64,11 @@ docker compose down -v
 
 ### Local
 
-Requires Java 17+ and Maven 3.6+.
+Requires Java 17+. Maven itself is not needed: `./mvnw` (or `mvnw.cmd` on Windows) downloads
+the pinned Maven version on first use.
 
 ```bash
-mvn clean package                       # builds target/titankv-1.0.0.jar, runs unit tests
+./mvnw clean package                    # builds target/titankv-1.0.0.jar, runs unit tests
 ./scripts/start-cluster.sh              # 3 nodes on 9001-9003 (dev mode); waits until the cluster forms
 ./scripts/titankv-cli.sh localhost:9001 # interactive shell
 ./scripts/stop-cluster.sh
@@ -265,8 +266,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-mvn test       # 218 unit tests
-mvn verify     # + 82 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 218 unit tests
+./mvnw verify     # + 82 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
