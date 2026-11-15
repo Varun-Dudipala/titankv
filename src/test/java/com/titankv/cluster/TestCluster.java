@@ -98,6 +98,18 @@ public final class TestCluster implements AutoCloseable {
         faults.cut(basePort + from, basePort + to);
     }
 
+    /**
+     * Fail every request a node sends to the other nodes, while its gossip still gets through.
+     * The node may be one that has not been started yet (the next index, before {@link #addNode}).
+     */
+    public void cutRequestsFrom(int index) {
+        for (int i = 0; i <= servers.size(); i++) {
+            if (i != index) {
+                faults.cutRequests(basePort + index, basePort + i);
+            }
+        }
+    }
+
     /** Add latency to every request one node sends another. */
     public void slowLink(int from, int to, long millis) {
         faults.delay(basePort + from, basePort + to, millis);

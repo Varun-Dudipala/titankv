@@ -108,6 +108,41 @@ class BinaryProtocolTest {
         assertThat(decoded.isOk()).isTrue();
     }
 
+    /**
+     * A frame from a build with another protocol version is refused by name. The fields mean
+     * different things between versions, so reading it anyway would do the wrong thing quietly.
+     */
+    @Test
+    void frameOfAnotherProtocolVersion_isRefusedWithItsVersion() {
+        int otherVersion = BinaryProtocol.PROTOCOL_VERSION + 1;
+        ByteBuffer request = BinaryProtocol.encode(Command.put("key", "value".getBytes(StandardCharsets.UTF_8)));
+        request.put(3, (byte) otherVersion);
+        ByteBuffer response = BinaryProtocol.encode(Response.ok());
+        response.put(3, (byte) 1);
+
+        assertThatThrownBy(() -> BinaryProtocol.hasCompleteRequest(request))
+            .isInstanceOf(ProtocolException.class)
+            .hasMessageContaining("Unsupported protocol version " + otherVersion)
+            .hasMessageContaining("speaks version " + BinaryProtocol.PROTOCOL_VERSION);
+        assertThatThrownBy(() -> BinaryProtocol.decodeCommand(request))
+            .isInstanceOf(ProtocolException.class).hasMessageContaining("Unsupported protocol version");
+        assertThatThrownBy(() -> BinaryProtocol.hasCompleteResponse(response))
+            .isInstanceOf(ProtocolException.class).hasMessageContaining("Unsupported protocol version 1");
+        assertThatThrownBy(() -> BinaryProtocol.decodeResponse(response))
+            .isInstanceOf(ProtocolException.class).hasMessageContaining("Unsupported protocol version 1");
+    }
+
+    @Test
+    void everyFrameStartsWithTheProtocolNameAndVersion() {
+        ByteBuffer request = BinaryProtocol.encode(Command.ping());
+        ByteBuffer response = BinaryProtocol.encode(Response.pong());
+
+        for (ByteBuffer frame : new ByteBuffer[] {request, response}) {
+            assertThat(new byte[] {frame.get(0), frame.get(1), frame.get(2)}).isEqualTo("TKV".getBytes(StandardCharsets.US_ASCII));
+            assertThat(frame.get(3)).isEqualTo((byte) BinaryProtocol.PROTOCOL_VERSION);
+        }
+    }
+
     @Test
     void decode_invalidMagic_throwsException() {
         ByteBuffer buffer = ByteBuffer.allocate(40);

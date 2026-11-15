@@ -7,15 +7,41 @@ import java.nio.charset.StandardCharsets;
  * Binary wire protocol encoder/decoder for TitanKV.
  *
  * Protocol format:
- * Request:  [MAGIC:4][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY:N][VALUE:M]
- * Response: [MAGIC:4][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE:N]
+ * Request:  [MAGIC:3][VERSION:1][CMD:1][KEY_LEN:4][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][KEY:N][VALUE:M]
+ * Response: [MAGIC:3][VERSION:1][STATUS:1][VAL_LEN:4][TIMESTAMP:8][EXPIRES:8][VALUE:N]
  *
  * Header size: 29 bytes (request), 25 bytes (response)
+ *
+ * Every frame starts with the three bytes "TKV" and the protocol version. A frame with another
+ * version is refused with a message that says so: the meaning of the fields has changed between
+ * versions (the timestamp of a client PUT was the client's causal context in version 1 and is the
+ * write's version in version 2), and reading one as the other would silently do the wrong thing.
  */
 public final class BinaryProtocol {
 
-    // Magic bytes: "TITK" in hex
-    public static final int MAGIC = 0x5449544B;
+    /** Increase with any change to the frames or to what their fields mean. */
+    public static final int PROTOCOL_VERSION = 2;
+
+    // "TKV" followed by the protocol version
+    private static final int MAGIC_PREFIX = 0x544B5600;
+    public static final int MAGIC = MAGIC_PREFIX | PROTOCOL_VERSION;
+
+    /**
+     * @throws ProtocolException if the first four bytes of a frame are not this protocol's, saying
+     *                           whether it is another version of it or something else entirely
+     */
+    private static void checkMagic(int magic) {
+        if (magic == MAGIC) {
+            return;
+        }
+        if ((magic & 0xFFFFFF00) == MAGIC_PREFIX) {
+            throw new ProtocolException("Unsupported protocol version " + (magic & 0xFF)
+                    + ": this build speaks version " + PROTOCOL_VERSION
+                    + ". Clients and nodes must run builds with the same protocol version.");
+        }
+        throw new ProtocolException(String.format(
+                "Invalid magic bytes: expected 0x%08X, got 0x%08X. This is not a TitanKV frame.", MAGIC, magic));
+    }
 
     // Header sizes
     public static final int REQUEST_HEADER_SIZE = 29;  // magic(4) + cmd(1) + keyLen(4) + valLen(4) + timestamp(8) + expires(8)
@@ -156,10 +182,7 @@ public final class BinaryProtocol {
         }
 
         int magic = buffer.getInt();
-        if (magic != MAGIC) {
-            throw new ProtocolException(String.format(
-                "Invalid magic bytes: expected 0x%08X, got 0x%08X", MAGIC, magic));
-        }
+        checkMagic(magic);
 
         byte wireType = buffer.get();
         byte cmdType = (byte) (wireType & Command.TYPE_MASK);
@@ -209,10 +232,7 @@ public final class BinaryProtocol {
         }
 
         int magic = buffer.getInt();
-        if (magic != MAGIC) {
-            throw new ProtocolException(String.format(
-                "Invalid magic bytes: expected 0x%08X, got 0x%08X", MAGIC, magic));
-        }
+        checkMagic(magic);
 
         byte status = buffer.get();
         int valueLength = buffer.getInt();
@@ -266,12 +286,7 @@ public final class BinaryProtocol {
 
         // Check magic bytes - throw on mismatch to prevent DoS
         int magic = buffer.getInt(pos);
-        if (magic != MAGIC) {
-            throw new ProtocolException(String.format(
-                "Invalid magic bytes: expected 0x%08X, got 0x%08X. " +
-                "This may indicate a protocol mismatch or attack.",
-                MAGIC, magic));
-        }
+        checkMagic(magic);
 
         if (remaining < REQUEST_HEADER_SIZE) {
             // Valid magic but need more bytes for full header
@@ -319,12 +334,7 @@ public final class BinaryProtocol {
 
         // Check magic bytes - throw on mismatch to prevent DoS
         int magic = buffer.getInt(pos);
-        if (magic != MAGIC) {
-            throw new ProtocolException(String.format(
-                "Invalid magic bytes: expected 0x%08X, got 0x%08X. " +
-                "This may indicate a protocol mismatch or attack.",
-                MAGIC, magic));
-        }
+        checkMagic(magic);
 
         if (remaining < RESPONSE_HEADER_SIZE) {
             // Valid magic but need more bytes for full header

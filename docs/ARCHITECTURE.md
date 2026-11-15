@@ -373,10 +373,25 @@ copy replaced the other, and anti-entropy exchanged the key on every round witho
 
 - **Join.** A new node gossips its way in and takes over parts of the ring. Nodes that share keys with
   it stream those keys (tombstones included, original versions kept) to it, and anti-entropy covers
-  anything missed. The new node is a replica from the moment it is known, before streaming ends, so
-  a QUORUM read in that window can miss a recent write. Closing the window would need Cassandra's
-  pending ranges: write to old and new replicas, read from the old ones, until bootstrap completes. The nodes that gave up ranges keep their copies until an operator runs `cleanup`,
-  which writes each such key to all its current replicas and only then deletes the local copy.
+  anything missed. The new node is a replica for writes from the moment it is known, but answers
+  no reads until it has caught up (below). The nodes that gave up ranges keep their copies until
+  an operator runs `cleanup`, which writes each such key to all its current replicas and only
+  then deletes the local copy.
+- **Catching up before answering reads.** A node that starts with no data in a cluster (it has
+  just joined, it runs without a WAL, or its disk was replaced) runs a Merkle repair with every
+  peer that is up, and until one pass of that has succeeded it refuses client requests (`/ready`
+  is 503) and answers replica reads with an error, so the coordinator asks another replica. It
+  accepts writes throughout. Quorum overlap assumes a replica still holds what it acknowledged.
+  Without this, a node that restarted empty answered "not found" at once: together with one
+  replica that had missed a write, it outvoted the one replica that held it, and an acknowledged
+  write read as missing (`CatchUpTest` reproduces it). For a join, a key's new replica set is two
+  of its old replicas and the new node; any write acknowledged by two of the old three is on at
+  least one of those two, so reads answered by them alone see it.
+
+  What is left of the join window: nodes learn of a join a gossip round apart. A coordinator
+  still on the old ring after the new node has caught up can acknowledge a write on replicas
+  that a reader on the new ring does not ask. Closing that needs Cassandra's pending ranges:
+  write to old and new replicas until every node has the new ring.
 - **Restart** (after a crash or a graceful shutdown). Peers deliver the node's hints and run a
   Merkle-tree repair with it, which sends only the keys its WAL did not have (all of them if it ran
   without a WAL). The restarted node sends nothing: the members it rediscovers are not new to the

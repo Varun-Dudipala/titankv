@@ -47,6 +47,9 @@ public class ClusterManager {
     private volatile boolean savedMembership;
     // A peer whose own membership was complete has sent this node its whole member list
     private volatile boolean learnedFromPeer;
+    // This node started with no data and has not yet been repaired from its peers
+    private volatile boolean startedWithoutData;
+    private volatile boolean caughtUp;
 
     /**
      * Create a new cluster manager.
@@ -589,7 +592,8 @@ public class ClusterManager {
      * Whether this node may serve client requests. A node started with seeds belongs to a cluster,
      * so it must not serve until it knows the cluster's whole membership: as a one-node cluster it
      * would accept writes with a single copy, and with a partial ring it would send keys to the
-     * wrong replicas. It knows the membership once one of these holds:
+     * wrong replicas. A node that started without data must also have caught up with its peers
+     * ({@link #isCatchingUp}). It knows the membership once one of these holds:
      * <ul>
      *   <li>a peer that itself has the complete membership has sent its whole member list;</li>
      *   <li>it restarted with a saved membership and {@value #SAVED_MEMBERSHIP_GRACE_MS} ms have
@@ -600,7 +604,7 @@ public class ClusterManager {
      * </ul>
      */
     public boolean isReady() {
-        if (!running) {
+        if (!running || isCatchingUp()) {
             return false;
         }
         if (!seedsConfigured || learnedFromPeer) {
@@ -619,6 +623,36 @@ public class ClusterManager {
      */
     public boolean hasCompleteMembership() {
         return !seedsConfigured || learnedFromPeer || savedMembership || nodes.size() > seedCount;
+    }
+
+    /**
+     * Tell this node that it started with no data: it has no write-ahead log, its disk was
+     * replaced, or it is new. Call before {@link #start}.
+     */
+    public void startedWithoutData() {
+        startedWithoutData = true;
+    }
+
+    /**
+     * Whether this node started without data in a cluster and has not yet been repaired from its
+     * peers. Until it has, it must not answer reads, as a coordinator or as a replica. Quorum
+     * overlap assumes a replica still has every write it acknowledged; an empty replica answering
+     * "not found" alongside one other replica that missed a write would outvote the one replica
+     * that has it. The same holds for a node that has just joined and holds none of its ranges
+     * yet. It accepts writes throughout, so it only has to catch up on the past.
+     */
+    public boolean isCatchingUp() {
+        return running && startedWithoutData && seedsConfigured && !caughtUp;
+    }
+
+    /**
+     * Called once this node has been repaired from every peer that is up.
+     */
+    public void caughtUp() {
+        if (!caughtUp) {
+            caughtUp = true;
+            logger.info("Node {} has caught up with its peers and now answers reads", localNode.getId());
+        }
     }
 
     /**

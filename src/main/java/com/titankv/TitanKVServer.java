@@ -65,6 +65,11 @@ public class TitanKVServer {
         this.shutdownLatch = new CountDownLatch(1);
         this.clusterManager = new ClusterManager(new Node(this.nodeId, getHostFromId(this.nodeId), port),
                 membershipFile(store, port));
+        if (store instanceof InMemoryStore && ((InMemoryStore) store).rawSize() == 0) {
+            // No WAL, a replaced disk, or a new node: it must be repaired from its peers before
+            // it answers reads
+            clusterManager.startedWithoutData();
+        }
         this.replicationManager = new ReplicationManager(clusterManager, store, hintsDir(store, port));
         this.tcpServer = new TcpServer(port, store, metrics, replicationManager, clusterManager);
     }
