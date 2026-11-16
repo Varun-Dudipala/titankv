@@ -238,30 +238,38 @@ clocks, the three convergence mechanisms, WAL recovery and the design trade-offs
 
 ## Performance
 
-**These numbers were measured on 2 October 2026 at commit `612ad48` and have not been re-measured.**
-The request path has changed since (one thread pool per peer, versions chosen by the client, replies
-that report superseded writes), so treat them as the earlier code's.
-
-Medians of 5 runs on a 4-vCPU VM running all nodes and the load generator together
+Medians of 5 runs on an Apple M3 laptop (8 CPUs) running all nodes and the load generator together
 ([method, spreads and all scenarios](benchmark/results/benchmark_results.md)):
 
 | Setup | 16 clients, 80% reads | 16 clients, writes only |
 |---|---|---|
-| 1 node, in-memory | 70,106 ops/sec | 70,139 ops/sec |
-| 3 nodes, QUORUM, in-memory | 24,457 ops/sec | 21,068 ops/sec |
-| 3 nodes, QUORUM, auth + fsynced WAL | 12,763 ops/sec | 4,415 ops/sec |
+| 1 node, in-memory | 153,818 ops/sec | 153,601 ops/sec |
+| 3 nodes, QUORUM, in-memory | 61,800 ops/sec | 45,582 ops/sec |
+| 3 nodes, QUORUM, auth + fsynced WAL | 3,271 ops/sec | 672 ops/sec |
 
 Every read in the benchmark is checked against the client's last acknowledged write: across 80
-runs and 16.7M operations there were 0 errors and 0 stale reads. With a node killed mid-run
-(`scripts/benchmark-failover.sh`), a production cluster served 474K operations in 40 seconds with
+runs and 37.9M operations there were 0 errors and 0 stale reads. With a node killed mid-run
+(`scripts/benchmark-failover.sh`), a production cluster served 131K operations in 40 seconds with
 0 errors, and the node recovered from its WAL plus hints and Merkle repair.
 
-Three nodes do about a third of one node's throughput here because replication triples the work
-and all nodes share one 4-core machine. Profiling cut system calls per operation from 13 to 9, a
-59% gain for 3 nodes ([details](benchmark/results/benchmark_results.md#profiling-the-replicated-path)).
+How to read these:
+
+- **Three nodes do 40% of one node's throughput** because replication triples the work and all
+  nodes share one machine. They are a floor, not a measure of scaling.
+- **The durable rows are bound by the disk.** A sync takes about 3 ms on this laptop, three nodes
+  share one drive, and every write waits for two of them. On a cloud VM with sub-millisecond
+  syncs the same scenario ran at 4,400 writes a second.
+- **Throughput at saturation hides latency.** Sent at a fixed rate instead of as fast as possible,
+  the 3-node cluster holds a p99 of 0.33 ms at half its maximum throughput and 3.1 ms at 90% of it
+  ([latency versus load](benchmark/results/benchmark_results.md#latency-versus-load-open-loop)).
+- **The changes since the first version cost nothing measurable.** The build from before them and
+  the current one, run alternately on this machine, are within 2% of each other. That comparison
+  also found a 23% regression on five nodes that every test had passed
+  ([details](benchmark/results/benchmark_results.md#against-the-earlier-build-on-this-machine)).
 
 ```bash
 ./scripts/benchmark-suite.sh      # every scenario, 5 runs each
+./scripts/benchmark-latency.sh    # latency at fixed rates (open loop)
 ./scripts/benchmark-failover.sh   # kill -9 a node under load
 ./scripts/run-benchmark.sh --protocol
 ```

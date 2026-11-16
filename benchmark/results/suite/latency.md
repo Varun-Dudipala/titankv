@@ -1,6 +1,6 @@
 # Latency versus load
 
-Machine: Apple M3, 8 CPUs, macOS 26.6.2; openjdk version "21.0.6" 2025-01-21 LTS. Commit ec84cdc, 2026-11-15.
+Machine: Apple M3, 8 CPUs, macOS 26.6.2; openjdk version "21.0.6" 2025-01-21 LTS. Code at `2ad99ea`, 2026-11-15.
 The 3 nodes and the load generator share this machine and talk over loopback.
 
 3-node cluster, QUORUM reads and writes, RF 3, 80% reads, 100-byte values. 3 runs of 15s per row; each cell is the median across runs (errors, stale reads and unsent requests are totals); the p99 range shows how much single runs vary. Closed loop uses 16 clients; open loop spreads the target rate over 64 clients and measures latency from each request's intended send time.
