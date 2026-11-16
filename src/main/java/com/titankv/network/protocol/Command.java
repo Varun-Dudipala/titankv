@@ -32,6 +32,7 @@ public final class Command {
     public static final byte PUT_INTERNAL = 0x12;  // Put without triggering replication
     public static final byte DELETE_INTERNAL = 0x13;  // Delete without triggering replication
     public static final byte MERKLE_TREE = 0x14;  // Anti-entropy: Merkle tree of keys shared with the sender
+    public static final byte PUT_BATCH_INTERNAL = 0x16;  // Several replica writes in one request (see WriteBatch)
     public static final byte MERKLE_LEAF = 0x15;  // Anti-entropy: key digests in a list of Merkle leaves
 
     static final int TYPE_MASK = 0x3F;

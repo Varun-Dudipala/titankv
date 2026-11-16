@@ -83,6 +83,35 @@ class AuthenticatedClusterTest {
     }
 
     @Test
+    void aWriteBatchWithoutTheTokenIsRejected() throws IOException {
+        byte[] batch = com.titankv.network.protocol.WriteBatch.encode(java.util.List.of(
+                new com.titankv.network.protocol.WriteBatch.Entry("forged-1", "x".getBytes(),
+                        System.currentTimeMillis() << 16, 0),
+                new com.titankv.network.protocol.WriteBatch.Entry("forged-2", null,
+                        System.currentTimeMillis() << 16, 0)));
+        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress("localhost", BASE_PORT))) {
+            ByteBuffer out = BinaryProtocol.encode(new Command(Command.PUT_BATCH_INTERNAL, "forged-1", batch, 0, 0));
+            while (out.hasRemaining()) {
+                channel.write(out);
+            }
+            ByteBuffer in = ByteBuffer.allocate(4096);
+            do {
+                channel.read(in);
+                in.flip();
+                if (BinaryProtocol.hasCompleteResponse(in)) {
+                    break;
+                }
+                in.compact();
+            } while (true);
+            Response response = BinaryProtocol.decodeResponse(in);
+            assertThat(response.isError()).isTrue();
+            assertThat(response.getErrorMessage()).contains("AUTH required");
+        }
+        assertThat(cluster.node(0).getStore().getRaw("forged-1")).isEmpty();
+        assertThat(cluster.node(0).getStore().getRaw("forged-2")).isEmpty();
+    }
+
+    @Test
     void adminCommandsNeedTheClusterToken() throws IOException {
         // No client token is configured, so anyone may read and write, but not remove nodes
         try (TitanKVClient anonymous = cluster.client(cluster.address(0))) {

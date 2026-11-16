@@ -435,6 +435,33 @@ public class TitanKVClient implements AutoCloseable {
     }
 
     /**
+     * Store several versioned values or tombstones on one replica in one request (internal
+     * replication, no cascade).
+     *
+     * @return for each write, 0 if the replica stored that version, the newer version it kept
+     *         instead, or {@link com.titankv.network.protocol.WriteBatch#REFUSED}
+     * @throws IOException if the request fails; none of the writes may then be taken as stored
+     */
+    public long[] putBatchInternal(java.util.List<com.titankv.network.protocol.WriteBatch.Entry> writes)
+            throws IOException {
+        for (com.titankv.network.protocol.WriteBatch.Entry write : writes) {
+            validateKey(write.getKey());
+        }
+        String routingKey = writes.get(0).getKey();
+        Command batch = new Command(Command.PUT_BATCH_INTERNAL, routingKey,
+                com.titankv.network.protocol.WriteBatch.encode(writes), 0, 0);
+        Response response = execute(batch, routingKey);
+        if (response.isError()) {
+            throw new IOException("Server error: " + response.getErrorMessage());
+        }
+        try {
+            return com.titankv.network.protocol.WriteBatch.decodeResults(response.getValueUnsafe(), writes.size());
+        } catch (IllegalArgumentException e) {
+            throw new IOException("Malformed answer to a write batch: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * Delete a key (internal replication, no cascade).
      * This method is used by ReplicationManager to prevent replication loops.
      * Writes a tombstone (null value) with the provided timestamp to prevent

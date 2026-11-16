@@ -77,6 +77,20 @@ public interface KVStore {
     }
 
     /**
+     * {@link #putOrSuperseded} for a caller that must not wait for the disk: the future completes
+     * when the write is durable. A store whose writes never wait may complete it at once.
+     */
+    default java.util.concurrent.CompletableFuture<Long> putOrSupersededAsync(String key, byte[] value,
+            long timestamp, long expiresAt) {
+        try {
+            return java.util.concurrent.CompletableFuture.completedFuture(
+                    putOrSuperseded(key, value, timestamp, expiresAt));
+        } catch (RuntimeException e) {
+            return java.util.concurrent.CompletableFuture.failedFuture(e);
+        }
+    }
+
+    /**
      * Delete a key-value pair.
      *
      * @param key the key to delete

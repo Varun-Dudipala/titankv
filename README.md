@@ -44,7 +44,8 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 - **Metrics** over HTTP (`/metrics` in Prometheus text format, `/health`, `/ready`, `/status`)
 
 **Storage and networking**
-- **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync
+- **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync: one sync
+  covers every write that arrived during the one before, on the coordinator and on each replica
 - **Non-blocking NIO server**; worker threads never wait on replicas
 - **Binary protocol** over TCP with 29-byte request and 25-byte response headers
 - **TTL** per key, **client circuit breaker**, connection pooling
@@ -216,8 +217,10 @@ expiry times.
 | PING | 0x04 | GET/PUT/DELETE_INTERNAL | 0x11–0x13 | PONG | 0x03 |
 | EXISTS | 0x05 | MERKLE_TREE / MERKLE_LEAF | 0x14–0x15 | EXISTS_TRUE / _FALSE | 0x04 / 0x05 |
 | AUTH | 0x07 | NODE_ID | 0x0B | STALE | 0x06 |
+| | | PUT_BATCH_INTERNAL | 0x16 | | |
 
-NODE_ID returns the answering node's id, which is what places it on the ring. STALE answers a PUT
+PUT_BATCH_INTERNAL carries several replica writes in one request, used when writes to a peer
+queue up. NODE_ID returns the answering node's id, which is what places it on the ring. STALE answers a PUT
 or DELETE that was replicated but is already superseded: a replica holds a
 newer version of the key, returned in `TIMESTAMP`. The client library retries with a later version.
 
@@ -282,8 +285,8 @@ How to read these:
 ## Testing
 
 ```bash
-./mvnw test       # 229 unit tests
-./mvnw verify     # + 86 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 249 unit tests
+./mvnw verify     # + 89 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:

@@ -14,8 +14,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -75,6 +79,11 @@ public class InMemoryStore implements KVStore {
     private long appendedTotal;
     private volatile long durableTotal;
     private final ThreadLocal<long[]> lastAppendEnd = ThreadLocal.withInitial(() -> new long[1]);
+    // Writes waiting for the WAL to be durable up to their record. Guarded by syncLock.
+    private final ArrayList<DurabilityWaiter> durabilityWaiters = new ArrayList<>();
+    private Thread syncThread;
+    private final java.util.concurrent.atomic.LongAdder walSyncs = new java.util.concurrent.atomic.LongAdder();
+    private boolean syncStopped;
     private final ReentrantReadWriteLock mutationLock = new ReentrantReadWriteLock();
     private FileChannel walChannel;
     private long walBytes;
@@ -133,6 +142,7 @@ public class InMemoryStore implements KVStore {
         if (walEnabled) {
             recover();
         }
+        startSyncThread();
         cleanupExecutor.scheduleAtFixedRate(this::cleanupExpired, cleanupIntervalMs, cleanupIntervalMs,
                 TimeUnit.MILLISECONDS);
     }
@@ -402,20 +412,52 @@ public class InMemoryStore implements KVStore {
      * Run a mutation so it cannot interleave with a snapshot, then snapshot if the WAL is full.
      */
     private <T> T mutate(Supplier<T> mutation) {
+        return await(mutateAsync(mutation));
+    }
+
+    /**
+     * As {@link #mutate}, without waiting for the disk: the mutation is applied and appended to
+     * the WAL on this thread, and the returned future completes once its record is durable.
+     *
+     * A caller that waits ties up a thread per write for the length of an fsync, which caps how
+     * many writes one fsync can cover at the number of threads. With the future, a node's
+     * workers go on to the next request, and an fsync covers every write that arrived during
+     * the one before it.
+     */
+    private <T> CompletableFuture<T> mutateAsync(Supplier<T> mutation) {
         if (!walEnabled) {
-            return mutation.get();
+            return CompletableFuture.completedFuture(mutation.get());
         }
         ensureWritable();
         T result;
+        long appendEnd;
         mutationLock.readLock().lock();
         try {
+            long[] end = lastAppendEnd.get();
+            end[0] = 0;
             result = mutation.get();
-            awaitDurable();
+            appendEnd = end[0]; // 0 if the mutation wrote nothing
         } finally {
             mutationLock.readLock().unlock();
         }
+        CompletableFuture<Void> durable = whenDurable(appendEnd);
         maybeSnapshot();
-        return result;
+        if (durable == null) {
+            return CompletableFuture.completedFuture(result);
+        }
+        T applied = result;
+        return durable.thenApply(ignored -> applied);
+    }
+
+    private static <T> T await(CompletableFuture<T> future) {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            if (e.getCause() instanceof RuntimeException) {
+                throw (RuntimeException) e.getCause();
+            }
+            throw e;
+        }
     }
 
     private void appendToWal(byte op, String key, byte[] value, long timestamp, long expiresAt) {
@@ -477,22 +519,115 @@ public class InMemoryStore implements KVStore {
         walChannel.close();
     }
 
-    /**
-     * Block until this thread's last WAL record is on disk. Whichever waiting writer gets the sync
-     * lock fsyncs everything appended so far, so writers that arrive meanwhile are covered too.
-     */
-    private void awaitDurable() {
-        long target = lastAppendEnd.get()[0];
-        if (!walFsync || target <= durableTotal) {
-            return;
+    private static final class DurabilityWaiter {
+        final long appendEnd;
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+
+        DurabilityWaiter(long appendEnd) {
+            this.appendEnd = appendEnd;
         }
+    }
+
+    /**
+     * @return a future that completes when the WAL is durable up to the given offset, or null
+     *         if it already is (or nothing needs to be synced)
+     */
+    private CompletableFuture<Void> whenDurable(long appendEnd) {
+        if (!walFsync || appendEnd <= durableTotal) {
+            return null;
+        }
+        DurabilityWaiter waiter = new DurabilityWaiter(appendEnd);
         synchronized (syncLock) {
-            if (target <= durableTotal) {
+            if (appendEnd <= durableTotal) {
+                return null;
+            }
+            if (syncStopped) {
+                waiter.future.completeExceptionally(new IllegalStateException("Store is shut down"));
+                return waiter.future;
+            }
+            durabilityWaiters.add(waiter);
+            syncLock.notifyAll();
+        }
+        return waiter.future;
+    }
+
+    /**
+     * Group commit. One thread fsyncs the WAL for as long as writes are waiting, and each fsync
+     * releases every write appended before it started. The busier the node, the more writes
+     * share an fsync; an idle node syncs each write as it arrives.
+     */
+    private void syncLoop() {
+        List<DurabilityWaiter> ready = new ArrayList<>();
+        while (true) {
+            boolean syncNeeded;
+            synchronized (syncLock) {
+                while (true) {
+                    takeDurable(ready);
+                    if (!ready.isEmpty() || !durabilityWaiters.isEmpty() || syncStopped) {
+                        break;
+                    }
+                    try {
+                        syncLock.wait();
+                    } catch (InterruptedException e) {
+                        syncStopped = true;
+                    }
+                }
+                if (syncStopped) {
+                    ready.addAll(durabilityWaiters);
+                    durabilityWaiters.clear();
+                }
+                syncNeeded = !durabilityWaiters.isEmpty();
+            }
+            if (syncStopped) {
+                IllegalStateException closed = new IllegalStateException("Store is shut down");
+                for (DurabilityWaiter waiter : ready) {
+                    if (waiter.appendEnd <= durableTotal) {
+                        waiter.future.complete(null);
+                    } else {
+                        waiter.future.completeExceptionally(closed);
+                    }
+                }
                 return;
             }
+            // Completed outside the lock: what runs next (sending a reply, counting an
+            // acknowledgement) must not hold up writers registering for the next sync
+            for (DurabilityWaiter waiter : ready) {
+                waiter.future.complete(null);
+            }
+            ready.clear();
+            if (syncNeeded) {
+                try {
+                    syncWal();
+                } catch (IllegalStateException e) {
+                    failWaiters(e);
+                }
+            }
+        }
+    }
+
+    /** Caller holds syncLock. Moves the waiters whose records are durable to {@code ready}. */
+    private void takeDurable(List<DurabilityWaiter> ready) {
+        long durable = durableTotal;
+        for (int i = durabilityWaiters.size() - 1; i >= 0; i--) {
+            if (durabilityWaiters.get(i).appendEnd <= durable) {
+                ready.add(durabilityWaiters.remove(i));
+            }
+        }
+    }
+
+    /**
+     * fsync everything appended so far. Takes the mutation read lock, so it never runs while a
+     * snapshot is replacing the log.
+     */
+    private void syncWal() {
+        mutationLock.readLock().lock();
+        try {
             long upTo;
             synchronized (walLock) {
                 upTo = appendedTotal;
+            }
+            if (upTo <= durableTotal) {
+                return; // a snapshot covered it meanwhile
             }
             try {
                 walChannel.force(false);
@@ -500,6 +635,49 @@ public class InMemoryStore implements KVStore {
                 throw walFailed("WAL fsync failed", e);
             }
             durableTotal = upTo;
+            walSyncs.increment();
+        } finally {
+            mutationLock.readLock().unlock();
+        }
+    }
+
+    /** @return how many times the WAL has been fsynced for waiting writes */
+    public long getWalSyncCount() {
+        return walSyncs.sum();
+    }
+
+    /** After a failed fsync: none of the waiting writes may be acknowledged. */
+    private void failWaiters(IllegalStateException failure) {
+        List<DurabilityWaiter> failed;
+        synchronized (syncLock) {
+            failed = new ArrayList<>(durabilityWaiters);
+            durabilityWaiters.clear();
+        }
+        for (DurabilityWaiter waiter : failed) {
+            waiter.future.completeExceptionally(failure);
+        }
+    }
+
+    private void startSyncThread() {
+        if (!walEnabled || !walFsync) {
+            return;
+        }
+        syncThread = new Thread(this::syncLoop, "titankv-wal-sync");
+        syncThread.setDaemon(true);
+        syncThread.start();
+    }
+
+    private void stopSyncThread() {
+        synchronized (syncLock) {
+            syncStopped = true;
+            syncLock.notifyAll();
+        }
+        if (syncThread != null) {
+            try {
+                syncThread.join(5_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -554,6 +732,9 @@ public class InMemoryStore implements KVStore {
             walChannel.force(true);
             walBytes = 0;
             durableTotal = appendedTotal; // everything appended so far is in the fsynced snapshot
+            synchronized (syncLock) {
+                syncLock.notifyAll(); // writes waiting for an fsync are covered by the snapshot
+            }
             logger.info("Snapshot of {} keys written to {}", store.size(), snapshotPath.toAbsolutePath());
         } catch (IOException e) {
             throw walFailed("Failed to install snapshot", e);
@@ -638,23 +819,57 @@ public class InMemoryStore implements KVStore {
             return false;
         }
         ensureCapacity(key, entry, existing);
-        return mutate(() -> {
-            KeyValuePair[] previous = new KeyValuePair[1];
-            boolean[] stored = {false};
-            store.compute(key, (k, current) -> {
-                if (!entry.isNewerThan(current)) {
-                    return current;
-                }
-                appendToWal(WAL_OP_PUT, key, entry.getValueUnsafe(), entry.getTimestamp(), entry.getExpiresAt());
-                previous[0] = current;
-                stored[0] = true;
-                return entry;
-            });
-            if (stored[0]) {
-                adjustMemory(key, previous[0], entry);
+        return mutate(() -> storeIfNewer(key, entry));
+    }
+
+    /** The mutation behind {@link #putIfNewer}: must run inside {@link #mutateAsync}. */
+    private boolean storeIfNewer(String key, KeyValuePair entry) {
+        KeyValuePair[] previous = new KeyValuePair[1];
+        boolean[] stored = {false};
+        store.compute(key, (k, current) -> {
+            if (!entry.isNewerThan(current)) {
+                return current;
             }
-            return stored[0];
+            appendToWal(WAL_OP_PUT, key, entry.getValueUnsafe(), entry.getTimestamp(), entry.getExpiresAt());
+            previous[0] = current;
+            stored[0] = true;
+            return entry;
         });
+        if (stored[0]) {
+            adjustMemory(key, previous[0], entry);
+        }
+        return stored[0];
+    }
+
+    /**
+     * {@link #putOrSuperseded} without waiting for the disk: the value is applied and logged on
+     * this thread, and the future completes when the write is durable. Nothing should be
+     * acknowledged to anyone before it does.
+     */
+    @Override
+    public CompletableFuture<Long> putOrSupersededAsync(String key, byte[] value, long timestamp, long expiresAt) {
+        try {
+            validateKey(key);
+            KeyValuePair entry = new KeyValuePair(value, timestamp, expiresAt);
+            KeyValuePair existing = store.get(key);
+            if (!entry.isNewerThan(existing)) {
+                return CompletableFuture.completedFuture(supersededBy(key, value, timestamp));
+            }
+            ensureCapacity(key, entry, existing);
+            return mutateAsync(() -> storeIfNewer(key, entry))
+                    .thenApply(stored -> stored ? 0L : supersededBy(key, value, timestamp));
+        } catch (RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    /** The version this store holds instead of the given one, or 0 if it holds nothing newer. */
+    private long supersededBy(String key, byte[] value, long timestamp) {
+        return getRaw(key)
+                .filter(current -> KeyValuePair.compareVersions(current.getTimestamp(), current.getValueUnsafe(),
+                        timestamp, value) > 0)
+                .map(KeyValuePair::getTimestamp)
+                .orElse(0L);
     }
 
     @Override
@@ -730,7 +945,20 @@ public class InMemoryStore implements KVStore {
                 ensureWritable();
             }
             appendToWal(WAL_OP_CLEAR, "", null, 0, 0);
-            awaitDurable();
+            if (walEnabled && walFsync) {
+                // Not through the sync thread: its fsync takes the lock this thread holds
+                try {
+                    synchronized (walLock) {
+                        walChannel.force(false);
+                        durableTotal = appendedTotal;
+                    }
+                } catch (IOException e) {
+                    throw walFailed("WAL fsync failed", e);
+                }
+                synchronized (syncLock) {
+                    syncLock.notifyAll();
+                }
+            }
             store.clear();
             currentMemoryBytes.set(0);
         } finally {
@@ -771,6 +999,7 @@ public class InMemoryStore implements KVStore {
             cleanupExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+        stopSyncThread();
         synchronized (walLock) {
             if (walChannel != null) {
                 try {

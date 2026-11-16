@@ -228,6 +228,15 @@ selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool 
 - **Worker threads never wait on replicas.** A replicated command returns a `CompletableFuture`;
   when it completes, the response is queued and the connection's next command is scheduled. Commands
   on one connection still run in order, so responses match request order.
+- **Replica writes are sent together when they queue up.** A replica call holds a thread and a
+  connection until the replica answers. When a peer answers in a fraction of a millisecond, each
+  write goes out on its own. When it waits for its disk, calls take milliseconds and writes for
+  that peer queue; a sender that becomes free then takes everything queued (up to 512 writes or
+  1 MB) and sends it as one request (`PUT_BATCH_INTERNAL`), which the replica makes durable with
+  one fsync and answers write by write. Nothing waits to fill a batch. Without this a
+  coordinator could have at most 8 writes in flight to a peer, and durable throughput fell from
+  2,100 to 1,000 writes a second when clients went from 64 to 256; with it, it rises to 6,900.
+  A peer that answers "Unknown command" (an older version) is sent single writes from then on.
 - **Replica I/O** runs on separate pools because it uses blocking client sockets, one pool per
   peer. Calls stuck on a slow or unreachable peer fill only that peer's threads and its queue of
   1,024; further calls to it fail at once (writes become hints, reads go to another replica),
@@ -255,8 +264,9 @@ and about 13 system calls per operation, 8 of them `futex` calls from handing wo
 threads. The changes that cut it to about 9 per operation (3 `futex`):
 
 - Reads contact only the replicas the consistency level needs (above).
-- The local replica's write runs on the calling thread when it does not wait for a WAL fsync,
-  instead of being handed to the replication pool.
+- The local replica's write runs on the calling thread instead of being handed to the
+  replication pool. (With a WAL the thread logs the write and moves on; the write counts toward
+  the consistency level once it is durable.)
 - A response is written straight to the socket when nothing is queued ahead of it, instead of
   registering `OP_WRITE` and waking the selector.
 - Node-to-node reads use the socket's `SO_TIMEOUT` rather than a timer task per read.
@@ -343,9 +353,18 @@ record `[magic][version][op][key len][value len][timestamp][expires][key][value]
 
 - The WAL append happens inside the map's per-key `compute`, so for any one key the WAL order
   matches the order updates were applied in memory.
-- **Group commit.** Writers append under a lock but fsync outside it. A writer waits until the WAL is
-  durable up to its own record; whichever writer performs the fsync covers everything appended so
-  far. This raised durable write throughput by 68%.
+- **Group commit.** A write is applied and appended on the thread that handles it, and that
+  thread moves on. One thread fsyncs the log for as long as writes are waiting, and each fsync
+  releases every write appended before it started; the reply to a write goes out when its record
+  is durable. The busier the node, the more writes share an fsync (a unit test hands the store
+  3,000 writes and counts about 60 fsyncs); an idle node syncs each write as it arrives.
+
+  The first version had the writers do this themselves: each waited, and whichever got the lock
+  fsynced for the rest. That raised durable throughput by 68% over an fsync per write, but every
+  waiting write still held a thread, so one fsync could never cover more writes than the node
+  had worker threads (8). On a 3-node cluster that capped durable writes at a few hundred a
+  second however many clients there were. Thread dumps under load showed exactly that: every
+  worker parked on the sync lock.
 - **Snapshots.** When the WAL exceeds 128 MB, all live entries are written to `snapshot.tmp`, which is
   fsynced and atomically renamed to `snapshot.dat`, and then the WAL is truncated. Mutations hold a
   read lock and snapshots the write lock, so the WAL is only truncated once every record in it is
