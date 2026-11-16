@@ -100,7 +100,10 @@ public final class ReplicationManager implements ReplicaIO {
         this.timeoutMs = timeoutMs;
         this.localStore = localStore;
 
-        int threads = Math.max(16, Runtime.getRuntime().availableProcessors() * 4);
+        // Per peer. Each call blocks a thread for a fraction of a millisecond, so a few threads
+        // carry tens of thousands of calls a second to one peer; more only adds threads to
+        // schedule (32 per peer measured 6% slower than 8 on a 5-node cluster).
+        int threads = Math.max(8, Runtime.getRuntime().availableProcessors());
         String configured = Env.get("TITANKV_REPLICATION_THREADS", "titankv.replication.threads");
         if (configured != null) {
             try {

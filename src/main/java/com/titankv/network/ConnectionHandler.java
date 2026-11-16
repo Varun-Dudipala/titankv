@@ -487,7 +487,7 @@ public class ConnectionHandler {
             return done(authError);
         }
         byte type = command.getType();
-        if (!isInternalCommand(type) && type != Command.PING && type != Command.STATUS
+        if (!isInternalCommand(type) && type != Command.PING && type != Command.STATUS && type != Command.NODE_ID
                 && clusterManager != null && !clusterManager.isReady()) {
             return done(Response.error("Node is joining the cluster; retry on another node"));
         }
@@ -511,6 +511,12 @@ public class ConnectionHandler {
                 return done(handleMerkle(command));
             case Command.PING:
                 return done(Response.pong());
+            case Command.NODE_ID:
+                // Lets a client build the same ring the nodes use, and so send each request to a
+                // replica of its key
+                return done(clusterManager == null ? Response.error("This node is not part of a cluster")
+                        : Response.ok(clusterManager.getLocalNode().getId()
+                                .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
             case Command.STATUS:
                 return done(handleStatus());
             case Command.REMOVE_NODE:

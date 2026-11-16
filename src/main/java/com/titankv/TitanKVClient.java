@@ -48,7 +48,14 @@ public class TitanKVClient implements AutoCloseable {
     private final String[] hosts;
     private final ClientConfig config;
     private final ConnectionPool connectionPool;
-    private final ConsistentHash hashRing;
+    // The nodes this client knows, placed on the ring by the id each node reports for itself
+    // (by address until it has). The cluster places nodes by id, so once every node has answered
+    // this is the cluster's own ring, and the first node on it for a key is a replica of that key.
+    private volatile ConsistentHash hashRing;
+    private final List<String> addresses = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final Map<String, String> nodeIds = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicBoolean nodeIdsRequested =
+            new java.util.concurrent.atomic.AtomicBoolean();
     private volatile boolean closed = false;
     // This client's hybrid logical clock: the newest version it has issued, read or been told of.
     // The client, not the coordinating node, chooses each write's version, so it knows the
@@ -124,17 +131,14 @@ public class TitanKVClient implements AutoCloseable {
                 config.getMaxConnectionsPerHost(),
                 config.getConnectTimeoutMs(),
                 config.getReadTimeoutMs());
-        this.hashRing = new ConsistentHash();
-
-        // Add all hosts to the hash ring and initialize circuit breakers
         for (String host : hosts) {
-            Node node = Node.fromAddress(host);
-            node.setStatus(Node.Status.ALIVE);
-            hashRing.addNode(node);
+            String address = Node.fromAddress(host).getAddress();
+            addresses.add(address);
             if (config.isCircuitBreakerEnabled()) {
-                circuitBreakers.put(node.getAddress(), new CircuitBreaker());
+                circuitBreakers.put(address, new CircuitBreaker());
             }
         }
+        this.hashRing = buildRing();
 
         logger.debug("TitanKV client initialized with {} hosts", hosts.length);
     }
@@ -562,6 +566,51 @@ public class TitanKVClient implements AutoCloseable {
         }
     }
 
+    private ConsistentHash buildRing() {
+        ConsistentHash ring = new ConsistentHash();
+        for (String address : addresses) {
+            Node at = Node.fromAddress(address);
+            Node node = new Node(nodeIds.getOrDefault(address, address), at.getHost(), at.getPort());
+            node.setStatus(Node.Status.ALIVE);
+            ring.addNode(node);
+        }
+        return ring;
+    }
+
+    /**
+     * Ask a node for its id and put it on this client's ring under that id.
+     *
+     * Any node can coordinate any request, so the ring only decides which node a request goes to
+     * first. When this ring matches the cluster's, that node is a replica of the key and answers
+     * from its own copy; otherwise the request costs a further hop from the coordinator to the
+     * replicas. Clients used to place nodes by address while the cluster placed them by resolved
+     * IP, which matched only when both resolved alike, as on one machine. When the cluster moved
+     * to placing nodes by id, a benchmark on five nodes lost a fifth of its throughput: two
+     * requests in five had begun to land on a node that did not hold the key.
+     */
+    private void learnNodeId(String address) {
+        if (nodeIds.containsKey(address)) {
+            return;
+        }
+        try {
+            Response response = executeOnHost(new Command(Command.NODE_ID, null, null), address);
+            byte[] id = response.getValueUnsafe();
+            // A node that does not know the command, or has no cluster, keeps its address as id
+            nodeIds.put(address, response.isOk() && id != null && id.length > 0
+                    ? new String(id, StandardCharsets.UTF_8) : address);
+            hashRing = buildRing();
+        } catch (IOException | RuntimeException e) {
+            logger.debug("Could not learn the id of {}: {}", address, e.getMessage());
+        }
+    }
+
+    /**
+     * @return the address of the node a request for this key is sent to first
+     */
+    public String coordinatorFor(String key) {
+        return hashRing.getNode(key).getAddress();
+    }
+
     /**
      * Send a command for a key, failing over across nodes. Nodes are tried in ring order for the
      * key, with nodes whose circuit breaker is open moved to the back. Failing over to a different
@@ -569,6 +618,14 @@ public class TitanKVClient implements AutoCloseable {
      */
     private Response execute(Command command, String key) throws IOException {
         ensureOpen();
+        if (addresses.size() > 1 && nodeIdsRequested.compareAndSet(false, true)) {
+            // Once, before the first request: nodes that do not answer now are asked again
+            // after the first request they do answer
+            for (String address : addresses) {
+                learnNodeId(address);
+            }
+        }
+        ConsistentHash hashRing = this.hashRing;
 
         List<Node> ringOrder = hashRing.getNodes(key, hashRing.getNodeCount());
         List<String> candidates = new ArrayList<>(ringOrder.size());
@@ -597,6 +654,9 @@ public class TitanKVClient implements AutoCloseable {
             String host = candidates.get(attempt % candidates.size());
             try {
                 Response response = executeOnHost(command, host);
+                if (addresses.size() > 1 && !nodeIds.containsKey(host)) {
+                    learnNodeId(host);
+                }
                 if (response.isError() && isNodeNotReady(response)) {
                     // A restarted node refuses clients until it rejoins; another node can serve this
                     lastException = new IOException(host + ": " + response.getErrorMessage());
@@ -736,9 +796,11 @@ public class TitanKVClient implements AutoCloseable {
      * @param host the host address in host:port format
      */
     public void addNode(String host) {
-        Node node = Node.fromAddress(host);
-        node.setStatus(Node.Status.ALIVE);
-        hashRing.addNode(node);
+        String address = Node.fromAddress(host).getAddress();
+        if (!addresses.contains(address)) {
+            addresses.add(address);
+            hashRing = buildRing();
+        }
         logger.debug("Added node {} to client", host);
     }
 
@@ -748,8 +810,9 @@ public class TitanKVClient implements AutoCloseable {
      * @param host the host address in host:port format
      */
     public void removeNode(String host) {
-        Node node = Node.fromAddress(host);
-        hashRing.removeNode(node);
+        if (addresses.remove(Node.fromAddress(host).getAddress())) {
+            hashRing = buildRing();
+        }
         logger.debug("Removed node {} from client", host);
     }
 

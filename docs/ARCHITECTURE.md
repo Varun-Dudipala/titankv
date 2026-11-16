@@ -40,8 +40,21 @@ writes that had gone to a stand-in node.
 ## Request path
 
 Clients send any request to any node. The receiving node **coordinates** it; there is no primary
-and no redirect. The client library hashes keys to pick a node only to spread load, and fails over
-to another node if one is down.
+and no redirect. Which node a client picks is a matter of cost, not correctness: a coordinator
+that is a replica of the key answers from its own copy, and one that is not has to ask the
+replicas. So the client library asks each node for its id (`NODE_ID`), places the nodes on a ring
+of its own exactly as the cluster does, and sends each request to the key's first replica, failing
+over to the next ones if it is down. A node that has not answered yet is placed by its address
+until it does.
+
+That the client's ring must *be* the cluster's ring was learned from a benchmark. Clients used to
+place nodes by address and the cluster by resolved IP, which agree when everything resolves alike,
+as on one machine. When the cluster moved to placing nodes by id (so that a node keeps its ranges
+when its address changes), the two rings stopped agreeing and nothing failed: every test passed.
+Re-running the benchmarks against the earlier build on the same machine showed a 5-node cluster
+23% slower, and a 3-node cluster unchanged. With three replicas on three nodes every node holds
+every key, so the first node is always a replica; on five, two requests in five had begun to land
+on a node that did not hold the key.
 
 ### Write (PUT / DELETE)
 
@@ -194,7 +207,7 @@ data, so every node immediately runs a round with each peer.
 ## Threading model
 
 ```
-selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool per peer (max(16, 4×CPUs) each)
+selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool per peer (max(8, CPUs) each)
   accepts, reads,     decodes auth, runs local      blocking socket I/O to
   writes sockets      commands, starts replicated   that peer
                       ones and returns at once
@@ -273,6 +286,11 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
     peers may all be down; what it saved was complete when it stopped);
   - it has nothing saved and has learned as many members as it has seeds: a new cluster forming,
     where the seed list is the membership.
+
+  The node is not ready at any moment before that, including while it starts: the server
+  accepts connections before the cluster manager is up, and for as long as resolving the seeds'
+  host names took, a starting node used to count as having no seeds and so as ready. A failover
+  benchmark hit that window once in 94,000 requests (`StartupReadinessTest`).
 
   Three weaker gates each failed. With none, a restarted node acted as a one-node cluster and
   acknowledged writes with a single copy, as the chaos test found when a seed node restarted.

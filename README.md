@@ -21,7 +21,8 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 
 **Data distribution and replication**
 - **Consistent hashing** with 150 virtual nodes per node (MurmurHash3) and replication factor 3
-- **Leaderless**: any node coordinates any request, as in Dynamo; clients need no knowledge of placement
+- **Leaderless**: any node coordinates any request, as in Dynamo. The client library asks each node
+  its id, builds the cluster's own ring, and sends each request to a replica of its key to save a hop
 - **Tunable consistency** (ONE / QUORUM / ALL), chosen **per request** by the client, with **strict
   quorums**: a key's replicas never change because a node is down or restarting, so R + W > N
   guarantees QUORUM reads see QUORUM writes
@@ -116,8 +117,9 @@ try (TitanKVClient client = new TitanKVClient("localhost:9001", "localhost:9002"
 Without a level, requests use the client's default (`ClientConfig.builder().consistency(...)`), and
 otherwise the server's (QUORUM unless configured).
 
-The client spreads requests across nodes by consistent hashing, pools connections, fails over to
-another node on error, and chooses each write's version from its own hybrid logical clock, so its
+The client sends each request to the first replica of its key (it learns the nodes' ids, and so
+their places on the ring, from the nodes themselves), pools connections, fails over to the key's
+other replicas and then the other nodes on error, and chooses each write's version from its own hybrid logical clock, so its
 writes are always ordered after what it has read or written, including writes that failed (see
 [clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
 
@@ -177,7 +179,7 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
 | `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
 | `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
-| `TITANKV_REPLICATION_THREADS` | max(16, 4 × CPUs) | Threads for replica I/O, per peer node |
+| `TITANKV_REPLICATION_THREADS` | max(8, CPUs) | Threads for replica I/O, per peer node |
 
 Ports per node: client TCP on `--port`, gossip UDP on port + 1000, metrics HTTP on port + 90.
 
@@ -208,9 +210,10 @@ expiry times.
 | DELETE | 0x03 | CLEANUP | 0x0A | ERROR | 0x02 |
 | PING | 0x04 | GET/PUT/DELETE_INTERNAL | 0x11–0x13 | PONG | 0x03 |
 | EXISTS | 0x05 | MERKLE_TREE / MERKLE_LEAF | 0x14–0x15 | EXISTS_TRUE / _FALSE | 0x04 / 0x05 |
-| AUTH | 0x07 | | | STALE | 0x06 |
+| AUTH | 0x07 | NODE_ID | 0x0B | STALE | 0x06 |
 
-STALE answers a PUT or DELETE that was replicated but is already superseded: a replica holds a
+NODE_ID returns the answering node's id, which is what places it on the ring. STALE answers a PUT
+or DELETE that was replicated but is already superseded: a replica holds a
 newer version of the key, returned in `TIMESTAMP`. The client library retries with a later version.
 
 Internal commands (0x11 and up) are node-to-node; they need the cluster token and a connection from
@@ -266,8 +269,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-./mvnw test       # 218 unit tests
-./mvnw verify     # + 82 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 219 unit tests
+./mvnw verify     # + 84 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:

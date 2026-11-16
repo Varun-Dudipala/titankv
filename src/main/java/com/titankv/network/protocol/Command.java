@@ -26,6 +26,7 @@ public final class Command {
     public static final byte STATUS = 0x08;       // Cluster membership as seen by the node
     public static final byte REMOVE_NODE = 0x09;  // Admin: permanently remove a DEAD node (key = node id)
     public static final byte CLEANUP = 0x0A;      // Admin: drop local keys this node no longer replicates
+    public static final byte NODE_ID = 0x0B;      // The id of the node answering, as the cluster's ring knows it
     // Internal commands (not exposed to clients)
     public static final byte GET_INTERNAL = 0x11;  // Get from local store only
     public static final byte PUT_INTERNAL = 0x12;  // Put without triggering replication
@@ -243,6 +244,7 @@ public final class Command {
             case STATUS: return "STATUS";
             case REMOVE_NODE: return "REMOVE_NODE";
             case CLEANUP: return "CLEANUP";
+            case NODE_ID: return "NODE_ID";
             case GET_INTERNAL: return "GET_INTERNAL";
             case PUT_INTERNAL: return "PUT_INTERNAL";
             case DELETE_INTERNAL: return "DELETE_INTERNAL";
