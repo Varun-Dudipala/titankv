@@ -203,10 +203,6 @@ public class ClusterManager {
         if (running) {
             return;
         }
-        running = true;
-        startedAtNanos = System.nanoTime();
-
-        gossipProtocol = new GossipProtocol(localNode, this, clusterSecret);
 
         // Join cluster via seed nodes
         // Note: Don't call addNode() here - we don't know the real node IDs yet.
@@ -223,8 +219,16 @@ public class ClusterManager {
                 }
             }
         }
+        // Everything isReady() depends on is in place before the node counts as running. The
+        // order used to be the other way round: for as long as it took to resolve the seeds'
+        // host names, a node that was starting had "no seeds" and reported ready, and the server
+        // was already accepting connections. A request arriving then was served by a node that
+        // knew nobody. A failover benchmark hit that window once in 94,000 requests.
         seedsConfigured = !seeds.isEmpty();
         seedCount = seeds.size();
+        startedAtNanos = System.nanoTime();
+        gossipProtocol = new GossipProtocol(localNode, this, clusterSecret);
+        running = true;
         gossipProtocol.setSeeds(seeds);
         try {
             gossipProtocol.start();

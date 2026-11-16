@@ -287,6 +287,11 @@ throughput by 59% (mixed) and 35% (writes), and single-node throughput by 69%. S
   - it has nothing saved and has learned as many members as it has seeds: a new cluster forming,
     where the seed list is the membership.
 
+  The node is not ready at any moment before that, including while it starts: the server
+  accepts connections before the cluster manager is up, and for as long as resolving the seeds'
+  host names took, a starting node used to count as having no seeds and so as ready. A failover
+  benchmark hit that window once in 94,000 requests (`StartupReadinessTest`).
+
   Three weaker gates each failed. With none, a restarted node acted as a one-node cluster and
   acknowledged writes with a single copy, as the chaos test found when a seed node restarted.
   "Knows one other member" let a restarted node serve with a partial ring, missing members that

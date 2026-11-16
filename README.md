@@ -269,7 +269,7 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-./mvnw test       # 218 unit tests
+./mvnw test       # 219 unit tests
 ./mvnw verify     # + 84 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
