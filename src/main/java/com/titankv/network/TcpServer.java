@@ -66,6 +66,26 @@ public class TcpServer {
         return DEFAULT_MAX_CONNECTIONS;
     }
 
+    /**
+     * TITANKV_WORKER_QUEUE / titankv.worker.queue, or 1,000 per worker thread: how many requests
+     * may wait for a worker before further ones are answered "busy".
+     */
+    private static int configuredWorkerQueue(int workerThreads) {
+        String configured = com.titankv.util.Env.get("TITANKV_WORKER_QUEUE", "titankv.worker.queue");
+        if (configured != null) {
+            try {
+                int length = Integer.parseInt(configured.trim());
+                if (length > 0) {
+                    return length;
+                }
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+            logger.warn("Invalid TITANKV_WORKER_QUEUE value {}, using {}", configured, workerThreads * 1000);
+        }
+        return workerThreads * 1000;
+    }
+
     private final int port;
     private final KVStore store;
     private final MetricsCollector metrics;
@@ -110,13 +130,15 @@ public class TcpServer {
                 workerThreads,
                 0L,
                 TimeUnit.MILLISECONDS,
-                new LinkedBlockingQueue<>(workerThreads * 1000),
+                new LinkedBlockingQueue<>(configuredWorkerQueue(workerThreads)),
                 r -> {
                     Thread t = new Thread(r, "titankv-worker");
                     t.setDaemon(true);
                     return t;
                 },
-                new ThreadPoolExecutor.CallerRunsPolicy());
+                // Refuse, so the connection answers "busy". The alternative, running the request
+                // on the submitting thread, would put disk and replica waits on the selector.
+                new ThreadPoolExecutor.AbortPolicy());
         logger.info("Initialized worker pool with {} threads", workerThreads);
     }
 

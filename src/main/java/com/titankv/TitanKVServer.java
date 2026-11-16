@@ -57,14 +57,38 @@ public class TitanKVServer {
      * @param seedNodes comma-separated addresses of other members to join through, or null
      */
     public TitanKVServer(int port, String nodeId, String seedNodes) {
+        this(port, nodeId, seedNodes, Env.get("TITANKV_ADVERTISE_HOST", "titankv.advertise.host"));
+    }
+
+    /**
+     * @param port          the port to listen on
+     * @param nodeId        node identifier (defaults to the advertised host, or the hostname, and the port)
+     * @param seedNodes     comma-separated addresses of other members to join through, or null
+     * @param advertiseHost the host name or address the other nodes and the clients reach this node
+     *                      at, or null to take it from the node id
+     */
+    public TitanKVServer(int port, String nodeId, String seedNodes, String advertiseHost) {
         this.port = port;
         this.seedNodes = seedNodes;
-        this.nodeId = nodeId == null || nodeId.isEmpty() ? generateNodeId(port) : nodeId;
+        boolean advertised = advertiseHost != null && !advertiseHost.isBlank();
+        this.nodeId = nodeId != null && !nodeId.isEmpty() ? nodeId
+                : advertised ? advertiseHost.trim() + ":" + port : generateNodeId(port);
+        String host = advertisedHost(this.nodeId, advertiseHost);
+        if (!advertised && !this.nodeId.contains(":") && seedNodes != null && !seedNodes.isBlank()) {
+            logger.warn("Node id '{}' names no host and no advertise host is set, so this node tells its peers to "
+                    + "reach it at localhost. That only works when every node runs on this machine: set "
+                    + "--advertise-host (or TITANKV_ADVERTISE_HOST), or use a node id of the form host:port.",
+                    this.nodeId);
+        }
         this.store = new InMemoryStore(nodeDataDir(port));
         this.metrics = new MetricsCollector();
         this.shutdownLatch = new CountDownLatch(1);
-        this.clusterManager = new ClusterManager(new Node(this.nodeId, getHostFromId(this.nodeId), port),
-                membershipFile(store, port));
+        this.clusterManager = new ClusterManager(new Node(this.nodeId, host, port), membershipFile(store, port));
+        if (store instanceof InMemoryStore) {
+            // One clock per node: the store judges expiry by the same clock the node gossips and
+            // checks versions with
+            ((InMemoryStore) store).setWallClock(clusterManager.getClock()::wallMillis);
+        }
         if (store instanceof InMemoryStore && ((InMemoryStore) store).rawSize() == 0) {
             // No WAL, a replaced disk, or a new node: it must be repaired from its peers before
             // it answers reads
@@ -125,11 +149,17 @@ public class TitanKVServer {
         }
     }
 
-    private static String getHostFromId(String nodeId) {
+    /**
+     * The host this node gossips as its own address: the advertise host if one is set, else the
+     * host part of a host:port node id, else localhost (a node id without a colon is only a label).
+     */
+    static String advertisedHost(String nodeId, String advertiseHost) {
+        if (advertiseHost != null && !advertiseHost.isBlank()) {
+            return advertiseHost.trim();
+        }
         if (nodeId.contains(":")) {
             return nodeId.substring(0, nodeId.lastIndexOf(':'));
         }
-        // If nodeId doesn't contain a colon, it's just a label - default to localhost
         return "localhost";
     }
 
@@ -348,6 +378,7 @@ public class TitanKVServer {
         String nodeId = null;
         String seedNodes = null;
         String clusterSecret = null;
+        String advertiseHost = null;
         boolean devMode = false;
 
         // Parse command line arguments
@@ -381,6 +412,12 @@ public class TitanKVServer {
                             exitWithError("--seeds requires a value");
                         }
                         seedNodes = args[++i];
+                        break;
+                    case "--advertise-host":
+                        if (i + 1 >= args.length) {
+                            exitWithError("--advertise-host requires a value");
+                        }
+                        advertiseHost = args[++i];
                         break;
                     case "--cluster-secret":
                         if (i + 1 >= args.length) {
@@ -421,7 +458,9 @@ public class TitanKVServer {
         ensureLogsDirectory();
 
         // Create and start the server with cluster config
-        TitanKVServer server = new TitanKVServer(port, nodeId, seedNodes);
+        TitanKVServer server = advertiseHost != null
+                ? new TitanKVServer(port, nodeId, seedNodes, advertiseHost)
+                : new TitanKVServer(port, nodeId, seedNodes);
         try {
             server.startAndBlock();
         } catch (IOException e) {
@@ -470,6 +509,8 @@ public class TitanKVServer {
         System.out.println("  -p, --port <port>            Port to listen on (default: 9001)");
         System.out.println("  -n, --node-id <id>           Node identifier (default: hostname:port)");
         System.out.println("  -s, --seeds <hosts>          Comma-separated seed node addresses");
+        System.out.println("      --advertise-host <host>   Host name or address other nodes and clients reach this");
+        System.out.println("                                node at (default: the host part of the node id)");
         System.out.println("      --cluster-secret <secret> Cluster authentication secret (required for production)");
         System.out.println("      --dev                     Enable development mode (disables auth requirement)");
         System.out.println("  -h, --help                   Show this help message");

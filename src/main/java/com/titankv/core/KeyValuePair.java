@@ -93,7 +93,14 @@ public final class KeyValuePair {
      * @return true if expired
      */
     public boolean isExpired() {
-        return value != null && expiresAt > 0 && System.currentTimeMillis() > expiresAt;
+        return isExpiredAt(System.currentTimeMillis());
+    }
+
+    /**
+     * @param nowMillis the time to judge by: a node judges expiry by its own clock
+     */
+    public boolean isExpiredAt(long nowMillis) {
+        return value != null && expiresAt > 0 && nowMillis > expiresAt;
     }
 
     /**

@@ -181,8 +181,10 @@ class PartitionTest {
             for (String key : keys) {
                 assertThat(unreached.getRaw(key)).as(key + " on the node the coordinator cannot reach").isEmpty();
             }
-            assertThat(cluster.node(0).getReplicationManager().getHintedHandoff()
-                    .pendingHints(cluster.node(1).getNodeId())).isEqualTo(20);
+            // A write is acknowledged as soon as two replicas have it. The hint for the third is
+            // stored when the call to it fails, which can be a moment after the acknowledgement.
+            TestCluster.awaitCondition(() -> cluster.node(0).getReplicationManager().getHintedHandoff()
+                    .pendingHints(cluster.node(1).getNodeId()) == 20, 5_000, "a hint for each of the 20 writes");
             assertThatThrownBy(() -> viaNode1.getString("one-way-0", ConsistencyLevel.ALL))
                     .isInstanceOf(IOException.class);
             // The other direction works: node 2 reads through nodes 1 and 3
@@ -191,7 +193,8 @@ class PartitionTest {
             cluster.heal();
             TestCluster.awaitCondition(() -> keys.stream().allMatch(key -> unreached.getRaw(key).isPresent()),
                     15_000, "hints to reach the node once the link is back");
-            assertThat(cluster.node(0).getReplicationManager().getHintedHandoff().totalPendingHints()).isZero();
+            TestCluster.awaitCondition(() -> cluster.node(0).getReplicationManager().getHintedHandoff()
+                    .totalPendingHints() == 0, 5_000, "the delivered hints to be dropped");
         }
     }
 

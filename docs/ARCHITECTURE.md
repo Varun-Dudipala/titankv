@@ -117,7 +117,11 @@ the high 48 bits and a logical counter in the low 16. Last write wins by version
   `observeCausalContext`), which then writes after everything the first one did and saw.
 - **Node clocks do not decide which write wins.** They are used for expiry times, tombstone age,
   and one check: a node refuses a version more than 60 seconds ahead of its own clock. Accepted,
-  such a version would outrank every write to the key until real time caught up.
+  such a version would outrank every write to the key until real time caught up. Everything on
+  a node that asks the time (expiry, tombstone age, gossip timestamps, that check) reads the
+  node's one clock object, so a test can set one node's clock wrong inside a running cluster:
+  `NodeClockTest` shows a node 30 seconds fast ending a 20-second TTL for every replica, and a
+  node 70 seconds fast being dropped by its peers until it is corrected.
 - **A client follows other clocks only so far.** It adopts a version from a reply or a read only
   if it is at most 30 seconds ahead of its own wall clock. Without that limit, one client 58
   seconds fast (inside what nodes accept) pulled every node's and client's clock forward with it,
@@ -214,6 +218,13 @@ selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool 
 ```
 
 - **One selector thread** does all socket I/O without blocking.
+- **A full worker queue is an answer, not a wait.** The workers' queue holds 1,000 requests per
+  worker. A request that does not fit is answered "Server busy", and the client sends it to
+  another node. The pool used to run such a request on the thread that submitted it
+  (`CallerRunsPolicy`), which for a new request is the selector: one fsync or one slow replica
+  on that thread and no connection was read, answered or accepted until it returned, at exactly
+  the moment the node was overloaded. `BusyServerTest` runs one worker with a queue of one
+  against sixteen writers.
 - **Worker threads never wait on replicas.** A replicated command returns a `CompletableFuture`;
   when it completes, the response is queued and the connection's next command is scheduled. Commands
   on one connection still run in order, so responses match request order.
@@ -469,7 +480,7 @@ copy replaced the other, and anti-entropy exchanged the key on every round witho
 | Surface | Protection |
 |---|---|
 | Gossip | HMAC-SHA256 per packet with the cluster secret, freshness window, per-sender replay check |
-| Internal replica commands | Cluster token (AUTH) and source IP must belong to a cluster member |
+| Internal replica commands | Cluster token (AUTH) and source IP must belong to a cluster member. Members' names are resolved once and remembered; when a connection matches none, they are resolved again (at most once per 10 seconds), so a member that returns with a new address is not locked out |
 | Admin commands (`removenode`, `cleanup`) | Cluster token |
 | Client commands | Optional client token (`TITANKV_CLIENT_TOKEN`) |
 | Protocol parsing | Magic bytes, length limits (64 KB keys, 16 MB values) |

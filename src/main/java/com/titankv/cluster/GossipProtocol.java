@@ -80,6 +80,8 @@ public class GossipProtocol {
     private final ConcurrentHashMap<String, Long> lastReceivedAt = new ConcurrentHashMap<>();
     private volatile List<Node> seeds = List.of();
     private volatile boolean digestReceived;
+    private static final long CLOCK_WARNING_MS = 30_000;
+    private long lastClockWarningNanos = System.nanoTime() - TimeUnit.SECONDS.toNanos(60);
     private long lastVersionWarningNanos = System.nanoTime() - TimeUnit.SECONDS.toNanos(60);
 
     private DatagramSocket socket;
@@ -349,7 +351,7 @@ public class GossipProtocol {
      * Wall-clock time, bumped by 1ms when needed so it strictly increases for every message.
      */
     private long nextSentAt() {
-        long now = System.currentTimeMillis();
+        long now = clusterManager.getClock().wallMillis();
         return lastSentAt.updateAndGet(last -> Math.max(now, last + 1));
     }
 
@@ -540,9 +542,20 @@ public class GossipProtocol {
     // ==================== Validation ====================
 
     private boolean isFresh(String senderId, long sentAt) {
-        long now = System.currentTimeMillis();
+        long now = clusterManager.getClock().wallMillis();
+        long ahead = sentAt - now;
+        if (Math.abs(ahead) > CLOCK_WARNING_MS) {
+            // Said once in a while rather than per message: a node whose clock is this far off
+            // sends one of these a second
+            long nanos = System.nanoTime();
+            if (nanos - lastClockWarningNanos > TimeUnit.SECONDS.toNanos(30)) {
+                lastClockWarningNanos = nanos;
+                logger.warn("The clock of {} is {}s {} this node's. Beyond {}s ahead or {}s behind, its gossip is "
+                        + "dropped and it is taken for dead.", senderId, Math.abs(ahead) / 1000,
+                        ahead > 0 ? "ahead of" : "behind", MAX_MESSAGE_FUTURE_MS / 1000, MAX_MESSAGE_AGE_MS / 1000);
+            }
+        }
         if (sentAt < now - MAX_MESSAGE_AGE_MS || sentAt > now + MAX_MESSAGE_FUTURE_MS) {
-            logger.warn("Dropping gossip message from {}: timestamp {} outside the accepted window", senderId, sentAt);
             return false;
         }
         boolean[] fresh = {false};
