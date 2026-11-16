@@ -14,7 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
@@ -22,8 +21,7 @@ import java.nio.channels.SocketChannel;
 import java.util.LinkedList;
 import java.util.Optional;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -48,6 +46,8 @@ public class ConnectionHandler {
     // request, and from the first byte of any later request to its last
     private static final long DEFAULT_FRAME_TIMEOUT_MS = 30_000;
     private static final long OPERATION_TIMEOUT_MS = 5_000;
+    /** The reply to a request this node has no worker free for; clients take it elsewhere. */
+    public static final String BUSY_MESSAGE = "Server busy: every worker is occupied; retry on another node";
 
     private final SocketChannel channel;
     private final KVStore store;
@@ -78,7 +78,7 @@ public class ConnectionHandler {
     // Lock for protecting interestOps modifications (prevents race conditions)
     private final Object interestOpsLock = new Object();
 
-    private static final ConcurrentMap<String, String> HOST_IP_CACHE = new ConcurrentHashMap<>();
+    private static final MemberAddresses MEMBER_ADDRESSES = new MemberAddresses();
     // Used only when there is no ClusterManager (a bare TcpServer in tests)
     private static final HybridLogicalClock STANDALONE_CLOCK = new HybridLogicalClock();
 
@@ -131,8 +131,8 @@ public class ConnectionHandler {
      * Check if this connection is authorized to send internal commands.
      * Internal commands should only come from known cluster nodes.
      *
-     * PERFORMANCE: Uses direct IP comparison against ClusterManager's cached
-     * node list. Does NOT perform any DNS lookups to avoid blocking.
+     * Members' host names are resolved through a cache ({@link MemberAddresses}), so this does
+     * not wait on DNS except for a name it has not seen, or after a failed match.
      *
      * @return true if authorized, false otherwise
      */
@@ -144,7 +144,7 @@ public class ConnectionHandler {
         }
 
         try {
-            // Get the remote address (no DNS lookup - just cached socket info)
+            // The socket's own record of its peer: no lookup
             java.net.InetSocketAddress remoteAddr = (java.net.InetSocketAddress) channel.getRemoteAddress();
             if (remoteAddr == null) {
                 logger.warn("Internal command rejected: cannot determine remote address");
@@ -153,25 +153,14 @@ public class ConnectionHandler {
 
             String remoteIP = remoteAddr.getAddress().getHostAddress();
 
-            // Check if this IP belongs to a known cluster node
-            // ClusterManager maintains a cached list - no network calls
-            boolean authorized = clusterManager.getAllNodes().stream()
-                    .anyMatch(node -> {
-                        String nodeHost = node.getHost();
-                        // Direct IP match (most common case)
-                        if (remoteIP.equals(node.getHashHost()) || remoteIP.equals(nodeHost)) {
-                            return true;
-                        }
-                        String resolved = resolveHostIp(nodeHost);
-                        if (remoteIP.equals(resolved)) {
-                            return true;
-                        }
-                        // Handle localhost variations
-                        if (isLocalhost(remoteIP) && isLocalhost(nodeHost)) {
-                            return true;
-                        }
-                        return false;
-                    });
+            // Is this the address of a cluster member? Host names are resolved through a cache
+            // that is refreshed when nothing matches, so a member whose address changed is let
+            // back in without restarting this node.
+            java.util.List<String> memberHosts = new java.util.ArrayList<>();
+            for (com.titankv.cluster.Node node : clusterManager.getAllNodes()) {
+                memberHosts.add(node.getHost());
+            }
+            boolean authorized = MEMBER_ADDRESSES.isMember(remoteIP, memberHosts);
 
             if (!authorized) {
                 logger.warn("Internal command rejected: unauthorized IP {} not in cluster", remoteIP);
@@ -182,30 +171,6 @@ public class ConnectionHandler {
             logger.warn("Internal command rejected: error getting remote address: {}", e.getMessage());
             return false;
         }
-    }
-
-    /**
-     * Check if an address is a localhost variant.
-     * Handles 127.0.0.1, ::1, and "localhost" string.
-     */
-    private boolean isLocalhost(String addr) {
-        return "127.0.0.1".equals(addr)
-                || "::1".equals(addr)
-                || "0:0:0:0:0:0:0:1".equals(addr)
-                || "localhost".equalsIgnoreCase(addr);
-    }
-
-    private String resolveHostIp(String host) {
-        if (host == null || host.isEmpty()) {
-            return host;
-        }
-        return HOST_IP_CACHE.computeIfAbsent(host, value -> {
-            try {
-                return InetAddress.getByName(value).getHostAddress();
-            } catch (Exception e) {
-                return value;
-            }
-        });
     }
 
     private static long frameTimeoutMs() {
@@ -434,35 +399,51 @@ public class ConnectionHandler {
      * asynchronously and the next command is scheduled from the completion callback.
      */
     private void processNextCommand(SelectionKey key) {
-        Command command;
-        synchronized (pendingCommands) {
-            if (commandInProgress || pendingCommands.isEmpty()) {
-                return;
-            }
-            command = pendingCommands.poll();
-            commandInProgress = true;
-        }
-        workerPool.submit(() -> {
-            long startTime = System.nanoTime();
-            CompletableFuture<Response> pending;
-            try {
-                pending = dispatch(command);
-            } catch (RuntimeException e) {
-                pending = CompletableFuture.completedFuture(errorResponse(command, e));
-            }
-            pending.whenComplete((response, error) -> {
-                Response result = error != null ? errorResponse(command, unwrap(error)) : response;
-                recordMetrics(command, result, System.nanoTime() - startTime);
-                if (replyIsLost(command)) {
-                    close();
+        while (true) {
+            Command command;
+            synchronized (pendingCommands) {
+                if (commandInProgress || pendingCommands.isEmpty()) {
                     return;
                 }
-                queueResponseAsync(result);
+                command = pendingCommands.poll();
+                commandInProgress = true;
+            }
+            try {
+                workerPool.execute(() -> run(command, key));
+                return;
+            } catch (RejectedExecutionException e) {
+                // The workers and their queue are full (or the server is stopping). Say so and
+                // let the client go elsewhere. Running the command on this thread instead, which
+                // may be the selector, would stall every connection behind one request.
+                metrics.recordError();
+                queueResponseAsync(Response.error(BUSY_MESSAGE));
                 synchronized (pendingCommands) {
                     commandInProgress = false;
                 }
-                processNextCommand(key);
-            });
+            }
+        }
+    }
+
+    private void run(Command command, SelectionKey key) {
+        long startTime = System.nanoTime();
+        CompletableFuture<Response> pending;
+        try {
+            pending = dispatch(command);
+        } catch (RuntimeException e) {
+            pending = CompletableFuture.completedFuture(errorResponse(command, e));
+        }
+        pending.whenComplete((response, error) -> {
+            Response result = error != null ? errorResponse(command, unwrap(error)) : response;
+            recordMetrics(command, result, System.nanoTime() - startTime);
+            if (replyIsLost(command)) {
+                close();
+                return;
+            }
+            queueResponseAsync(result);
+            synchronized (pendingCommands) {
+                commandInProgress = false;
+            }
+            processNextCommand(key);
         });
     }
 
@@ -733,7 +714,7 @@ public class ConnectionHandler {
         }
         long timestamp = writeVersion(command);
         // Client PUTs carry a relative TTL in the expires field
-        long expiresAt = command.getExpiresAt() > 0 ? System.currentTimeMillis() + command.getExpiresAt() : 0;
+        long expiresAt = command.getExpiresAt() > 0 ? clock().wallMillis() + command.getExpiresAt() : 0;
         Response written = Response.ok(null, clock().current(), expiresAt);
 
         if (isDistributed()) {

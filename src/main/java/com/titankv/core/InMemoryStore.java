@@ -80,6 +80,8 @@ public class InMemoryStore implements KVStore {
     private long walBytes;
     private boolean loading;
     private volatile IOException walFailure;
+    // What time it is, for expiry and tombstone age. A node sets this to its own clock.
+    private volatile java.util.function.LongSupplier wallClock = System::currentTimeMillis;
     private static final long SNAPSHOT_RETRY_SECONDS = 30;
     private boolean snapshotFailed;
     private long snapshotRetryAtNanos;
@@ -455,6 +457,13 @@ public class InMemoryStore implements KVStore {
     }
 
     /**
+     * Judge expiry and tombstone age by the given clock instead of the machine's.
+     */
+    public void setWallClock(java.util.function.LongSupplier wallClock) {
+        this.wallClock = java.util.Objects.requireNonNull(wallClock);
+    }
+
+    /**
      * @return false once a WAL write or fsync has failed and the store has stopped accepting writes
      */
     public boolean isHealthy() {
@@ -593,7 +602,7 @@ public class InMemoryStore implements KVStore {
     @Override
     public Optional<KeyValuePair> put(String key, byte[] value, long ttlMillis) {
         validateKey(key);
-        long now = System.currentTimeMillis();
+        long now = wallClock.getAsLong();
         KeyValuePair entry = new KeyValuePair(value, HybridLogicalClock.encode(now), ttlMillis > 0 ? now + ttlMillis : 0);
         ensureCapacity(key, entry, store.get(key));
         return mutate(() -> {
@@ -667,7 +676,7 @@ public class InMemoryStore implements KVStore {
         return mutate(() -> {
             KeyValuePair[] removed = new KeyValuePair[1];
             store.compute(key, (k, old) -> {
-                appendToWal(WAL_OP_DELETE, key, null, System.currentTimeMillis(), 0);
+                appendToWal(WAL_OP_DELETE, key, null, wallClock.getAsLong(), 0);
                 removed[0] = old;
                 return null;
             });
@@ -684,7 +693,7 @@ public class InMemoryStore implements KVStore {
     @Override
     public Set<String> keys() {
         return store.entrySet().stream()
-                .filter(e -> !e.getValue().isExpired() && !e.getValue().isTombstone())
+                .filter(e -> !expired(e.getValue()) && !e.getValue().isTombstone())
                 .map(e -> e.getKey())
                 .collect(Collectors.toSet());
     }
@@ -707,7 +716,7 @@ public class InMemoryStore implements KVStore {
     @Override
     public int size() {
         return (int) store.values().stream()
-                .filter(v -> !v.isExpired() && !v.isTombstone())
+                .filter(v -> !expired(v) && !v.isTombstone())
                 .count();
     }
 
@@ -780,8 +789,12 @@ public class InMemoryStore implements KVStore {
      * An entry as the rest of the system should see it: a value whose time-to-live has run out
      * is its tombstone.
      */
-    private static KeyValuePair asStored(KeyValuePair entry) {
-        return entry.isExpired() ? entry.toTombstone() : entry;
+    private KeyValuePair asStored(KeyValuePair entry) {
+        return expired(entry) ? entry.toTombstone() : entry;
+    }
+
+    private boolean expired(KeyValuePair entry) {
+        return entry.isExpiredAt(wallClock.getAsLong());
     }
 
     /**
@@ -792,7 +805,7 @@ public class InMemoryStore implements KVStore {
      */
     private KeyValuePair liveEntry(String key) {
         KeyValuePair entry = store.get(key);
-        while (entry != null && entry.isExpired()) {
+        while (entry != null && expired(entry)) {
             KeyValuePair tombstone = entry.toTombstone();
             if (store.replace(key, entry, tombstone)) {
                 adjustMemory(key, entry, tombstone);
@@ -811,13 +824,13 @@ public class InMemoryStore implements KVStore {
      * on the next run.
      */
     private void cleanupExpired() {
-        long tombstoneCutoff = System.currentTimeMillis() - tombstoneGraceMs;
+        long tombstoneCutoff = wallClock.getAsLong() - tombstoneGraceMs;
         int expired = 0;
         int purged = 0;
         for (var entry : store.entrySet()) {
             String key = entry.getKey();
             KeyValuePair value = entry.getValue();
-            if (value.isExpired()) {
+            if (expired(value)) {
                 KeyValuePair tombstone = value.toTombstone();
                 if (!store.replace(key, value, tombstone)) {
                     continue; // a write got in first

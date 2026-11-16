@@ -153,6 +153,9 @@ With replication factor 3:
 | A WAL write or fsync fails | The node stops accepting writes (`/health` returns 503) until it is restarted; it does not carry on appending behind a possibly half-written record. |
 | Clock skew between nodes | Does not affect which write wins: the client chooses each write's version. Node clocks still decide when a TTL runs out and when a tombstone is purged: a key expires when the first replica's clock says so. |
 | A client's clock is wrong | A write behind a newer version is reported (STALE) and sent again with a later one, so at QUORUM a write that starts after another was acknowledged still wins. A version over 60s ahead of a node's clock is refused. Other clients do not adopt a version more than 30s ahead of their own clock: a key written by a client that far ahead cannot be overwritten until real time reaches it, and the writer is told so. |
+| More requests than a node can take | Requests wait in a bounded queue (1,000 per worker); beyond it the node answers "Server busy" at once and the client takes the request to another node. Nothing runs on the network thread, so the node keeps reading, answering and accepting connections. |
+| A node's clock is over a minute ahead | Its gossip is refused, so the others take it for dead and carry on at QUORUM without it (they log the clock difference from 30 seconds). It is a member again once its clock is corrected. |
+| A member comes back with a new IP address (a recreated container) | Its peers look its name up again when a node-to-node connection matches no member, at most once per 10 seconds, instead of refusing it until they restart. |
 | A client sends part of a request and goes quiet | The server closes the connection after 30 seconds without a whole request. Connections idle between requests are kept; at most 10,000 are open at once. |
 | Concurrent writes to one key | Last write wins by (timestamp, then tombstone, then value), the same on every replica; no conflict is surfaced to the application. |
 
@@ -178,7 +181,9 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long tombstones of deleted and expired keys are kept |
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
 | `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
+| `TITANKV_ADVERTISE_HOST` (`--advertise-host`) | host part of the node id | The name or address other nodes and clients reach this node at. Needed when the node id is a plain label (`node-1`) and the nodes are on different machines |
 | `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
+| `TITANKV_WORKER_QUEUE` | 1,000 per worker | Requests that may wait for a worker; further ones are answered "Server busy" |
 | `TITANKV_REPLICATION_THREADS` | max(8, CPUs) | Threads for replica I/O, per peer node |
 
 Ports per node: client TCP on `--port`, gossip UDP on port + 1000, metrics HTTP on port + 90.
@@ -269,8 +274,8 @@ and all nodes share one 4-core machine. Profiling cut system calls per operation
 ## Testing
 
 ```bash
-./mvnw test       # 219 unit tests
-./mvnw verify     # + 84 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 229 unit tests
+./mvnw verify     # + 86 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -287,7 +292,10 @@ The integration suite includes:
 - a node that restarts empty or joins, held back from reads until it has caught up; frames and
   gossip from another protocol version
 - stalled connections, the connection limit, WAL damage in the middle of the log, a failing WAL,
-  torn hint files, a full store that must still take deletes
+  torn hint files, a full store that must still take deletes, a server with one worker and sixteen
+  writers (every request is answered, most of them "busy")
+- one node's clock set wrong inside a running cluster: 30 seconds fast, it ends a 20-second TTL
+  for everyone at once; 70 seconds fast, the others drop it and take it back when it is corrected
 - restarts with saved membership: a full stop after which only two of five nodes return, a node
   that returns alone, and nodes with nothing saved restarting together
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
@@ -332,7 +340,8 @@ WAL tests cover crash recovery across snapshots, concurrent writers during snaps
   when it has learned as many members as it has seeds, so list every initial node as a seed and
   start them all. Nodes without a WAL (dev mode) save nothing and need this after every full stop.
 - **Node ids are identities.** Ring positions come from the node id (`--node-id`, by default
-  `hostname:port`), so a node must keep its id across restarts.
+  `hostname:port`), so a node must keep its id across restarts. Its address may change
+  (`--advertise-host`).
 - Traffic is not encrypted (no TLS).
 
 ## License

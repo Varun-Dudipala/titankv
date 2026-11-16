@@ -38,6 +38,8 @@ public class TitanKVClient implements AutoCloseable {
     private static final long CIRCUIT_RESET_TIMEOUT_MS = 5_000;
     // Error a node returns while it is (re)joining the cluster; see ConnectionHandler
     static final String NOT_READY_PREFIX = "Node is joining the cluster";
+    // Error a node returns when all its workers are occupied; see ConnectionHandler
+    static final String BUSY_PREFIX = "Server busy";
     // How often a write that lost to a newer version is sent again with a later one
     private static final int MAX_STALE_RETRIES = 3;
     // The furthest ahead of its own wall clock this client lets a version from elsewhere move its
@@ -723,9 +725,13 @@ public class TitanKVClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Whether a node declined the request without attempting it (it is still joining, or it has
+     * no worker free), so that another node should be asked.
+     */
     private static boolean isNodeNotReady(Response response) {
         String message = response.getErrorMessage();
-        return message != null && message.startsWith(NOT_READY_PREFIX);
+        return message != null && (message.startsWith(NOT_READY_PREFIX) || message.startsWith(BUSY_PREFIX));
     }
 
     private void ensureAuthenticated(PooledConnection conn, String host) throws IOException {

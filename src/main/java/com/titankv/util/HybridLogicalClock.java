@@ -89,6 +89,15 @@ public final class HybridLogicalClock {
         this.skewMillis = skewMillis;
     }
 
+    /**
+     * @return this node's wall-clock time in epoch milliseconds. Everything on a node that asks
+     *         what time it is (expiry, tombstone age, gossip freshness, version checks) asks
+     *         here, so a test can run one node of an in-JVM cluster with a wrong clock.
+     */
+    public long wallMillis() {
+        return now();
+    }
+
     private long now() {
         return System.currentTimeMillis() + skewMillis;
     }
