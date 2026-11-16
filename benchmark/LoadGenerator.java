@@ -12,15 +12,26 @@ import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.LockSupport;
 
 /**
- * Closed-loop load generator: each thread issues one request at a time with its own client.
+ * Load generator with two modes. Each thread has its own client and one request in flight.
  *
- * Every thread first writes its whole key space, so reads hit existing keys, then runs an
- * unmeasured warmup (JIT, connection pools) before the measured run. Latency is recorded per
- * operation and reported as percentiles.
+ * <p><b>Closed loop</b> (default): a thread sends its next request as soon as the previous one
+ * returns. This finds maximum throughput, but its latencies suffer from coordinated omission: while
+ * the server is slow, the generator also slows down and stops sending, so the requests that would
+ * have waited are never measured.
  *
- * Reads are also checked for correctness. Each value starts with an 8-byte sequence number that
+ * <p><b>Open loop</b> ({@code --rate}): requests follow a fixed schedule of {@code rate} ops/sec
+ * spread evenly across threads, and latency is measured from each request's <i>intended</i> send
+ * time. A thread that falls behind sends its overdue requests immediately, without skipping any, so
+ * the time they spent waiting shows up in the latencies. The time from actual send to response
+ * (service time, which is what closed loop measures) is reported alongside.
+ *
+ * <p>Every thread first writes its whole key space, so reads hit existing keys, then runs an
+ * unmeasured closed-loop warmup (JIT, connection pools) before the measured run.
+ *
+ * <p>Reads are also checked for correctness. Each value starts with an 8-byte sequence number that
  * increases with every write the thread makes, and the thread remembers the last sequence it had
  * acknowledged for each key. A read that returns an older sequence is a stale read; with QUORUM or
  * ALL writes and reads there should be none.
@@ -37,6 +48,8 @@ public class LoadGenerator {
     private final int keysPerThread;
     private final boolean retry;
     private final ConsistencyLevel consistency;
+    /** Target ops/sec across all threads; 0 means closed loop. */
+    private final double rate;
 
     private final LongAdder reads = new LongAdder();
     private final LongAdder readMisses = new LongAdder();
@@ -44,12 +57,20 @@ public class LoadGenerator {
     private final LongAdder writes = new LongAdder();
     private final LongAdder errors = new LongAdder();
     private final LongAdder preloadErrors = new LongAdder();
+    private final LongAdder unsent = new LongAdder();
     private static final Map<String, LongAdder> ERROR_KINDS = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Start of the measured run, set by the barrier action before any thread is released. */
+    private volatile long measuredStartNanos;
+
     public LoadGenerator(String[] hosts, int threads, int opsPerThread, int durationSeconds, int warmupOpsPerThread,
-            double readRatio, int valueSize, int keysPerThread, boolean retry, ConsistencyLevel consistency) {
+            double readRatio, int valueSize, int keysPerThread, boolean retry, ConsistencyLevel consistency,
+            double rate) {
         if (valueSize < 8) {
             throw new IllegalArgumentException("--value-size must be at least 8 (values carry a sequence number)");
+        }
+        if (rate < 0) {
+            throw new IllegalArgumentException("--rate must be positive");
         }
         this.hosts = hosts;
         this.threads = threads;
@@ -61,6 +82,16 @@ public class LoadGenerator {
         this.keysPerThread = keysPerThread;
         this.retry = retry;
         this.consistency = consistency;
+        this.rate = rate;
+    }
+
+    private boolean openLoop() {
+        return rate > 0;
+    }
+
+    /** Open loop: how many requests each thread sends in the measured run. */
+    private long scheduledOpsPerThread() {
+        return durationSeconds > 0 ? Math.max(1, Math.round(rate * durationSeconds / threads)) : opsPerThread;
     }
 
     /**
@@ -69,8 +100,9 @@ public class LoadGenerator {
     public Result run(boolean timeline) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CyclicBarrier start = new CyclicBarrier(threads + 1);
-        CyclicBarrier measured = new CyclicBarrier(threads + 1);
+        CyclicBarrier measured = new CyclicBarrier(threads + 1, () -> measuredStartNanos = System.nanoTime());
         long[][] latencies = new long[threads][];
+        long[][] serviceTimes = new long[threads][];
         Future<?>[] futures = new Future<?>[threads];
         AtomicBoolean stop = new AtomicBoolean();
 
@@ -89,7 +121,14 @@ public class LoadGenerator {
                     start.await();
                     worker.runOps(client, warmupOpsPerThread, null, false);
                     measured.await();
-                    latencies[thread] = worker.runMeasured(client, stop);
+                    if (openLoop()) {
+                        long[][] samples = worker.runOpenLoop(client);
+                        latencies[thread] = samples[0];
+                        serviceTimes[thread] = samples[1];
+                    } else {
+                        latencies[thread] = worker.runMeasured(client, stop);
+                        serviceTimes[thread] = latencies[thread];
+                    }
                 }
                 return null;
             });
@@ -102,7 +141,7 @@ public class LoadGenerator {
         }
         System.out.println("Warming up (" + threads * warmupOpsPerThread + " ops)...");
         measured.await();
-        long startNanos = System.nanoTime();
+        long startNanos = measuredStartNanos;
 
         ScheduledExecutorService reporter = Executors.newSingleThreadScheduledExecutor();
         if (timeline) {
@@ -116,7 +155,7 @@ public class LoadGenerator {
                 previous[1] = failed;
             }, 1, 1, TimeUnit.SECONDS);
         }
-        if (durationSeconds > 0) {
+        if (durationSeconds > 0 && !openLoop()) {
             reporter.schedule(() -> stop.set(true), durationSeconds, TimeUnit.SECONDS);
         }
         for (Future<?> future : futures) {
@@ -126,8 +165,12 @@ public class LoadGenerator {
         reporter.shutdownNow();
         pool.shutdown();
 
-        long[] all = Arrays.stream(latencies).flatMapToLong(Arrays::stream).filter(v -> v > 0).sorted().toArray();
-        return new Result(reads.sum(), readMisses.sum(), staleReads.sum(), writes.sum(), errors.sum(), elapsed, all);
+        return new Result(rate, reads.sum(), readMisses.sum(), staleReads.sum(), writes.sum(), errors.sum(),
+                unsent.sum(), elapsed, sortedPositive(latencies), sortedPositive(serviceTimes));
+    }
+
+    private static long[] sortedPositive(long[][] perThread) {
+        return Arrays.stream(perThread).flatMapToLong(Arrays::stream).filter(v -> v > 0).sorted().toArray();
     }
 
     /**
@@ -163,46 +206,95 @@ public class LoadGenerator {
                 if (count == samples.length) {
                     samples = Arrays.copyOf(samples, samples.length * 2);
                 }
-                long[] one = new long[1];
-                runOps(client, 1, one, true);
-                samples[count++] = one[0];
+                long begin = System.nanoTime();
+                if (op(client, true)) {
+                    samples[count] = System.nanoTime() - begin;
+                }
+                count++;
             }
             return Arrays.copyOf(samples, count);
         }
 
         void runOps(TitanKVClient client, int count, long[] samples, boolean measured) {
-            ThreadLocalRandom random = ThreadLocalRandom.current();
             for (int i = 0; i < count; i++) {
-                String key = key(thread, random.nextInt(keysPerThread));
-                boolean read = random.nextDouble() < readRatio;
                 long begin = System.nanoTime();
-                try {
-                    if (read) {
-                        Optional<byte[]> value = client.get(key);
-                        if (measured) {
-                            reads.increment();
-                            if (value.isEmpty()) {
-                                readMisses.increment();
-                            } else if (ByteBuffer.wrap(value.get()).getLong() < acked.getOrDefault(key, 0L)) {
-                                staleReads.increment();
-                            }
-                        }
-                    } else {
-                        write(client, key);
-                        if (measured) {
-                            writes.increment();
-                        }
-                    }
-                    if (samples != null) {
-                        samples[i] = System.nanoTime() - begin;
-                    }
-                } catch (Exception e) {
+                if (op(client, measured) && samples != null) {
+                    samples[i] = System.nanoTime() - begin;
+                }
+            }
+        }
+
+        /**
+         * Open loop. Request {@code i} of this thread is request {@code i * threads + thread} of one
+         * global schedule at {@code rate} ops/sec, so the threads' sends interleave evenly. Returns
+         * {latency from intended send time, service time from actual send time}.
+         *
+         * <p>If the thread is behind schedule it sends right away and keeps going; nothing is skipped.
+         * Only if it is still sending past twice the planned run length plus 10 seconds does it give
+         * up, and the requests it never sent are counted as unsent.
+         */
+        long[][] runOpenLoop(TitanKVClient client) {
+            long count = scheduledOpsPerThread();
+            double intervalNanos = 1e9 / rate;
+            long start = measuredStartNanos;
+            long plannedNanos = (long) (count * threads * intervalNanos);
+            long deadline = start + 2 * plannedNanos + 10_000_000_000L;
+            long[] latency = new long[(int) count];
+            long[] service = new long[(int) count];
+            for (int i = 0; i < count; i++) {
+                long intended = start + (long) (((double) i * threads + thread) * intervalNanos);
+                long now = System.nanoTime();
+                while (now < intended) {
+                    // Timed sleeps overshoot in proportion to their length (by about a quarter on
+                    // macOS), and the overshoot would count as latency. Sleeping half the remaining
+                    // time at a time keeps the last sleep, and so the overshoot, short.
+                    long remaining = intended - now;
+                    LockSupport.parkNanos(remaining > 100_000 ? remaining / 2 : remaining);
+                    now = System.nanoTime();
+                }
+                if (now > deadline) {
+                    unsent.add(count - i);
+                    return new long[][] {Arrays.copyOf(latency, i), Arrays.copyOf(service, i)};
+                }
+                if (op(client, true)) {
+                    long end = System.nanoTime();
+                    latency[i] = end - intended;
+                    service[i] = end - now;
+                }
+            }
+            return new long[][] {latency, service};
+        }
+
+        /** Runs one random read or write; returns whether it succeeded. */
+        boolean op(TitanKVClient client, boolean measured) {
+            ThreadLocalRandom random = ThreadLocalRandom.current();
+            String key = key(thread, random.nextInt(keysPerThread));
+            boolean read = random.nextDouble() < readRatio;
+            try {
+                if (read) {
+                    Optional<byte[]> value = client.get(key);
                     if (measured) {
-                        errors.increment();
-                        String kind = (read ? "read: " : "write: ") + String.valueOf(e.getMessage()).replaceAll("[0-9]+", "#");
-                        ERROR_KINDS.computeIfAbsent(kind, k -> new LongAdder()).increment();
+                        reads.increment();
+                        if (value.isEmpty()) {
+                            readMisses.increment();
+                        } else if (ByteBuffer.wrap(value.get()).getLong() < acked.getOrDefault(key, 0L)) {
+                            staleReads.increment();
+                        }
+                    }
+                } else {
+                    write(client, key);
+                    if (measured) {
+                        writes.increment();
                     }
                 }
+                return true;
+            } catch (Exception e) {
+                if (measured) {
+                    errors.increment();
+                    String kind = (read ? "read: " : "write: ") + String.valueOf(e.getMessage()).replaceAll("[0-9]+", "#");
+                    ERROR_KINDS.computeIfAbsent(kind, k -> new LongAdder()).increment();
+                }
+                return false;
             }
         }
     }
@@ -224,23 +316,31 @@ public class LoadGenerator {
     }
 
     public static final class Result {
+        final double targetRate;
         final long reads;
         final long readMisses;
         final long staleReads;
         final long writes;
         final long errors;
+        final long unsent;
         final long elapsedNanos;
+        /** Closed loop: service time. Open loop: time from intended send to response. */
         final long[] sortedLatencies;
+        /** Time from actual send to response; the same as sortedLatencies in closed loop. */
+        final long[] sortedServiceTimes;
 
-        Result(long reads, long readMisses, long staleReads, long writes, long errors, long elapsedNanos,
-                long[] sortedLatencies) {
+        Result(double targetRate, long reads, long readMisses, long staleReads, long writes, long errors, long unsent,
+                long elapsedNanos, long[] sortedLatencies, long[] sortedServiceTimes) {
+            this.targetRate = targetRate;
             this.reads = reads;
             this.readMisses = readMisses;
             this.staleReads = staleReads;
             this.writes = writes;
             this.errors = errors;
+            this.unsent = unsent;
             this.elapsedNanos = elapsedNanos;
             this.sortedLatencies = sortedLatencies;
+            this.sortedServiceTimes = sortedServiceTimes;
         }
 
         double seconds() {
@@ -252,31 +352,60 @@ public class LoadGenerator {
         }
 
         double percentileMs(double p) {
-            if (sortedLatencies.length == 0) {
+            return percentileMs(sortedLatencies, p);
+        }
+
+        static double percentileMs(long[] sorted, double p) {
+            if (sorted.length == 0) {
                 return 0;
             }
-            int index = (int) Math.min(sortedLatencies.length - 1, Math.ceil(p * sortedLatencies.length) - 1);
-            return sortedLatencies[Math.max(0, index)] / 1e6;
+            int index = (int) Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1);
+            return sorted[Math.max(0, index)] / 1e6;
         }
 
         void print() {
+            boolean open = targetRate > 0;
             long ops = reads + writes;
             System.out.println();
             System.out.println("Results");
             System.out.println("-------------------------------------------");
+            System.out.println("Mode:              " + (open ? "open loop (fixed rate)" : "closed loop"));
             System.out.printf("Operations:        %,d (%,d reads, %,d writes)%n", ops, reads, writes);
             System.out.printf("Errors:            %,d%n", errors);
             System.out.printf("Read misses:       %,d (should be 0: every key is preloaded)%n", readMisses);
             System.out.printf("Stale reads:       %,d (reads older than the thread's last acknowledged write)%n",
                     staleReads);
             System.out.printf("Duration:          %.2f s%n", seconds());
+            if (open) {
+                System.out.printf("Target rate:       %,.0f ops/sec%n", targetRate);
+                System.out.printf("Achieved rate:     %,.0f ops/sec (%.1f%% of target)%n", throughput(),
+                        throughput() / targetRate * 100);
+                if (unsent > 0) {
+                    System.out.printf("UNSENT:            %,d requests (generator fell too far behind; "
+                            + "the latencies below leave them out)%n", unsent);
+                }
+            }
             System.out.printf("Throughput:        %,.0f ops/sec (%,.0f reads/sec, %,.0f writes/sec)%n",
                     ops / seconds(), reads / seconds(), writes / seconds());
-            System.out.printf("Latency p50/p95/p99/max: %.3f / %.3f / %.3f / %.3f ms%n",
-                    percentileMs(0.50), percentileMs(0.95), percentileMs(0.99), percentileMs(1.0));
+            System.out.printf("Latency p50/p95/p99/p99.9/max: %.3f / %.3f / %.3f / %.3f / %.3f ms%s%n",
+                    percentileMs(0.50), percentileMs(0.95), percentileMs(0.99), percentileMs(0.999),
+                    percentileMs(1.0), open ? " (from intended send time)" : "");
+            if (open) {
+                System.out.printf("Service p50/p95/p99/p99.9/max: %.3f / %.3f / %.3f / %.3f / %.3f ms "
+                        + "(from actual send time)%n", percentileMs(sortedServiceTimes, 0.50),
+                        percentileMs(sortedServiceTimes, 0.95), percentileMs(sortedServiceTimes, 0.99),
+                        percentileMs(sortedServiceTimes, 0.999), percentileMs(sortedServiceTimes, 1.0));
+            }
             ERROR_KINDS.forEach((kind, count) -> System.out.printf("  error x%d: %s%n", count.sum(), kind));
+            // Parsed by benchmark-suite.sh and benchmark-failover.sh: do not change these fields.
             System.out.printf("CSV,%.0f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%n", throughput(), percentileMs(0.50),
                     percentileMs(0.95), percentileMs(0.99), percentileMs(1.0), errors, readMisses, staleReads, ops);
+            System.out.printf("LATENCY,%s,%.0f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d%n",
+                    open ? "open" : "closed", targetRate, throughput(),
+                    percentileMs(0.50), percentileMs(0.95), percentileMs(0.99), percentileMs(0.999), percentileMs(1.0),
+                    percentileMs(sortedServiceTimes, 0.50), percentileMs(sortedServiceTimes, 0.99),
+                    percentileMs(sortedServiceTimes, 0.999), percentileMs(sortedServiceTimes, 1.0),
+                    errors, readMisses, staleReads, ops, unsent);
         }
     }
 
@@ -292,6 +421,7 @@ public class LoadGenerator {
         boolean timeline = false;
         boolean retry = false;
         ConsistencyLevel consistency = null;
+        double rate = 0;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -322,6 +452,12 @@ public class LoadGenerator {
                 case "--value-size": valueSize = Integer.parseInt(value); break;
                 case "--keys": keys = Integer.parseInt(value); break;
                 case "--consistency": consistency = ConsistencyLevel.valueOf(value.toUpperCase()); break;
+                case "--rate":
+                    rate = Double.parseDouble(value);
+                    if (!(rate > 0)) {
+                        throw new IllegalArgumentException("--rate must be a positive number of ops/sec");
+                    }
+                    break;
                 default: throw new IllegalArgumentException("Unknown option " + arg);
             }
         }
@@ -330,6 +466,9 @@ public class LoadGenerator {
         System.out.println("-------------------------------------------");
         System.out.println("Hosts:            " + String.join(", ", hosts));
         System.out.println("Threads:          " + threads);
+        System.out.println("Mode:             " + (rate > 0
+                ? String.format("open loop at %,.0f ops/sec (%,.1f per thread)", rate, rate / threads)
+                : "closed loop"));
         System.out.println(duration > 0
                 ? "Duration:         " + duration + "s (after " + warmup + " warmup ops per thread)"
                 : "Ops per thread:   " + ops + " (after " + warmup + " warmup)");
@@ -341,16 +480,32 @@ public class LoadGenerator {
         System.out.println("CPUs:             " + Runtime.getRuntime().availableProcessors());
         System.out.println("-------------------------------------------");
 
-        new LoadGenerator(hosts, threads, ops, duration, warmup, readRatio, valueSize, keys, retry, consistency)
+        new LoadGenerator(hosts, threads, ops, duration, warmup, readRatio, valueSize, keys, retry, consistency, rate)
                 .run(timeline).print();
     }
 
     private static void printUsage() {
         System.out.println("Usage: LoadGenerator [--hosts h1:p1,h2:p2] [--threads 16] [--ops 20000 | --duration SECONDS]");
-        System.out.println("                     [--warmup 2000] [--read-ratio 0.8] [--value-size 100] [--keys 1000]");
-        System.out.println("                     [--consistency ONE|QUORUM|ALL] [--retry] [--timeline]");
+        System.out.println("                     [--rate OPS_PER_SEC] [--warmup 2000] [--read-ratio 0.8]");
+        System.out.println("                     [--value-size 100] [--keys 1000] [--consistency ONE|QUORUM|ALL]");
+        System.out.println("                     [--retry] [--timeline]");
+        System.out.println("  --rate         open loop: send OPS_PER_SEC in total, spread evenly over the threads, and");
+        System.out.println("                 measure latency from each request's intended send time. A thread that");
+        System.out.println("                 falls behind sends late rather than skipping, so the delay counts. With");
+        System.out.println("                 --duration each thread sends rate*duration/threads requests, otherwise");
+        System.out.println("                 --ops requests. --threads caps how many requests can be in flight.");
+        System.out.println("                 Without --rate the run is closed loop: each thread sends its next request");
+        System.out.println("                 when the previous one returns (maximum throughput; latencies understate");
+        System.out.println("                 queueing because of coordinated omission).");
         System.out.println("  --consistency  level for every read and write (default: the server's)");
-        System.out.println("  --retry     let clients fail over to another node on error");
-        System.out.println("  --timeline  print TIMELINE,<second>,<ops>,<errors> every second");
+        System.out.println("  --retry        let clients fail over to another node on error");
+        System.out.println("  --timeline     print TIMELINE,<second>,<ops>,<errors> every second");
+        System.out.println("Output ends with two machine-readable lines:");
+        System.out.println("  CSV,<ops/sec>,<p50>,<p95>,<p99>,<max>,<errors>,<misses>,<stale>,<ops>");
+        System.out.println("  LATENCY,<closed|open>,<target ops/sec>,<achieved ops/sec>,<p50>,<p95>,<p99>,<p99.9>,<max>,");
+        System.out.println("          <service p50>,<service p99>,<service p99.9>,<service max>,<errors>,<misses>,");
+        System.out.println("          <stale>,<ops>,<unsent>");
+        System.out.println("  Latencies are in ms. In open loop, CSV and the first five LATENCY latencies are from the");
+        System.out.println("  intended send time; service times are from the actual send. Target is 0 in closed loop.");
     }
 }
