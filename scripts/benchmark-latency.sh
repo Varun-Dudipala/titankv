@@ -33,7 +33,7 @@ mkdir -p "$RAW"
 rm -f "$RAW"/latency-*.log
 echo "mode,load_pct,rep,target_ops_per_sec,achieved_ops_per_sec,p50_ms,p95_ms,p99_ms,p999_ms,max_ms,svc_p50_ms,svc_p99_ms,svc_p999_ms,svc_max_ms,errors,misses,stale,ops,unsent" > "$CSV"
 
-(cd "$PROJECT_DIR" && mvn -q -B package -DskipTests)
+(cd "$PROJECT_DIR" && ./mvnw -q -B package -DskipTests)
 
 cluster_down() {
     "$SCRIPT_DIR/stop-cluster.sh" > /dev/null
