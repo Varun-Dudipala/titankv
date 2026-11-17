@@ -377,4 +377,36 @@ class ConsistentHashTest {
         // Should not have thrown any exceptions
         assertThat(hashRing.getNodeCount()).isGreaterThanOrEqualTo(3);
     }
+
+    @Test
+    void positionOf_mapsTheSignedHashRangeOntoZeroToOne() {
+        assertThat(ConsistentHash.positionOf(Long.MIN_VALUE)).isEqualTo(0.0);
+        assertThat(ConsistentHash.positionOf(0L)).isEqualTo(0.5);
+        assertThat(ConsistentHash.positionOf(Long.MAX_VALUE)).isLessThan(1.0).isCloseTo(1.0, within(1e-9));
+        assertThat(ConsistentHash.positionOf(-1L)).isLessThan(ConsistentHash.positionOf(0L));
+        assertThat(ConsistentHash.positionOf(Long.MIN_VALUE / 2)).isCloseTo(0.25, within(1e-9));
+    }
+
+    @Test
+    void getVirtualNodes_listsTheRingInHashOrder() {
+        for (int i = 1; i <= 3; i++) {
+            Node node = new Node("node" + i, "localhost", 9000 + i);
+            node.setStatus(Node.Status.ALIVE);
+            hashRing.addNode(node);
+        }
+
+        List<VirtualNode> vnodes = hashRing.getVirtualNodes();
+
+        assertThat(vnodes).hasSize(300);
+        assertThat(vnodes).extracting(VirtualNode::getHashValue).isSorted();
+        // The owner of a key is the first virtual node at or after its hash, as getNode finds it
+        for (int k = 0; k < 200; k++) {
+            long hash = com.titankv.util.MurmurHash3.hash64("key-" + k);
+            VirtualNode owner = vnodes.stream().filter(v -> v.getHashValue() >= hash).findFirst().orElse(vnodes.get(0));
+            assertThat(owner.getPhysicalNode()).as("key-" + k).isEqualTo(hashRing.getNode("key-" + k));
+        }
+        // It is a copy: changing it leaves the ring alone
+        vnodes.clear();
+        assertThat(hashRing.getVirtualNodeCount()).isEqualTo(300);
+    }
 }

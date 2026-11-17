@@ -243,6 +243,28 @@ public class ConsistentHash {
     }
 
     /**
+     * A copy of the ring in hash order, for display. Each virtual node owns the range that ends
+     * at its position and starts after the virtual node before it.
+     */
+    public List<VirtualNode> getVirtualNodes() {
+        lock.readLock().lock();
+        try {
+            return new ArrayList<>(ring.values());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Where a hash sits on the ring as a fraction of the way round, from 0 (the lowest hash) up
+     * to but not including 1. The ring is ordered by signed value, so the lowest hash is
+     * {@code Long.MIN_VALUE}.
+     */
+    public static double positionOf(long hash) {
+        return ((hash - Long.MIN_VALUE) >>> 11) / (double) (1L << 53);
+    }
+
+    /**
      * Check if a node is in the ring.
      */
     public boolean containsNode(Node node) {

@@ -58,6 +58,8 @@ class MetricsCollectorTest {
         assertThat(metrics.getTotalPutOps()).isZero();
         assertThat(registry.get("titankv.replica.ops").tag("operation", "read").counter().count()).isEqualTo(1);
         assertThat(registry.get("titankv.replica.ops").tag("operation", "write").counter().count()).isEqualTo(2);
+        assertThat(metrics.getTotalReplicaReads()).isEqualTo(1);
+        assertThat(metrics.getTotalReplicaWrites()).isEqualTo(2);
     }
 
     @Test
@@ -81,5 +83,20 @@ class MetricsCollectorTest {
         assertThat(metrics.getTotalErrors()).isEqualTo(1);
         assertThat(metrics.getActiveConnections()).isEqualTo(1);
         assertThat(registry.get("titankv.connections").gauge().value()).isEqualTo(1);
+    }
+
+    @Test
+    void reportsTheNinetyNinthPercentileOfRecentOperations() {
+        assertThat(metrics.getGetP99LatencyMs()).isZero();
+        assertThat(metrics.getPutP99LatencyMs()).isZero();
+
+        for (int ms = 1; ms <= 100; ms++) {
+            metrics.recordGet(TimeUnit.MILLISECONDS.toNanos(ms), true);
+        }
+        metrics.recordPut(TimeUnit.MILLISECONDS.toNanos(7));
+
+        // The percentile comes from a histogram, so it is close to the true value, not equal to it
+        assertThat(metrics.getGetP99LatencyMs()).isBetween(90.0, 110.0);
+        assertThat(metrics.getPutP99LatencyMs()).isBetween(6.0, 8.0);
     }
 }

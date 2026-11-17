@@ -192,7 +192,8 @@ public class TitanKVServer {
         // Initialize and start metrics HTTP server
         if (store instanceof InMemoryStore) {
             registerReplicationMetrics();
-            metricsHttpServer = new MetricsHttpServer(metricsPort(port), metrics, clusterManager, (InMemoryStore) store);
+            metricsHttpServer = new MetricsHttpServer(metricsPort(port), metrics, clusterManager,
+                    (InMemoryStore) store, replicationManager);
             try {
                 metricsHttpServer.start();
                 logger.info("Metrics HTTP server started on port {}", metricsHttpServer.getPort());
