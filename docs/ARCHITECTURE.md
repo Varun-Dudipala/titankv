@@ -17,7 +17,7 @@ node can serve any request.
 │   ConsistentHash ring, hybrid logical clock                                  │
 │                                                                              │
 │  DataRebalancer (streams keys to joining nodes)                              │
-│  MetricsHttpServer (/metrics /health /ready /status)                         │
+│  MetricsHttpServer (/metrics /health /ready /status /dashboard /api/*)       │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -447,6 +447,49 @@ copy replaced the other, and anti-entropy exchanged the key on every round witho
   cluster. It used to treat each as a node that had just joined and send it every key they share.
 - **Removal.** `removenode` on a DEAD node changes the ring; anti-entropy fills the new replicas.
 
+## Dashboard
+
+`MetricsHttpServer` also serves `/dashboard`, a single HTML page with inline styles and script
+(a `Content-Security-Policy` header forbids it to load anything else), and the JSON it polls once
+a second:
+
+| Endpoint | Source |
+|---|---|
+| `/api/node` | The node's own counters (`MetricsCollector`), pending hints per target (`HintedHandoff`), store size, memory and WAL fsync count (`InMemoryStore`), readiness, and its member list with each member's status and heartbeat age |
+| `/api/cluster` | The serving node's member list, each member with its own `/api/node` (or `null`) |
+| `/api/ring` | `ConsistentHash.getVirtualNodes()`: every position as a fraction of the ring, its owner, and each node's share of the hash space as first replica |
+| `/api/replicas?key=K` | `ClusterManager.getReplicasForKey`: the replicas in ring order, up or not |
+
+**One page, every node.** Operation counts, pending hints and readiness are known only to the node
+they describe, and gossip does not carry them. The node serving the page therefore fetches
+`/api/node` from every other member and embeds the answers. HTTP ports are not gossiped, so it
+tries `host:port + offset` (the offset being its own HTTP port minus its own client port) and
+then, for a member on another host, its own HTTP port, and remembers which one answered. An answer is embedded only if it is
+one well-formed JSON object that names that member: a guessed port can belong to something else,
+this node included. The browser could not do this itself: under
+Docker the members are known by service names it cannot resolve, on ports that are mapped
+differently on the host. A member that does not answer is reported with `"self": null`, while its
+gossip status still comes from the serving node, so "dead according to gossip" and "not answering
+HTTP" are separate facts on the page.
+
+The fetches never hold up a request for long. Each peer is asked at most once per 500 ms however
+many pages are open, on a thread pool of its own; a request for `/api/cluster` waits at most
+300 ms for answers and otherwise returns the last ones (dropped after 3 s). Counting live keys
+walks the store, so the count is reused for a second, or for 20 times as long as the last count
+took if that is longer; one thread counts at a time and the others report the previous count.
+
+The page does not trust what it is given either. Each node's numbers are drawn inside their own
+error handler, so a member that reports something unreadable is shown without numbers, and a
+failed round is logged and the next one scheduled regardless. A monitoring page that stops
+polling keeps showing its last numbers as if they were current.
+
+QUORUM and ALL are reported against the copies the cluster keeps (`min(replication factor,
+members)`), the same number the coordinator counts acknowledgements against.
+
+**Read-only.** The server accepts only `GET`, and the handlers call nothing that writes, deletes
+or changes membership. Answers contain no secret or token. Rates are not computed on the server:
+the page derives them from two samples of a node's counters and that node's own timestamps.
+
 ## Testing strategy
 
 - **Unit tests** for the protocol, hash ring, store, WAL recovery (including torn writes and
@@ -505,5 +548,6 @@ copy replaced the other, and anti-entropy exchanged the key on every round witho
 | Client commands | Optional client token (`TITANKV_CLIENT_TOKEN`) |
 | Protocol parsing | Magic bytes, length limits (64 KB keys, 16 MB values) |
 | Connections | Closed by the selector after 30 seconds without a whole request; at most 10,000 at once |
+| HTTP port (metrics, dashboard) | None. Read-only (`GET` only) and free of secrets, but it shows addresses, key placement and traffic: keep it on a private network |
 
 Token comparison is constant-time. Traffic is not encrypted.

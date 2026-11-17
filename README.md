@@ -42,6 +42,8 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 - **Admin**: `removenode` for dead nodes, `cleanup` after joins, `status`, streaming to joining nodes;
   admin commands require the cluster token
 - **Metrics** over HTTP (`/metrics` in Prometheus text format, `/health`, `/ready`, `/status`)
+- **Live dashboard** on the same port (`/dashboard`): members and their state, the hash ring, per-node
+  rates, hints and WAL fsyncs, and which replicas hold a key
 
 **Storage and networking**
 - **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync: one sync
@@ -124,6 +126,69 @@ other replicas and then the other nodes on error, and chooses each write's versi
 writes are always ordered after what it has read or written, including writes that failed (see
 [clocks](docs/ARCHITECTURE.md#versions-and-clocks)).
 
+## Dashboard
+
+Every node serves a page that shows the cluster live, refreshed once a second. It is one HTML
+file with its styles and script inline: nothing is loaded from anywhere else.
+
+![The dashboard while one of three nodes is down](docs/dashboard.png)
+
+```bash
+./scripts/start-cluster.sh
+open http://localhost:9091/dashboard          # any node serves it: 9091, 9092, 9093
+
+# Some load, then kill node 2 and bring it back
+./scripts/run-benchmark.sh --hosts localhost:9001,localhost:9002,localhost:9003 --rate 1500 --duration 300 --retry &
+kill -9 $(cut -d' ' -f2 logs/cluster.pids)
+TITANKV_DEV_MODE=true java -jar target/titankv-1.0.0.jar --port 9002 --seeds localhost:9001,localhost:9003
+```
+
+With Docker the page is at the same address; use `docker compose kill titankv-2` and
+`docker compose start titankv-2`.
+
+What it shows:
+
+- **Members** with the state the serving node gives them (alive, suspect, dead, joining, leaving),
+  whether each is ready or still catching up, and a table of how every node sees every other
+- **The hash ring**: all 150 virtual nodes of every node, and the share of the hash space each
+  node is the first replica for. Ranges of a node that is down fade but stay where they are
+- **Per node**: client reads and writes per second, replica writes and reads, p99 latency, pending
+  hints and whom they are for, keys, memory, and WAL fsyncs. Under load the fsync rate stays far
+  below the write rate: that is group commit
+- **Where a key lives**: type a key to see its position on the ring, its three replicas in order,
+  whether each is up, and which consistency levels can be met right now
+- **Events**: each change the page sees, with the time
+
+Kill a node and it turns suspect after 3 seconds and dead after 10; hints for it accumulate on
+the nodes that coordinate writes, and are delivered when it returns.
+
+The page reads four JSON endpoints, which can also be used on their own:
+
+| Endpoint | Returns |
+|---|---|
+| `/api/cluster` | Every member as this node sees it, each with that member's own numbers |
+| `/api/node` | This node's own numbers and its view of the members |
+| `/api/ring` | Position and owner of every virtual node, and each node's share |
+| `/api/replicas?key=K` | The key's hash and its replicas in ring order, with their state |
+
+Percent-encode the key; as in any query string, a `+` stands for a space (`%2B` is a plus).
+QUORUM and ALL are reported against the copies the cluster actually keeps: a single node keeps
+one copy and can meet every level, whatever the replication factor says.
+
+A node's own numbers exist only on that node, so the node serving the page asks the others for
+`/api/node` and passes the answers on. Nodes do not gossip their HTTP ports, so the serving node
+tries two: the same distance from the client port as its own (90 by default), then, for a member
+on another machine, its own HTTP port. That covers nodes spaced alike on one machine and nodes given one fixed
+`TITANKV_METRICS_PORT` on separate machines; any other arrangement shows the other nodes as
+"not answering", with their membership state still correct.
+
+Everything on this port is read-only: only `GET` is accepted and no request changes data or
+membership. It has **no authentication**, and it shows node addresses, key placement and traffic,
+so do not expose it publicly: keep it on a private network or behind a firewall. The node also
+requests `/api/node` from every address in its member list; in dev mode, where gossip is not
+signed, anyone who can send it a packet can add an address to that list, which is one more
+reason to set a cluster secret anywhere other than your own machine.
+
 ## Consistency and failure behaviour
 
 TitanKV is an **AP** system with tunable consistency: during a partition, each side keeps serving the
@@ -181,7 +246,7 @@ Every setting is an environment variable or the equivalent system property (`tit
 | `TITANKV_FRAME_TIMEOUT_MS` | `30000` | How long a connection may take to deliver a whole request |
 | `TITANKV_TOMBSTONE_GRACE_MS` | `86400000` | How long tombstones of deleted and expired keys are kept |
 | `TITANKV_ANTI_ENTROPY_INTERVAL_MS` | `60000` | Merkle-tree repair with a random peer; `0` disables |
-| `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status` |
+| `TITANKV_METRICS_PORT` | node port + 90 | `/metrics`, `/health`, `/ready`, `/status`, `/dashboard`, `/api/*`. No authentication: do not expose it publicly |
 | `TITANKV_ADVERTISE_HOST` (`--advertise-host`) | host part of the node id | The name or address other nodes and clients reach this node at. Needed when the node id is a plain label (`node-1`) and the nodes are on different machines |
 | `TITANKV_WORKER_THREADS` | max(4, CPUs) | Request worker threads |
 | `TITANKV_WORKER_QUEUE` | 1,000 per worker | Requests that may wait for a worker; further ones are answered "Server busy" |
@@ -293,8 +358,8 @@ How to read these:
 ## Testing
 
 ```bash
-./mvnw test       # 249 unit tests
-./mvnw verify     # + 89 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 268 unit tests
+./mvnw verify     # + 100 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:
@@ -318,6 +383,9 @@ The integration suite includes:
 - restarts with saved membership: a full stop after which only two of five nodes return, a node
   that returns alone, and nodes with nothing saved restarting together
 - read repair, hinted handoff, Merkle anti-entropy (including tombstones), TTL, metrics endpoints
+- the dashboard: its endpoints against the ring and the nodes' own counters, a crash and recovery
+  read from them (suspect, dead, hints kept, hints delivered), that they accept only `GET` and
+  change nothing, and that in production mode they never contain the cluster secret
 - **Network faults**, injected between nodes: a 2 | 3 partition (each side serves exactly the keys it
   holds a quorum of, and refuses the rest), an isolated node, a link cut in one direction, a replica
   that answers a second late, and a second chaos test that mixes all of these with crashes, lost

@@ -2,7 +2,9 @@ package com.titankv.util;
 
 import com.titankv.cluster.ClusterManager;
 import com.titankv.cluster.Node;
+import com.titankv.consistency.ReplicationManager;
 import com.titankv.core.InMemoryStore;
+import com.titankv.network.protocol.BinaryProtocol;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Meter;
@@ -30,17 +32,33 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * - GET /health - Health check (returns 200 if healthy)
  * - GET /ready - Readiness check (returns 200 if ready to serve traffic)
  * - GET /status - JSON status including cluster info
+ * - GET /dashboard - a page that shows the cluster live, fed by the four endpoints below
+ * - GET /api/cluster - every member as this node sees it, with each member's own numbers
+ * - GET /api/node - this node's own numbers and its view of the membership
+ * - GET /api/ring - the virtual nodes on the hash ring and each node's share of it
+ * - GET /api/replicas?key=K - the nodes that hold a key and whether each is up
+ *
+ * Every endpoint only reads: GET is the only method accepted, and no handler changes the store
+ * or the membership. There is no authentication, so the port is for a private network only.
  */
 public class MetricsHttpServer {
 
     private static final Logger logger = LoggerFactory.getLogger(MetricsHttpServer.class);
 
     private static final String CRLF = "\r\n";
+    private static final int HANDLER_THREADS = 8;
+    private static final String DASHBOARD_RESOURCE = "/dashboard.html";
+    // The page is one file: no scripts, styles, fonts or images from anywhere else, and it may
+    // only call back to the node that served it
+    private static final String DASHBOARD_CONTENT_SECURITY_POLICY =
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; "
+            + "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
     private final int port;
     private final MetricsCollector metrics;
     private final ClusterManager clusterManager;
     private final InMemoryStore store;
+    private final DashboardData dashboard;
     private final AtomicBoolean running;
     private final ExecutorService executor;
     private ServerSocket serverSocket;
@@ -50,12 +68,25 @@ public class MetricsHttpServer {
      * Create a metrics HTTP server on a specific port.
      */
     public MetricsHttpServer(int port, MetricsCollector metrics, ClusterManager clusterManager, InMemoryStore store) {
+        this(port, metrics, clusterManager, store, null);
+    }
+
+    /**
+     * @param replicationManager where the dashboard reads the replication factor and the pending
+     *                           hints from, or null to report no hints and a factor of 3
+     */
+    public MetricsHttpServer(int port, MetricsCollector metrics, ClusterManager clusterManager, InMemoryStore store,
+                             ReplicationManager replicationManager) {
         this.port = port;
         this.metrics = metrics;
         this.clusterManager = clusterManager;
         this.store = store;
+        this.dashboard = clusterManager != null && store != null
+                ? new DashboardData(port, metrics, clusterManager, store, replicationManager) : null;
         this.running = new AtomicBoolean(false);
-        this.executor = Executors.newFixedThreadPool(2, r -> {
+        // A browser keeps spare connections open that send nothing until it needs them; each one
+        // holds a thread until it times out, so there are more threads than a scraper would need
+        this.executor = Executors.newFixedThreadPool(HANDLER_THREADS, r -> {
             Thread t = new Thread(r, "metrics-http");
             t.setDaemon(true);
             return t;
@@ -106,6 +137,9 @@ public class MetricsHttpServer {
             }
         }
 
+        if (dashboard != null) {
+            dashboard.close();
+        }
         executor.shutdown();
         try {
             if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -153,7 +187,10 @@ public class MetricsHttpServer {
             }
 
             String method = parts[0];
-            String path = parts[1];
+            String target = parts[1];
+            int queryStart = target.indexOf('?');
+            String path = queryStart < 0 ? target : target.substring(0, queryStart);
+            String query = queryStart < 0 ? "" : target.substring(queryStart + 1);
 
             // Only support GET
             if (!"GET".equalsIgnoreCase(method)) {
@@ -180,6 +217,21 @@ public class MetricsHttpServer {
                     break;
                 case "/status":
                     handleStatus(out);
+                    break;
+                case "/dashboard":
+                    handleDashboard(out);
+                    break;
+                case "/api/cluster":
+                    handleApi(out, dashboard != null ? dashboard::clusterJson : null);
+                    break;
+                case "/api/node":
+                    handleApi(out, dashboard != null ? dashboard::nodeJson : null);
+                    break;
+                case "/api/ring":
+                    handleApi(out, dashboard != null ? dashboard::ringJson : null);
+                    break;
+                case "/api/replicas":
+                    handleReplicas(out, query);
                     break;
                 default:
                     sendError(out, 404, "Not Found");
@@ -372,18 +424,82 @@ public class MetricsHttpServer {
         sendResponse(out, 200, "application/json", sb.toString());
     }
 
+    private void handleDashboard(OutputStream out) throws IOException {
+        byte[] page = dashboard != null ? dashboardPage() : null;
+        if (page == null) {
+            sendError(out, 404, "Not Found");
+            return;
+        }
+        sendResponse(out, 200, "text/html; charset=utf-8", page,
+                "Content-Security-Policy: " + DASHBOARD_CONTENT_SECURITY_POLICY, "Cache-Control: no-store");
+    }
+
+    private static byte[] dashboardPage() throws IOException {
+        try (InputStream in = MetricsHttpServer.class.getResourceAsStream(DASHBOARD_RESOURCE)) {
+            return in != null ? in.readAllBytes() : null;
+        }
+    }
+
+    private void handleApi(OutputStream out, java.util.function.Supplier<String> json) throws IOException {
+        if (json == null) {
+            sendError(out, 404, "Not Found");
+            return;
+        }
+        String body;
+        try {
+            body = json.get();
+        } catch (RuntimeException e) {
+            logger.warn("Could not answer a dashboard request: {}", e.toString());
+            sendError(out, 500, "Internal Server Error");
+            return;
+        }
+        sendResponse(out, 200, "application/json", body.getBytes(StandardCharsets.UTF_8), "Cache-Control: no-store");
+    }
+
+    private void handleReplicas(OutputStream out, String query) throws IOException {
+        String key = null;
+        try {
+            for (String parameter : query.split("&")) {
+                if (parameter.startsWith("key=")) {
+                    key = java.net.URLDecoder.decode(parameter.substring(4), StandardCharsets.UTF_8);
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            sendError(out, 400, "Bad Request: the key is not valid percent-encoding");
+            return;
+        }
+        if (key == null || key.isEmpty()) {
+            sendError(out, 400, "Bad Request: expected /api/replicas?key=...");
+            return;
+        }
+        if (key.getBytes(StandardCharsets.UTF_8).length > BinaryProtocol.MAX_KEY_LENGTH) {
+            sendError(out, 400, "Bad Request: the key is longer than the store accepts");
+            return;
+        }
+        String lookup = key;
+        handleApi(out, dashboard != null ? () -> dashboard.replicasJson(lookup) : null);
+    }
+
     private static String jsonEscape(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+        return JsonWriter.escape(value);
     }
 
     private void sendResponse(OutputStream out, int statusCode, String contentType, String body) throws IOException {
-        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+        sendResponse(out, statusCode, contentType, body.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void sendResponse(OutputStream out, int statusCode, String contentType, byte[] bodyBytes,
+                              String... extraHeaders) throws IOException {
         String statusText = getStatusText(statusCode);
 
         StringBuilder headers = new StringBuilder();
         headers.append("HTTP/1.1 ").append(statusCode).append(" ").append(statusText).append(CRLF);
         headers.append("Content-Type: ").append(contentType).append(CRLF);
         headers.append("Content-Length: ").append(bodyBytes.length).append(CRLF);
+        headers.append("X-Content-Type-Options: nosniff").append(CRLF);
+        for (String header : extraHeaders) {
+            headers.append(header).append(CRLF);
+        }
         headers.append("Connection: close").append(CRLF);
         headers.append(CRLF);
 
@@ -402,6 +518,7 @@ public class MetricsHttpServer {
             case 400: return "Bad Request";
             case 404: return "Not Found";
             case 405: return "Method Not Allowed";
+            case 500: return "Internal Server Error";
             case 503: return "Service Unavailable";
             default: return "Unknown";
         }

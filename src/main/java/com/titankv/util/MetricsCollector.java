@@ -145,6 +145,37 @@ public class MetricsCollector {
         return putLatency.mean(TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * @return the 99th percentile of recent client reads in milliseconds (the timers keep a
+     *         rolling window of about two minutes), 0 before the first read
+     */
+    public double getGetP99LatencyMs() {
+        return p99Ms(getLatency);
+    }
+
+    public double getPutP99LatencyMs() {
+        return p99Ms(putLatency);
+    }
+
+    private static double p99Ms(Timer timer) {
+        for (io.micrometer.core.instrument.distribution.ValueAtPercentile value
+                : timer.takeSnapshot().percentileValues()) {
+            if (value.percentile() == 0.99) {
+                double ms = value.value(TimeUnit.MILLISECONDS);
+                return Double.isFinite(ms) ? ms : 0.0;
+            }
+        }
+        return 0.0;
+    }
+
+    public long getTotalReplicaReads() {
+        return (long) internalGets.count();
+    }
+
+    public long getTotalReplicaWrites() {
+        return (long) internalWrites.count();
+    }
+
     public MeterRegistry getRegistry() {
         return registry;
     }

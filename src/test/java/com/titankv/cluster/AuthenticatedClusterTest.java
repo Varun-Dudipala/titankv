@@ -137,4 +137,43 @@ class AuthenticatedClusterTest {
             assertThat(wal).exists();
         }
     }
+
+    /**
+     * The HTTP port has no authentication, so nothing it serves may give the secret away. The
+     * dashboard works the same as in dev mode, and with a WAL its fsyncs are counted.
+     */
+    @Test
+    void dashboardWorksAndNeverRevealsTheSecret() throws Exception {
+        try (TitanKVClient client = cluster.client(cluster.address(0))) {
+            client.put("dashboard-auth-key", "value");
+        }
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        java.util.function.Function<String, java.net.http.HttpResponse<String>> get = path -> {
+            try {
+                return http.send(java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("http://localhost:" + (BASE_PORT + 90) + path)).build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString());
+            } catch (Exception e) {
+                throw new AssertionError("GET " + path + " failed", e);
+            }
+        };
+
+        // Node 1 learns the other nodes' numbers from their HTTP ports, which need no token
+        TestCluster.awaitCondition(() -> get.apply("/api/cluster").body().split("\"self\":\\{\"node\"", -1).length == 4,
+                10_000, "/api/cluster to carry all three nodes' own numbers");
+
+        for (String path : new String[] {"/dashboard", "/api/cluster", "/api/node", "/api/ring",
+                "/api/replicas?key=dashboard-auth-key", "/status", "/metrics"}) {
+            java.net.http.HttpResponse<String> response = get.apply(path);
+            assertThat(response.statusCode()).as(path).isEqualTo(200);
+            assertThat(response.body()).as(path).doesNotContain("integration-test-secret").doesNotContain("secret")
+                    .doesNotContainIgnoringCase("token");
+        }
+
+        String node = get.apply("/api/node").body();
+        assertThat(node).contains("\"wal_enabled\":true");
+        java.util.regex.Matcher syncs = java.util.regex.Pattern.compile("\"wal_syncs\":(\\d+)").matcher(node);
+        assertThat(syncs.find()).isTrue();
+        assertThat(Long.parseLong(syncs.group(1))).isPositive();
+    }
 }

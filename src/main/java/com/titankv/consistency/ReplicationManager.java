@@ -194,7 +194,7 @@ public final class ReplicationManager implements ReplicaIO {
      * cluster members. Members that are down still count, so losing replicas makes QUORUM and
      * ALL fail rather than quietly requiring fewer acknowledgements.
      */
-    int effectiveReplicationFactor() {
+    public int effectiveReplicationFactor() {
         return Math.max(1, Math.min(replicationFactor, clusterManager.getNodeCount()));
     }
 

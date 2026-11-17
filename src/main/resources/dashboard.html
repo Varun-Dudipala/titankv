@@ -1,0 +1,890 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TitanKV dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11, 11, 11, 0.10);
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+  --series-5: #e87ba4; --series-6: #008300; --series-7: #6250d6; --series-8: #e34948;
+  --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #0ca30c; --series-7: #9085e9; --series-8: #e66767;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px;
+  padding: 18px 24px 4px;
+}
+h1 { font-size: 20px; margin: 0; font-weight: 650; }
+h2 { font-size: 13px; margin: 0 0 12px; font-weight: 600; color: var(--ink-2); }
+.sub { color: var(--ink-2); }
+.muted { color: var(--muted); }
+.spacer { flex: 1; }
+main { padding: 12px 24px 32px; display: grid; gap: 16px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+  min-width: 0;
+}
+.banner {
+  display: none; border: 1px solid var(--critical); border-radius: 10px; padding: 10px 14px;
+  background: var(--surface);
+}
+.banner.on { display: block; }
+
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; }
+.figure .label { color: var(--ink-2); font-size: 12px; }
+.figure .value { font-size: 28px; font-weight: 600; line-height: 1.2; }
+.figure .note { color: var(--muted); font-size: 12px; }
+
+.top { display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 860px) { .top { grid-template-columns: 1fr; } }
+.side { display: grid; gap: 16px; align-content: start; }
+
+.ring-wrap { position: relative; max-width: 320px; margin: 0 auto; }
+#ring { display: block; width: 100%; height: auto; }
+#ring .arc { fill: none; stroke-width: 18; }
+#ring .arc.down { opacity: 0.25; }
+#ring .track { fill: none; stroke: var(--grid); stroke-width: 18; }
+#ring text { fill: var(--ink-2); font-size: 12px; text-anchor: middle; }
+#ring .big { fill: var(--ink); font-size: 22px; font-weight: 600; }
+#ring .key-line { stroke: var(--ink); stroke-width: 2; }
+#ring .key-dot { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
+#ring .key-label { fill: var(--ink); font-weight: 600; }
+.legend { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 4px; }
+.legend li { display: flex; align-items: center; gap: 8px; }
+.legend .share { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+.lookup { display: flex; gap: 8px; }
+.lookup input {
+  flex: 1; min-width: 0; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--axis);
+  background: var(--page); color: var(--ink); font: inherit;
+}
+.lookup input:focus { outline: 2px solid var(--series-1); outline-offset: 1px; }
+#replicas { margin-top: 12px; }
+#replicas ol { margin: 8px 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+#replicas li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.order {
+  width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--axis); flex: none;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 11px; color: var(--ink-2);
+}
+
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { font-weight: 500; color: var(--ink-2); font-size: 12px; }
+tr:last-child td { border-bottom: 0; }
+.scroll { overflow-x: auto; }
+
+.status { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.status .icon { font-size: 11px; width: 12px; text-align: center; }
+.status.good .icon { color: var(--good); }
+.status.warning .icon { color: var(--warning); }
+.status.critical .icon { color: var(--critical); }
+.status.neutral .icon { color: var(--muted); }
+
+.nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.node-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.node-head .name { font-weight: 600; font-size: 15px; }
+.tag { font-size: 11px; color: var(--ink-2); border: 1px solid var(--axis); border-radius: 999px; padding: 0 7px; }
+.node-state { color: var(--ink-2); font-size: 12px; margin: 2px 0 12px; min-height: 17px; }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 10px; }
+.tile .label { color: var(--ink-2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .value { font-size: 18px; font-weight: 600; white-space: nowrap; }
+.tile .note { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node.silent .tiles, .node.silent .charts { opacity: 0.45; }
+.charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+.chart .label { color: var(--ink-2); font-size: 11px; display: flex; justify-content: space-between; }
+.chart svg { display: block; width: 100%; height: 44px; border-bottom: 1px solid var(--axis); }
+.chart path { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.chart line { stroke: var(--axis); stroke-width: 1; vector-effect: non-scaling-stroke; visibility: hidden; }
+
+#events { list-style: none; margin: 0; padding: 0; max-height: 168px; overflow-y: auto; display: grid; gap: 4px; }
+#events li { display: flex; gap: 12px; }
+#events time { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+
+#tip {
+  position: fixed; z-index: 10; pointer-events: none; display: none; padding: 5px 8px; border-radius: 6px;
+  background: var(--ink); color: var(--page); font-size: 12px; white-space: nowrap;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>TitanKV</h1>
+  <span class="sub" id="served">connecting…</span>
+  <span class="spacer"></span>
+  <span id="live" class="status neutral"><span class="icon">●</span><span id="live-text">connecting</span></span>
+</header>
+<main>
+  <div class="banner" id="banner" role="alert"></div>
+
+  <section class="card summary" aria-label="Cluster summary">
+    <div class="figure"><div class="label">Nodes up</div><div class="value" id="sum-up">–</div><div class="note" id="sum-up-note">&nbsp;</div></div>
+    <div class="figure"><div class="label">Client operations</div><div class="value" id="sum-ops">–</div><div class="note">per second, all nodes</div></div>
+    <div class="figure"><div class="label">Pending hints</div><div class="value" id="sum-hints">–</div><div class="note">writes waiting for a replica that was down</div></div>
+    <div class="figure"><div class="label">Replication</div><div class="value" id="sum-rf">–</div><div class="note" id="sum-rf-note">&nbsp;</div></div>
+  </section>
+
+  <section class="top">
+    <div class="card">
+      <h2>Hash ring</h2>
+      <div class="ring-wrap"><svg id="ring" viewBox="0 0 320 320" role="img" aria-label="The hash ring, coloured by the node that owns each range"></svg></div>
+      <ul class="legend" id="legend"></ul>
+      <div class="muted" style="font-size:12px;margin-top:8px">Share of the hash space each node is the first replica for.</div>
+    </div>
+    <div class="side">
+      <div class="card">
+        <h2>Where does a key live?</h2>
+        <div class="lookup"><input id="key" type="text" placeholder="Type a key, for example user:42" autocomplete="off" spellcheck="false" aria-label="Key to look up"></div>
+        <div id="replicas" class="sub">The key's hash picks a point on the ring; its replicas are the next distinct nodes clockwise.</div>
+      </div>
+      <div class="card">
+        <h2>Gossip views: how each node (row) sees every member (column)</h2>
+        <div class="scroll"><table id="views"></table></div>
+      </div>
+      <div class="card">
+        <h2>Events seen by this page</h2>
+        <ol id="events"></ol>
+      </div>
+    </div>
+  </section>
+
+  <section class="nodes" id="nodes" aria-label="Nodes"></section>
+</main>
+<div id="tip" role="tooltip"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var POLL_MS = 1000;      // how often the page asks for the cluster view
+  var HISTORY = 60;        // points kept per chart: one minute
+  var SERIES = 8;          // node colours; further nodes are drawn grey
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var NBSP = '\u00a0';   // keeps an empty line of text from collapsing
+
+  var nodes = new Map();   // node id -> what the page knows and shows about it
+  var colours = new Map(); // node id -> colour, kept for as long as the node is a member
+  var ring = null;         // the last /api/ring answer
+  var ringText = '';
+  var lookup = null;       // the last /api/replicas answer
+  var servedBy = null;
+  var connected = null;
+  var ticks = 0;
+  var memberIds = '';
+  var lastProblem = null;
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, className, text) {
+    var e = document.createElement(tag);
+    if (className) { e.className = className; }
+    if (text !== undefined && text !== null) { e.textContent = text; }
+    return e;
+  }
+
+  function svg(tag, attrs) {
+    var e = document.createElementNS(SVG_NS, tag);
+    for (var name in attrs) { e.setAttribute(name, attrs[name]); }
+    return e;
+  }
+
+  // A node keeps its colour for as long as it is a member; a node that joins takes the first
+  // colour nobody has
+  function colourOf(id) {
+    if (!colours.has(id)) {
+      var taken = {};
+      colours.forEach(function (colour) { taken[colour] = true; });
+      var colour = 'var(--muted)';
+      for (var slot = SERIES; slot >= 1; slot--) {
+        if (!taken['var(--series-' + slot + ')']) { colour = 'var(--series-' + slot + ')'; }
+      }
+      colours.set(id, colour);
+    }
+    return colours.get(id);
+  }
+
+  // ---------- formatting ----------
+
+  function count(n) { return Math.round(n).toLocaleString('en-US'); }
+
+  function rate(n) {
+    if (n === null || n === undefined) { return '–'; }
+    return n >= 100 ? count(n) : n.toFixed(1);
+  }
+
+  function bytes(n) {
+    if (n < 1024) { return n + ' B'; }
+    if (n < 1024 * 1024) { return (n / 1024).toFixed(1) + ' KB'; }
+    if (n < 1024 * 1024 * 1024) { return (n / 1024 / 1024).toFixed(1) + ' MB'; }
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  function millis(n) {
+    if (!n) { return '–'; }
+    return (n >= 100 ? n.toFixed(0) : n >= 10 ? n.toFixed(1) : n.toFixed(2)) + ' ms';
+  }
+
+  function duration(ms) {
+    var s = Math.floor(ms / 1000);
+    if (s < 60) { return s + ' s'; }
+    if (s < 3600) { return Math.floor(s / 60) + ' min ' + (s % 60) + ' s'; }
+    return Math.floor(s / 3600) + ' h ' + Math.floor((s % 3600) / 60) + ' min';
+  }
+
+  function clock(date) {
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+    return two(date.getHours()) + ':' + two(date.getMinutes()) + ':' + two(date.getSeconds());
+  }
+
+  // ---------- status ----------
+
+  var STATUS = {
+    ALIVE: ['good', '●', 'Alive'],
+    SUSPECT: ['warning', '▲', 'Suspect'],
+    DEAD: ['critical', '✕', 'Dead'],
+    JOINING: ['neutral', '○', 'Joining'],
+    LEAVING: ['neutral', '○', 'Leaving']
+  };
+
+  // A status is always an icon and a word; the colour only repeats what they say
+  function setStatus(target, status, label) {
+    var look = STATUS[status] || ['neutral', '○', status];
+    target.className = 'status ' + look[0];
+    target.textContent = '';
+    target.appendChild(el('span', 'icon', look[1]));
+    target.appendChild(el('span', null, label || look[2]));
+  }
+
+  // ---------- tooltip ----------
+
+  var tip = $('tip');
+
+  function showTip(event, text) {
+    tip.textContent = text;
+    tip.style.display = 'block';
+    var x = Math.min(event.clientX + 12, window.innerWidth - tip.offsetWidth - 8);
+    tip.style.left = Math.max(8, x) + 'px';
+    tip.style.top = Math.max(8, event.clientY - tip.offsetHeight - 10) + 'px';
+  }
+
+  function hideTip() { tip.style.display = 'none'; }
+
+  // ---------- events ----------
+
+  function logEvent(text) {
+    var item = el('li');
+    item.appendChild(el('time', null, clock(new Date())));
+    item.appendChild(el('span', null, text));
+    var list = $('events');
+    list.insertBefore(item, list.firstChild);
+    while (list.childNodes.length > 100) { list.removeChild(list.lastChild); }
+  }
+
+  // ---------- small line chart ----------
+
+  function makeChart(title, unit, colour) {
+    var root = el('div', 'chart');
+    var label = el('div', 'label');
+    var peak = el('span', 'muted');
+    label.appendChild(el('span', null, title));
+    label.appendChild(peak);
+    var plot = svg('svg', { viewBox: '0 0 ' + (HISTORY - 1) + ' 40', preserveAspectRatio: 'none' });
+    var path = svg('path', {});
+    path.style.stroke = colour;
+    var cursor = svg('line', { y1: 0, y2: 40 });
+    plot.appendChild(cursor);
+    plot.appendChild(path);
+    root.appendChild(label);
+    root.appendChild(plot);
+    var values = [];
+
+    plot.addEventListener('mousemove', function (event) {
+      var box = plot.getBoundingClientRect();
+      var index = Math.round((event.clientX - box.left) / box.width * (HISTORY - 1));
+      index = Math.max(0, Math.min(HISTORY - 1, index));
+      var value = values[index - (HISTORY - values.length)];
+      cursor.setAttribute('x1', index);
+      cursor.setAttribute('x2', index);
+      cursor.style.visibility = 'visible';
+      var ago = HISTORY - 1 - index;
+      var when = ago === 0 ? 'now' : ago + ' s ago';
+      showTip(event, value === undefined || value === null ? when + ': no data' : when + ': ' + rate(value) + ' ' + unit);
+    });
+    plot.addEventListener('mouseleave', function () {
+      cursor.style.visibility = 'hidden';
+      hideTip();
+    });
+
+    return {
+      root: root,
+      // The newest value is at the right edge; a null is a gap (the node did not answer)
+      push: function (value) {
+        values.push(value);
+        if (values.length > HISTORY) { values.shift(); }
+        var max = 0;
+        values.forEach(function (v) { if (v !== null && v > max) { max = v; } });
+        var top = max > 0 ? max : 1;
+        var d = '';
+        var pen = false;
+        for (var i = 0; i < values.length; i++) {
+          if (values[i] === null) { pen = false; continue; }
+          var x = HISTORY - values.length + i;
+          var y = 38 - values[i] / top * 34;
+          d += (pen ? 'L' : 'M') + x + ' ' + y.toFixed(2);
+          pen = true;
+        }
+        path.setAttribute('d', d);
+        peak.textContent = 'peak ' + rate(max);
+      }
+    };
+  }
+
+  // ---------- node cards ----------
+
+  function makeTile(parent, label) {
+    var tile = el('div', 'tile');
+    tile.appendChild(el('div', 'label', label));
+    var value = el('div', 'value', '–');
+    var note = el('div', 'note', NBSP);
+    tile.appendChild(value);
+    tile.appendChild(note);
+    parent.appendChild(tile);
+    return { value: value, note: note };
+  }
+
+  function makeNode(id) {
+    var colour = colourOf(id);
+    var root = el('article', 'card node');
+    var head = el('div', 'node-head');
+    var swatch = el('span', 'swatch');
+    swatch.style.background = colour;
+    var status = el('span', 'status');
+    var address = el('span', 'muted');
+    var tag = el('span', 'tag', 'serving this page');
+    tag.style.display = 'none';
+    head.appendChild(swatch);
+    head.appendChild(el('span', 'name', id));
+    head.appendChild(address);
+    head.appendChild(tag);
+    head.appendChild(el('span', 'spacer'));
+    head.appendChild(status);
+    var state = el('div', 'node-state');
+    var tiles = el('div', 'tiles');
+    var node = {
+      id: id, root: root, status: status, address: address, tag: tag, state: state,
+      reads: makeTile(tiles, 'Reads / s'),
+      writes: makeTile(tiles, 'Writes / s'),
+      replica: makeTile(tiles, 'Replica writes / s'),
+      p99: makeTile(tiles, 'p99 write'),
+      hints: makeTile(tiles, 'Pending hints'),
+      keys: makeTile(tiles, 'Keys'),
+      memory: makeTile(tiles, 'Memory'),
+      wal: makeTile(tiles, 'WAL fsyncs'),
+      ops: makeChart('Client ops / s', 'ops/s', colour),
+      hintChart: makeChart('Pending hints', 'hints', colour),
+      previous: null, rates: null, seen: {}
+    };
+    var charts = el('div', 'charts');
+    charts.appendChild(node.ops.root);
+    charts.appendChild(node.hintChart.root);
+    root.appendChild(head);
+    root.appendChild(state);
+    root.appendChild(tiles);
+    root.appendChild(charts);
+    return node;
+  }
+
+  // Rates come from the difference between two of the node's own samples, timed by its own clock
+  function updateRates(node, self) {
+    var before = node.previous;
+    if (!self) {
+      node.previous = null;
+      node.rates = null;
+      return;
+    }
+    if (!before || self.uptime_ms < before.uptime_ms) {
+      node.previous = self;      // first sample, or the node restarted and counts from zero again
+      node.rates = null;
+      return;
+    }
+    var seconds = (self.time_ms - before.time_ms) / 1000;
+    if (seconds <= 0) { return; } // the same sample again: keep the rates it gave
+    function per(now, then) { return Math.max(0, now - then) / seconds; }
+    node.rates = {
+      reads: per(self.ops.gets, before.ops.gets),
+      writes: per(self.ops.puts + self.ops.deletes, before.ops.puts + before.ops.deletes),
+      replicaReads: per(self.ops.replica_reads, before.ops.replica_reads),
+      replicaWrites: per(self.ops.replica_writes, before.ops.replica_writes),
+      errors: per(self.ops.errors, before.ops.errors),
+      walSyncs: per(self.store.wal_syncs, before.store.wal_syncs)
+    };
+    node.previous = self;
+  }
+
+  function hintsByTarget(self) {
+    var parts = [];
+    for (var target in self.hints.by_target) { parts.push(target + ': ' + count(self.hints.by_target[target])); }
+    return 'for ' + parts.join(', ');
+  }
+
+  function renderNode(node, member) {
+    var self = member.self;
+    var rates = node.rates;
+    setStatus(node.status, member.status);
+    node.address.textContent = member.address === member.id ? '' : member.address;
+    node.tag.style.display = member.local ? '' : 'none';
+    node.root.classList.toggle('silent', !self);
+
+    if (!self) {
+      node.state.textContent = member.up
+          ? 'Its HTTP port does not answer, so its own numbers are unknown.'
+          : 'Not answering. Last heard from ' + duration(member.heartbeat_age_ms) + ' ago.';
+    } else if (self.catching_up) {
+      node.state.textContent = 'Catching up: it started without data and will not answer reads until it is repaired from its peers.';
+    } else if (!self.ready) {
+      node.state.textContent = 'Not ready: still learning the cluster membership.';
+    } else if (!self.healthy) {
+      node.state.textContent = 'Unhealthy: the write-ahead log failed and the node refuses writes.';
+    } else {
+      node.state.textContent = 'Ready. Up for ' + duration(self.uptime_ms) + ', ' + count(self.connections) + ' open connections.';
+    }
+
+    ['reads', 'writes', 'replica', 'p99', 'hints', 'keys', 'memory', 'wal'].forEach(function (name) {
+      if (!self) {
+        node[name].value.textContent = '–';
+        node[name].note.textContent = NBSP;
+      }
+    });
+    if (self) {
+      node.reads.value.textContent = rates ? rate(rates.reads) : '–';
+      node.reads.note.textContent = count(self.ops.gets) + ' total';
+      node.writes.value.textContent = rates ? rate(rates.writes) : '–';
+      node.writes.note.textContent = count(self.ops.puts + self.ops.deletes) + ' total';
+      node.replica.value.textContent = rates ? rate(rates.replicaWrites) : '–';
+      node.replica.note.textContent = rates ? rate(rates.replicaReads) + ' reads / s' : NBSP;
+      node.p99.value.textContent = millis(self.latency_ms.put_p99);
+      node.p99.note.textContent = 'read ' + millis(self.latency_ms.get_p99);
+      node.hints.value.textContent = count(self.hints.pending);
+      node.hints.note.textContent = self.hints.pending > 0 ? hintsByTarget(self) : 'none waiting';
+      node.hints.note.title = node.hints.note.textContent;
+      node.keys.value.textContent = count(self.store.keys);
+      node.keys.note.textContent = self.store.keys_raw > self.store.keys
+          ? ('+ ' + count(self.store.keys_raw - self.store.keys) + ' deleted or expired') : NBSP;
+      node.keys.note.title = node.keys.note.textContent;
+      node.memory.value.textContent = bytes(self.store.memory_bytes);
+      node.memory.note.textContent = self.hints.bytes > 0 ? 'hints ' + bytes(self.hints.bytes) : NBSP;
+      if (self.store.wal_enabled) {
+        node.wal.value.textContent = count(self.store.wal_syncs);
+        node.wal.note.textContent = rates ? rate(rates.walSyncs) + ' / s' : NBSP;
+      } else {
+        node.wal.value.textContent = 'off';
+        node.wal.note.textContent = 'WAL is off';
+      }
+    }
+    node.ops.push(self && rates ? rates.reads + rates.writes : null);
+    node.hintChart.push(self ? self.hints.pending : null);
+  }
+
+  // What changed since the last poll, in words
+  function noteChanges(node, member) {
+    var seen = node.seen;
+    var self = member.self;
+    var hints = self ? self.hints.by_target : null;
+    if (seen.status !== undefined) {
+      if (seen.status !== member.status) {
+        logEvent(servedBy + ' now sees ' + node.id + ' as ' + member.status + ' (was ' + seen.status + ')');
+      }
+      if (seen.answers && !self) { logEvent(node.id + ' stopped answering on its HTTP port'); }
+      if (!seen.answers && self) { logEvent(node.id + ' answers on its HTTP port again'); }
+      if (self && seen.ready !== null && seen.ready !== self.ready) {
+        logEvent(node.id + (self.ready ? ' is ready to serve clients' : ' is not ready'));
+      }
+      if (self && seen.catchingUp !== null && seen.catchingUp !== self.catching_up) {
+        logEvent(node.id + (self.catching_up ? ' is catching up from its peers' : ' has caught up with its peers'));
+      }
+      if (hints && seen.hints) {
+        var targets = {};
+        var target;
+        for (target in hints) { targets[target] = true; }
+        for (target in seen.hints) { targets[target] = true; }
+        for (target in targets) {
+          if (!seen.hints[target] && hints[target]) { logEvent(node.id + ' started keeping hints for ' + target); }
+          if (seen.hints[target] && !hints[target]) { logEvent(node.id + ' has no more hints for ' + target + ' (delivered or expired)'); }
+        }
+      }
+    }
+    node.seen = {
+      status: member.status,
+      answers: !!self,
+      ready: self ? self.ready : null,
+      catchingUp: self ? self.catching_up : null,
+      hints: hints || seen.hints
+    };
+  }
+
+  // ---------- gossip views ----------
+
+  function renderViews(members) {
+    var table = $('views');
+    table.textContent = '';
+    var headRow = el('tr');
+    headRow.appendChild(el('th', null, 'Seen by'));
+    members.forEach(function (member) { headRow.appendChild(el('th', null, member.id)); });
+    table.appendChild(headRow);
+    members.forEach(function (observer) {
+      var row = el('tr');
+      row.appendChild(el('td', null, observer.id));
+      var view = {};
+      if (observer.self) {
+        observer.self.members.forEach(function (m) { view[m.id] = m; });
+      }
+      members.forEach(function (subject) {
+        var cell = el('td');
+        if (!observer.self) {
+          cell.appendChild(el('span', 'muted', 'no answer'));
+        } else if (observer.id === subject.id) {
+          cell.appendChild(el('span', 'muted', 'itself'));
+        } else if (view[subject.id]) {
+          var status = el('span');
+          setStatus(status, view[subject.id].status);
+          cell.appendChild(status);
+        } else {
+          cell.appendChild(el('span', 'muted', 'unknown'));
+        }
+        row.appendChild(cell);
+      });
+      table.appendChild(row);
+    });
+  }
+
+  // ---------- ring ----------
+
+  var RING_C = 160;
+  var RING_R = 118;
+
+  function ringPoint(position, radius) {
+    var angle = position * 2 * Math.PI - Math.PI / 2; // 0 at the top, clockwise
+    return [RING_C + radius * Math.cos(angle), RING_C + radius * Math.sin(angle)];
+  }
+
+  function renderRing() {
+    var plot = $('ring');
+    plot.textContent = '';
+    plot.appendChild(svg('circle', { 'class': 'track', cx: RING_C, cy: RING_C, r: RING_R }));
+    if (!ring || !ring.vnodes.length) { return; }
+
+    // One path per node, made of the ranges its virtual nodes own
+    var paths = ring.nodes.map(function () { return ''; });
+    var vnodes = ring.vnodes;
+    for (var i = 0; i < vnodes.length; i++) {
+      var end = vnodes[i][0];
+      var start = i === 0 ? vnodes[vnodes.length - 1][0] - 1 : vnodes[i - 1][0];
+      var from = ringPoint(start, RING_R);
+      var to = ringPoint(end, RING_R);
+      paths[vnodes[i][1]] += 'M' + from[0].toFixed(2) + ' ' + from[1].toFixed(2)
+          + 'A' + RING_R + ' ' + RING_R + ' 0 ' + (end - start > 0.5 ? 1 : 0) + ' 1 '
+          + to[0].toFixed(2) + ' ' + to[1].toFixed(2);
+    }
+    ring.nodes.forEach(function (owner, index) {
+      var path = svg('path', { 'class': 'arc', d: paths[index] });
+      path.style.stroke = colourOf(owner.id);
+      path.dataset.node = owner.id;
+      plot.appendChild(path);
+    });
+
+    var big = svg('text', { 'class': 'big', x: RING_C, y: RING_C - 2 });
+    big.textContent = count(ring.virtual_nodes);
+    var small = svg('text', { x: RING_C, y: RING_C + 18 });
+    small.textContent = 'virtual nodes, ' + ring.nodes.length + (ring.nodes.length === 1 ? ' node' : ' nodes');
+    plot.appendChild(big);
+    plot.appendChild(small);
+
+    var legend = $('legend');
+    legend.textContent = '';
+    ring.nodes.forEach(function (owner) {
+      var item = el('li');
+      var swatch = el('span', 'swatch');
+      swatch.style.background = colourOf(owner.id);
+      item.appendChild(swatch);
+      item.appendChild(el('span', null, owner.id));
+      item.appendChild(el('span', 'share', (owner.share * 100).toFixed(1) + '%'));
+      legend.appendChild(item);
+    });
+    renderKeyMarker();
+    dimRing();
+  }
+
+  // Ranges of nodes that are down stay on the ring (their keys keep the same replicas) but fade
+  function dimRing() {
+    var arcs = $('ring').querySelectorAll('.arc');
+    for (var i = 0; i < arcs.length; i++) {
+      var node = nodes.get(arcs[i].dataset.node);
+      arcs[i].classList.toggle('down', !!node && node.up === false);
+    }
+  }
+
+  function renderKeyMarker() {
+    var plot = $('ring');
+    var old = plot.querySelectorAll('.key-mark');
+    for (var i = 0; i < old.length; i++) { plot.removeChild(old[i]); }
+    if (!lookup || !ring) { return; }
+    var inner = ringPoint(lookup.position, RING_R - 16);
+    var outer = ringPoint(lookup.position, RING_R + 18);
+    var label = ringPoint(lookup.position, RING_R + 30);
+    plot.appendChild(svg('line', { 'class': 'key-mark key-line', x1: inner[0], y1: inner[1], x2: outer[0], y2: outer[1] }));
+    plot.appendChild(svg('circle', { 'class': 'key-mark key-dot', cx: outer[0], cy: outer[1], r: 5 }));
+    var text = svg('text', { 'class': 'key-mark key-label', x: label[0], y: label[1] + 4 });
+    text.textContent = 'key';
+    plot.appendChild(text);
+  }
+
+  $('ring').addEventListener('mousemove', function (event) {
+    if (!ring || !ring.vnodes.length) { return; }
+    var box = this.getBoundingClientRect();
+    var x = (event.clientX - box.left) / box.width * 320 - RING_C;
+    var y = (event.clientY - box.top) / box.height * 320 - RING_C;
+    var distance = Math.sqrt(x * x + y * y);
+    if (distance < RING_R - 16 || distance > RING_R + 16) { hideTip(); return; }
+    var position = (Math.atan2(y, x) + Math.PI / 2) / (2 * Math.PI);
+    if (position < 0) { position += 1; }
+    // The owner of a point is the first virtual node at or after it, wrapping round at the end
+    var low = 0;
+    var high = ring.vnodes.length;
+    while (low < high) {
+      var mid = (low + high) >> 1;
+      if (ring.vnodes[mid][0] < position) { low = mid + 1; } else { high = mid; }
+    }
+    var vnode = ring.vnodes[low === ring.vnodes.length ? 0 : low];
+    showTip(event, 'Position ' + position.toFixed(3) + ': first replica is ' + ring.nodes[vnode[1]].id);
+  });
+  $('ring').addEventListener('mouseleave', hideTip);
+
+  // ---------- key lookup ----------
+
+  function renderLookup() {
+    var box = $('replicas');
+    box.textContent = '';
+    if (!lookup) {
+      box.textContent = "The key's hash picks a point on the ring; its replicas are the next distinct nodes clockwise.";
+      renderKeyMarker();
+      return;
+    }
+    box.appendChild(el('div', null, 'Hash ' + lookup.hash + ', at ' + lookup.position.toFixed(3) + ' of the way round the ring.'));
+    var list = el('ol');
+    lookup.replicas.forEach(function (replica, index) {
+      var item = el('li');
+      item.appendChild(el('span', 'order', String(index + 1)));
+      var swatch = el('span', 'swatch');
+      swatch.style.background = colourOf(replica.id);
+      item.appendChild(swatch);
+      item.appendChild(el('strong', null, replica.id));
+      if (replica.address !== replica.id) { item.appendChild(el('span', 'muted', replica.address)); }
+      var status = el('span');
+      setStatus(status, replica.status);
+      item.appendChild(status);
+      list.appendChild(item);
+    });
+    box.appendChild(list);
+    var up = lookup.replicas_up;
+    var total = lookup.replicas.length;
+    var verdict = up + ' of ' + total + ' replicas up as ' + servedBy + ' sees them: ';
+    // QUORUM and ALL are counted against the copies this cluster keeps, which is fewer than the
+    // replication factor when the cluster has fewer nodes than that
+    if (up === total && total >= lookup.copies) {
+      verdict += 'ONE, QUORUM (' + lookup.quorum + ') and ALL can be met.';
+    } else if (up >= lookup.quorum) {
+      verdict += 'ONE and QUORUM (' + lookup.quorum + ') can be met, ALL cannot.';
+    } else if (up >= 1) {
+      verdict += 'only ONE can be met; QUORUM needs ' + lookup.quorum + '.';
+    } else {
+      verdict += 'no consistency level can be met.';
+    }
+    box.appendChild(el('div', null, verdict));
+    renderKeyMarker();
+  }
+
+  function refreshLookup() {
+    var key = $('key').value;
+    if (!key) {
+      lookup = null;
+      renderLookup();
+      return Promise.resolve();
+    }
+    return getJson('/api/replicas?key=' + encodeURIComponent(key)).then(function (answer) {
+      if ($('key').value === key) { // ignore the answer to a key that has since been edited
+        lookup = answer;
+        renderLookup();
+      }
+    }, function () { /* the banner already says the node is not answering */ });
+  }
+
+  var typing = null;
+  $('key').addEventListener('input', function () {
+    clearTimeout(typing);
+    typing = setTimeout(refreshLookup, 150);
+    // Keep the key in the address, so a reload or a shared link shows the same lookup
+    history.replaceState(null, '', this.value ? '#key=' + encodeURIComponent(this.value) : location.pathname);
+  });
+  if (location.hash.indexOf('#key=') === 0) {
+    try { $('key').value = decodeURIComponent(location.hash.substring(5)); } catch (e) { /* not a key */ }
+  }
+
+  // ---------- polling ----------
+
+  function getJson(path) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, 2500);
+    return fetch(path, { signal: controller.signal, cache: 'no-store' }).then(function (response) {
+      if (!response.ok) { throw new Error('HTTP ' + response.status); }
+      return response.json();
+    }).finally(function () { clearTimeout(timer); });
+  }
+
+  function refreshRing() {
+    return fetch('/api/ring', { cache: 'no-store' }).then(function (response) {
+      if (!response.ok) { throw new Error('HTTP ' + response.status); }
+      return response.text();
+    }).then(function (text) {
+      if (text !== ringText) {
+        var parsed = JSON.parse(text);
+        ringText = text;
+        ring = parsed;
+        renderRing();
+      }
+    }).catch(function () { /* keep the ring already drawn; it is asked for again soon */ });
+  }
+
+  function setConnected(now) {
+    if (connected === now) { return; }
+    if (connected !== null || !now) {
+      logEvent(now ? 'Reached ' + servedBy + ' again' : 'Lost contact with ' + (servedBy || 'the node serving this page'));
+    }
+    connected = now;
+    var banner = $('banner');
+    banner.classList.toggle('on', !now);
+    banner.textContent = now ? '' : 'The node serving this page (' + (servedBy || location.host)
+        + ') is not answering, so nothing below is current. If you stopped it, open the dashboard of a node that is still up.';
+    setStatus($('live'), now ? 'ALIVE' : 'DEAD', now ? 'live' : 'disconnected');
+  }
+
+  function renderCluster(cluster) {
+    servedBy = cluster.served_by;
+    $('served').textContent = 'the cluster as ' + servedBy + ' sees it';
+    document.title = 'TitanKV: ' + servedBy;
+
+    var container = $('nodes');
+    var present = {};
+    var up = 0;
+    var ops = 0;
+    var opsKnown = false;
+    var hints = 0;
+    cluster.nodes.forEach(function (member) {
+      present[member.id] = true;
+      var node = nodes.get(member.id);
+      if (!node) {
+        node = makeNode(member.id);
+        nodes.set(member.id, node);
+        container.appendChild(node.root);
+      }
+      node.up = member.up;
+      try {
+        updateRates(node, member.self);
+        noteChanges(node, member);
+        renderNode(node, member);
+        node.unreadable = false;
+      } catch (error) {
+        // Its numbers are not in the shape this page reads (another version, most likely).
+        // Show it without them instead of letting one node stop the page.
+        if (!node.unreadable) {
+          logEvent(member.id + ' sent numbers this page cannot read (' + error.message + ')');
+        }
+        node.unreadable = true;
+        node.previous = null;
+        node.rates = null;
+        member.self = null; // for everything drawn after this too: the views table, the totals
+        renderNode(node, member);
+      }
+      if (member.up) { up++; }
+      if (member.self && member.self.hints) { hints += member.self.hints.pending || 0; }
+      if (node.rates) {
+        ops += node.rates.reads + node.rates.writes;
+        opsKnown = true;
+      }
+    });
+    nodes.forEach(function (node, id) {
+      if (!present[id]) { // removed from the cluster
+        container.removeChild(node.root);
+        nodes.delete(id);
+        colours.delete(id);
+        logEvent(id + ' is no longer a member');
+      }
+    });
+
+    var total = cluster.nodes.length;
+    $('sum-up').textContent = up + ' of ' + total;
+    $('sum-up-note').textContent = up === total ? 'every member is up' : (total - up) + ' down or suspect';
+    $('sum-ops').textContent = opsKnown ? rate(ops) : '–';
+    $('sum-hints').textContent = count(hints);
+    $('sum-rf').textContent = cluster.copies + (cluster.copies === 1 ? ' copy' : ' copies');
+    $('sum-rf-note').textContent = 'QUORUM is ' + cluster.quorum
+        + (cluster.copies < cluster.replication_factor
+            ? '; ' + cluster.replication_factor + ' copies once there are that many nodes' : '');
+
+    renderViews(cluster.nodes);
+    dimRing();
+
+    var ids = cluster.nodes.map(function (member) { return member.id; }).join('\n');
+    var changed = ids !== memberIds;
+    memberIds = ids;
+    return changed;
+  }
+
+  function tick() {
+    var started = Date.now();
+    getJson('/api/cluster').then(function (cluster) {
+      var first = connected === null;
+      var membersChanged = renderCluster(cluster);
+      lastProblem = null;
+      setConnected(true);
+      if (first) { logEvent('Watching ' + cluster.nodes.length + ' members through ' + servedBy); }
+      var more = [];
+      // The ring only changes when a node joins or leaves; look again now and then anyway
+      if (membersChanged || ticks % 10 === 0) { more.push(refreshRing()); }
+      if ($('key').value) { more.push(refreshLookup()); }
+      ticks++;
+      return Promise.all(more);
+    }, function () {
+      setConnected(false);
+    }).catch(function (error) {
+      // Drawing the answer failed. Say so and carry on: a page that stops polling keeps showing
+      // its last numbers as if they were current.
+      var message = 'This page could not draw the last update (' + (error && error.message ? error.message : error) + ')';
+      if (message !== lastProblem) { logEvent(message); }
+      lastProblem = message;
+    }).then(function () {
+      setTimeout(tick, Math.max(100, POLL_MS - (Date.now() - started)));
+    });
+  }
+
+  tick();
+})();
+</script>
+</body>
+</html>
