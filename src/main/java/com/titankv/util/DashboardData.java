@@ -270,13 +270,14 @@ final class DashboardData {
         List<Node> members = sortedMembers();
         Map<String, String> answers = askPeers(members);
 
+        int copies = copies(); // read once: the quorum must be the one for this many copies
         JsonWriter json = new JsonWriter();
         json.beginObject()
                 .name("served_by").value(clusterManager.getLocalNode().getId())
                 .name("time_ms").value(System.currentTimeMillis())
                 .name("replication_factor").value(replicationFactor)
-                .name("copies").value(copies())
-                .name("quorum").value(copies() / 2 + 1)
+                .name("copies").value(copies)
+                .name("quorum").value(copies / 2 + 1)
                 .name("nodes").beginArray();
         for (Node member : members) {
             json.beginObject();
@@ -367,7 +368,10 @@ final class DashboardData {
             synchronized (peer) {
                 known = peer.httpPort;
             }
-            for (int port : candidatePorts(known, member.getPort(), httpPortOffset, httpPort)) {
+            // Two nodes on one machine cannot share a port, so there this node's own HTTP port is
+            // this node, not the member
+            boolean sameHost = member.getHost().equalsIgnoreCase(clusterManager.getLocalNode().getHost());
+            for (int port : candidatePorts(known, member.getPort(), httpPortOffset, sameHost ? 0 : httpPort)) {
                 try {
                     json = fetchNodeJson(member, port);
                 } catch (IOException | RuntimeException e) {
@@ -393,7 +397,8 @@ final class DashboardData {
 
     /**
      * The ports a member may serve HTTP on, most likely first: the one it last answered on, the
-     * one at this node's distance from the client port, and this node's own HTTP port.
+     * one at this node's distance from the client port, and this node's own HTTP port (0 to
+     * leave that one out).
      */
     static List<Integer> candidatePorts(int lastAnsweredOn, int memberPort, int httpPortOffset, int httpPort) {
         List<Integer> ports = new ArrayList<>(3);

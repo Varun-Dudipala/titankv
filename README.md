@@ -177,8 +177,8 @@ one copy and can meet every level, whatever the replication factor says.
 
 A node's own numbers exist only on that node, so the node serving the page asks the others for
 `/api/node` and passes the answers on. Nodes do not gossip their HTTP ports, so the serving node
-tries two: the same distance from the client port as its own (90 by default), then its own HTTP
-port. That covers nodes spaced alike on one machine and nodes given one fixed
+tries two: the same distance from the client port as its own (90 by default), then, for a member
+on another machine, its own HTTP port. That covers nodes spaced alike on one machine and nodes given one fixed
 `TITANKV_METRICS_PORT` on separate machines; any other arrangement shows the other nodes as
 "not answering", with their membership state still correct.
 
@@ -358,7 +358,7 @@ How to read these:
 ## Testing
 
 ```bash
-./mvnw test       # 267 unit tests
+./mvnw test       # 268 unit tests
 ./mvnw verify     # + 100 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 

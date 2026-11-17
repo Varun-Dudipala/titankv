@@ -110,34 +110,61 @@ class DashboardPeerTest {
     }
 
     /**
-     * The second port tried is this node's own HTTP port on the member's host. On one machine
-     * that is this node itself, which answers with its own numbers: they are not the member's.
+     * The ports are guesses, so what answers on one may be another node: its numbers are not
+     * the member's, however well formed.
      */
     @Test
     void anAnswerFromAnotherNodeIsNotTakenForTheMembers() throws Exception {
-        cluster.addNode(new Node("peer-1", "localhost", LOCAL_PORT + 1)); // nothing listens 90 above it
-        listen(HTTP_PORT);
-        bodies.put(HTTP_PORT, nodeJson("local"));
+        cluster.addNode(new Node("peer-1", "localhost", LOCAL_PORT + 1));
+        listen(LOCAL_PORT + 1 + 90);
+        bodies.put(LOCAL_PORT + 1 + 90, nodeJson("someone-else"));
 
-        Thread.sleep(600); // long enough for the peer to have been asked on both ports
         dashboard.clusterJson();
-        Thread.sleep(600);
+        Thread.sleep(600); // long enough for the peer to have been asked and to have answered
         String view = clusterView("\"id\":\"peer-1\"");
 
         assertThat(view).containsPattern("\"id\":\"peer-1\"[^{]*\"self\":null");
-        assertThat(view).doesNotContain("\"gets\":7");
+        assertThat(view).doesNotContain("someone-else").doesNotContain("\"gets\":7");
     }
 
     /** Nodes on separate machines, all given one HTTP port: not 90 above the client port. */
     @Test
     void aPeerOnThisNodesOwnHttpPortIsFound() throws Exception {
-        cluster.addNode(new Node("peer-1", "localhost", LOCAL_PORT + 1));
+        cluster.addNode(new Node("peer-1", "127.0.0.1", LOCAL_PORT + 1)); // another host than "localhost"
         listen(HTTP_PORT);
         bodies.put(HTTP_PORT, nodeJson("peer-1"));
 
         String view = clusterView("\"self\":{\"node\":\"peer-1\"");
 
         assertThat(view).contains("\"self\":{\"node\":\"peer-1\",\"ready\":true");
+    }
+
+    /**
+     * On one machine this node's own HTTP port is this node. A member there that is down must
+     * not have that port asked on its behalf twice a second.
+     */
+    @Test
+    void thisNodesOwnPortIsNotAskedForAMemberOnTheSameMachine() throws Exception {
+        cluster.addNode(new Node("peer-1", "localhost", LOCAL_PORT + 1)); // down: nothing listens for it
+        java.util.concurrent.atomic.AtomicInteger asked = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer self = HttpServer.create(new InetSocketAddress("localhost", HTTP_PORT), 0);
+        self.createContext("/api/node", exchange -> {
+            asked.incrementAndGet();
+            byte[] body = nodeJson("local").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        self.start();
+        servers.add(self);
+
+        for (int i = 0; i < 4; i++) {
+            dashboard.clusterJson();
+            Thread.sleep(600);
+        }
+
+        assertThat(asked.get()).isZero();
+        assertThat(clusterView("\"id\":\"peer-1\"")).containsPattern("\"id\":\"peer-1\"[^{]*\"self\":null");
     }
 
     @Test
@@ -148,8 +175,8 @@ class DashboardPeerTest {
         assertThat(DashboardData.candidatePorts(9092, 9002, 90, 9091)).containsExactly(9092, 9091);
         // separate machines, one fixed HTTP port and one client port: both guesses are the same port
         assertThat(DashboardData.candidatePorts(0, 9001, 99, 9100)).containsExactly(9100);
-        // an HTTP port that was never chosen (0) gives no port worth trying
-        assertThat(DashboardData.candidatePorts(0, 9002, -9001, 0)).containsExactly(1);
+        // without this node's own port (a member on the same machine, or a port never chosen)
+        assertThat(DashboardData.candidatePorts(0, 9002, 90, 0)).containsExactly(9092);
         assertThat(DashboardData.candidatePorts(0, 9001, -9001, 0)).isEmpty();
         assertThat(DashboardData.candidatePorts(0, 65000, 1000, 9091)).containsExactly(9091);
     }

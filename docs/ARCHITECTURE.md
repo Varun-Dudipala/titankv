@@ -464,7 +464,7 @@ a second:
 they describe, and gossip does not carry them. The node serving the page therefore fetches
 `/api/node` from every other member and embeds the answers. HTTP ports are not gossiped, so it
 tries `host:port + offset` (the offset being its own HTTP port minus its own client port) and
-then its own HTTP port, and remembers which one answered. An answer is embedded only if it is
+then, for a member on another host, its own HTTP port, and remembers which one answered. An answer is embedded only if it is
 one well-formed JSON object that names that member: a guessed port can belong to something else,
 this node included. The browser could not do this itself: under
 Docker the members are known by service names it cannot resolve, on ports that are mapped
