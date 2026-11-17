@@ -105,6 +105,20 @@ final class JsonWriter {
 
     private void quote(String text) {
         out.append('"');
+        escapeInto(out, text);
+        out.append('"');
+    }
+
+    /**
+     * @return the text as it goes between the quotes of a JSON string
+     */
+    static String escape(String text) {
+        StringBuilder escaped = new StringBuilder(text.length() + 8);
+        escapeInto(escaped, text);
+        return escaped.toString();
+    }
+
+    private static void escapeInto(StringBuilder out, String text) {
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             switch (c) {
@@ -133,7 +147,6 @@ final class JsonWriter {
                     }
             }
         }
-        out.append('"');
     }
 
     @Override

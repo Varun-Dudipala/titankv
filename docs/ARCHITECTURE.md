@@ -462,8 +462,11 @@ a second:
 
 **One page, every node.** Operation counts, pending hints and readiness are known only to the node
 they describe, and gossip does not carry them. The node serving the page therefore fetches
-`/api/node` from every other member (at `host:port + offset`, the offset being its own HTTP port
-minus its own client port) and embeds the answers. The browser could not do this itself: under
+`/api/node` from every other member and embeds the answers. HTTP ports are not gossiped, so it
+tries `host:port + offset` (the offset being its own HTTP port minus its own client port) and
+then its own HTTP port, and remembers which one answered. An answer is embedded only if it is
+one well-formed JSON object that names that member: a guessed port can belong to something else,
+this node included. The browser could not do this itself: under
 Docker the members are known by service names it cannot resolve, on ports that are mapped
 differently on the host. A member that does not answer is reported with `"self": null`, while its
 gossip status still comes from the serving node, so "dead according to gossip" and "not answering
@@ -472,7 +475,16 @@ HTTP" are separate facts on the page.
 The fetches never hold up a request for long. Each peer is asked at most once per 500 ms however
 many pages are open, on a thread pool of its own; a request for `/api/cluster` waits at most
 300 ms for answers and otherwise returns the last ones (dropped after 3 s). Counting live keys
-walks the store, so that count is reused for a second.
+walks the store, so the count is reused for a second, or for 20 times as long as the last count
+took if that is longer; one thread counts at a time and the others report the previous count.
+
+The page does not trust what it is given either. Each node's numbers are drawn inside their own
+error handler, so a member that reports something unreadable is shown without numbers, and a
+failed round is logged and the next one scheduled regardless. A monitoring page that stops
+polling keeps showing its last numbers as if they were current.
+
+QUORUM and ALL are reported against the copies the cluster keeps (`min(replication factor,
+members)`), the same number the coordinator counts acknowledgements against.
 
 **Read-only.** The server accepts only `GET`, and the handlers call nothing that writes, deletes
 or changes membership. Answers contain no secret or token. Rates are not computed on the server:

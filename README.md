@@ -171,13 +171,23 @@ The page reads four JSON endpoints, which can also be used on their own:
 | `/api/ring` | Position and owner of every virtual node, and each node's share |
 | `/api/replicas?key=K` | The key's hash and its replicas in ring order, with their state |
 
+Percent-encode the key; as in any query string, a `+` stands for a space (`%2B` is a plus).
+QUORUM and ALL are reported against the copies the cluster actually keeps: a single node keeps
+one copy and can meet every level, whatever the replication factor says.
+
 A node's own numbers exist only on that node, so the node serving the page asks the others for
-`/api/node` and passes the answers on. This assumes every node serves HTTP at the same distance
-from its client port (90 by default).
+`/api/node` and passes the answers on. Nodes do not gossip their HTTP ports, so the serving node
+tries two: the same distance from the client port as its own (90 by default), then its own HTTP
+port. That covers nodes spaced alike on one machine and nodes given one fixed
+`TITANKV_METRICS_PORT` on separate machines; any other arrangement shows the other nodes as
+"not answering", with their membership state still correct.
 
 Everything on this port is read-only: only `GET` is accepted and no request changes data or
 membership. It has **no authentication**, and it shows node addresses, key placement and traffic,
-so do not expose it publicly: keep it on a private network or behind a firewall.
+so do not expose it publicly: keep it on a private network or behind a firewall. The node also
+requests `/api/node` from every address in its member list; in dev mode, where gossip is not
+signed, anyone who can send it a packet can add an address to that list, which is one more
+reason to set a cluster secret anywhere other than your own machine.
 
 ## Consistency and failure behaviour
 
@@ -348,8 +358,8 @@ How to read these:
 ## Testing
 
 ```bash
-./mvnw test       # 257 unit tests
-./mvnw verify     # + 99 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 267 unit tests
+./mvnw verify     # + 100 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:

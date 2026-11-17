@@ -188,6 +188,7 @@ tr:last-child td { border-bottom: 0; }
   var connected = null;
   var ticks = 0;
   var memberIds = '';
+  var lastProblem = null;
 
   function $(id) { return document.getElementById(id); }
 
@@ -704,7 +705,9 @@ tr:last-child td { border-bottom: 0; }
     var up = lookup.replicas_up;
     var total = lookup.replicas.length;
     var verdict = up + ' of ' + total + ' replicas up as ' + servedBy + ' sees them: ';
-    if (up === total && total >= lookup.replication_factor) {
+    // QUORUM and ALL are counted against the copies this cluster keeps, which is fewer than the
+    // replication factor when the cluster has fewer nodes than that
+    if (up === total && total >= lookup.copies) {
       verdict += 'ONE, QUORUM (' + lookup.quorum + ') and ALL can be met.';
     } else if (up >= lookup.quorum) {
       verdict += 'ONE and QUORUM (' + lookup.quorum + ') can be met, ALL cannot.';
@@ -755,13 +758,17 @@ tr:last-child td { border-bottom: 0; }
   }
 
   function refreshRing() {
-    return fetch('/api/ring', { cache: 'no-store' }).then(function (response) { return response.text(); }).then(function (text) {
+    return fetch('/api/ring', { cache: 'no-store' }).then(function (response) {
+      if (!response.ok) { throw new Error('HTTP ' + response.status); }
+      return response.text();
+    }).then(function (text) {
       if (text !== ringText) {
+        var parsed = JSON.parse(text);
         ringText = text;
-        ring = JSON.parse(text);
+        ring = parsed;
         renderRing();
       }
-    }, function () { });
+    }).catch(function () { /* keep the ring already drawn; it is asked for again soon */ });
   }
 
   function setConnected(now) {
@@ -797,11 +804,25 @@ tr:last-child td { border-bottom: 0; }
         container.appendChild(node.root);
       }
       node.up = member.up;
-      updateRates(node, member.self);
-      noteChanges(node, member);
-      renderNode(node, member);
+      try {
+        updateRates(node, member.self);
+        noteChanges(node, member);
+        renderNode(node, member);
+        node.unreadable = false;
+      } catch (error) {
+        // Its numbers are not in the shape this page reads (another version, most likely).
+        // Show it without them instead of letting one node stop the page.
+        if (!node.unreadable) {
+          logEvent(member.id + ' sent numbers this page cannot read (' + error.message + ')');
+        }
+        node.unreadable = true;
+        node.previous = null;
+        node.rates = null;
+        member.self = null; // for everything drawn after this too: the views table, the totals
+        renderNode(node, member);
+      }
       if (member.up) { up++; }
-      if (member.self) { hints += member.self.hints.pending; }
+      if (member.self && member.self.hints) { hints += member.self.hints.pending || 0; }
       if (node.rates) {
         ops += node.rates.reads + node.rates.writes;
         opsKnown = true;
@@ -821,8 +842,10 @@ tr:last-child td { border-bottom: 0; }
     $('sum-up-note').textContent = up === total ? 'every member is up' : (total - up) + ' down or suspect';
     $('sum-ops').textContent = opsKnown ? rate(ops) : '–';
     $('sum-hints').textContent = count(hints);
-    $('sum-rf').textContent = cluster.replication_factor + ' copies';
-    $('sum-rf-note').textContent = 'QUORUM is ' + (Math.floor(cluster.replication_factor / 2) + 1);
+    $('sum-rf').textContent = cluster.copies + (cluster.copies === 1 ? ' copy' : ' copies');
+    $('sum-rf-note').textContent = 'QUORUM is ' + cluster.quorum
+        + (cluster.copies < cluster.replication_factor
+            ? '; ' + cluster.replication_factor + ' copies once there are that many nodes' : '');
 
     renderViews(cluster.nodes);
     dimRing();
@@ -838,6 +861,7 @@ tr:last-child td { border-bottom: 0; }
     getJson('/api/cluster').then(function (cluster) {
       var first = connected === null;
       var membersChanged = renderCluster(cluster);
+      lastProblem = null;
       setConnected(true);
       if (first) { logEvent('Watching ' + cluster.nodes.length + ' members through ' + servedBy); }
       var more = [];
@@ -848,6 +872,12 @@ tr:last-child td { border-bottom: 0; }
       return Promise.all(more);
     }, function () {
       setConnected(false);
+    }).catch(function (error) {
+      // Drawing the answer failed. Say so and carry on: a page that stops polling keeps showing
+      // its last numbers as if they were current.
+      var message = 'This page could not draw the last update (' + (error && error.message ? error.message : error) + ')';
+      if (message !== lastProblem) { logEvent(message); }
+      lastProblem = message;
     }).then(function () {
       setTimeout(tick, Math.max(100, POLL_MS - (Date.now() - started)));
     });

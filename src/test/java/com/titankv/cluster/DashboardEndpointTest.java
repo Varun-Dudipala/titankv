@@ -129,7 +129,8 @@ class DashboardEndpointTest {
         }, 10_000, "/api/cluster to carry all three nodes' own numbers");
 
         String viewOfNode1 = get(0, "/api/cluster").body();
-        assertThat(viewOfNode1).contains("\"served_by\":\"node-1\"").contains("\"replication_factor\":3");
+        assertThat(viewOfNode1).contains("\"served_by\":\"node-1\"").contains("\"replication_factor\":3")
+                .contains("\"copies\":3").contains("\"quorum\":2");
         assertThat(all(viewOfNode1, "\"self\":\\{\"node\":\"(node-\\d)\"")).containsExactly("node-1", "node-2", "node-3");
         // Each "self" is what that node says about itself: only node 1 coordinated the writes
         assertThat(all(viewOfNode1, "\"puts\":(\\d+)")).containsExactly("20", "0", "0");
@@ -161,7 +162,7 @@ class DashboardEndpointTest {
             assertThat(all(replicas, "\"id\":\"(node-\\d)\"")).as(key).isEqualTo(expected).hasSize(3);
             assertThat(body).as(key)
                     .contains("\"hash\":\"" + com.titankv.util.MurmurHash3.hash64(key) + "\"")
-                    .contains("\"replication_factor\":3").contains("\"quorum\":2").contains("\"replicas_up\":3");
+                    .contains("\"replication_factor\":3").contains("\"copies\":3").contains("\"quorum\":2").contains("\"replicas_up\":3");
         }
         // The key comes back as it was typed, escaped so that it stays inside its string
         assertThat(get("/api/replicas?key=" + URLEncoder.encode("\"quoted\"\\", StandardCharsets.UTF_8)).body())

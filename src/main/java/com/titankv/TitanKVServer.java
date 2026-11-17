@@ -28,7 +28,7 @@ public class TitanKVServer {
     private static final Logger logger = LoggerFactory.getLogger(TitanKVServer.class);
 
     private static final int DEFAULT_PORT = 9001;
-    private static final String VERSION = "1.0.0";
+    private static final String VERSION = com.titankv.util.Version.CURRENT;
 
     private final int port;
     private final String nodeId;

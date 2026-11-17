@@ -481,7 +481,7 @@ public class MetricsHttpServer {
     }
 
     private static String jsonEscape(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+        return JsonWriter.escape(value);
     }
 
     private void sendResponse(OutputStream out, int statusCode, String contentType, String body) throws IOException {

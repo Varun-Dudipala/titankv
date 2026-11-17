@@ -50,8 +50,6 @@ final class DashboardData {
 
     private static final Logger logger = LoggerFactory.getLogger(DashboardData.class);
 
-    private static final String VERSION = "1.0.0";
-
     /** A peer is not asked again while its last answer is younger than this. */
     private static final long PEER_REFRESH_MS = 500;
     /** How long a request for the cluster view waits for the peers it has just asked. */
@@ -68,16 +66,24 @@ final class DashboardData {
     private final InMemoryStore store;
     private final ReplicationManager replicationManager;
     private final int replicationFactor;
-    // Every node serves HTTP at the same distance from its client port (90 unless configured)
+    // Where the other nodes serve HTTP is not gossiped, so it is inferred from this node: either
+    // the same distance from the client port (the default is 90, and nodes sharing a machine are
+    // usually spaced alike), or the same port (nodes on separate machines given one fixed port)
+    private final int httpPort;
     private final int httpPortOffset;
     private final long startedAtMs = System.currentTimeMillis();
 
-    // Counting live keys walks the whole store, so the counts are reused for a second however
-    // many pages and peers ask. Both are taken together, so their difference means something.
+    // Counting live keys walks the whole store. The counts are reused for at least a second
+    // however many pages and peers ask, and for 20 times as long as the last count took, so a
+    // large store spends at most a twentieth of one thread on it. Only one thread counts at a
+    // time; the others report the previous counts instead of waiting behind it.
     private static final long KEY_COUNT_REFRESH_MS = 1000;
+    private static final int KEY_COUNT_COST_FACTOR = 20;
     private final Object keyCountLock = new Object();
     private int[] keyCounts; // live keys, then all entries including tombstones and expired ones
     private long keyCountsAtNanos;
+    private long keyCountsMaxAgeNanos = TimeUnit.MILLISECONDS.toNanos(KEY_COUNT_REFRESH_MS);
+    private boolean countingKeys;
 
     private final Map<String, Peer> peers = new ConcurrentHashMap<>();
     private final ExecutorService peerFetcher = Executors.newCachedThreadPool(r -> {
@@ -93,6 +99,7 @@ final class DashboardData {
         boolean asked;
         long askedAtNanos;
         CompletableFuture<Void> inFlight;
+        int httpPort; // the port it last answered on, 0 if it has not answered yet
     }
 
     DashboardData(int httpPort, MetricsCollector metrics, ClusterManager clusterManager, InMemoryStore store,
@@ -102,7 +109,17 @@ final class DashboardData {
         this.store = store;
         this.replicationManager = replicationManager;
         this.replicationFactor = replicationManager != null ? replicationManager.getReplicationFactor() : 3;
+        this.httpPort = httpPort;
         this.httpPortOffset = httpPort - clusterManager.getLocalNode().getPort();
+    }
+
+    /**
+     * Copies of a key in this cluster: the replication factor, or the member count if that is
+     * smaller. The consistency levels are counted against this, not the configured factor.
+     */
+    private int copies() {
+        return replicationManager != null ? replicationManager.effectiveReplicationFactor()
+                : Math.max(1, Math.min(replicationFactor, clusterManager.getNodeCount()));
     }
 
     void close() {
@@ -126,7 +143,7 @@ final class DashboardData {
         json.beginObject()
                 .name("node").value(local.getId())
                 .name("address").value(local.getAddress())
-                .name("version").value(VERSION)
+                .name("version").value(Version.CURRENT)
                 .name("time_ms").value(now)
                 .name("uptime_ms").value(now - startedAtMs)
                 .name("ready").value(clusterManager.isReady())
@@ -165,9 +182,10 @@ final class DashboardData {
         }
         json.endObject().endObject();
 
+        int[] keys = keyCounts(); // one reading for both numbers
         json.name("store").beginObject()
-                .name("keys").value(keyCounts()[0])
-                .name("keys_raw").value(keyCounts()[1])
+                .name("keys").value(keys[0])
+                .name("keys_raw").value(keys[1])
                 .name("memory_bytes").value(store.getMemoryUsedBytes())
                 .name("wal_enabled").value(store.isWalEnabled())
                 .name("wal_syncs").value(store.getWalSyncCount())
@@ -184,15 +202,43 @@ final class DashboardData {
 
     private int[] keyCounts() {
         synchronized (keyCountLock) {
-            long now = System.nanoTime();
-            if (keyCounts == null || now - keyCountsAtNanos >= TimeUnit.MILLISECONDS.toNanos(KEY_COUNT_REFRESH_MS)) {
-                int raw = store.rawSize();
-                int live = store.size();
-                // Writes land between the two counts; never report more live keys than entries
-                keyCounts = new int[] {live, Math.max(raw, live)};
-                keyCountsAtNanos = now;
+            while (true) {
+                boolean fresh = keyCounts != null && System.nanoTime() - keyCountsAtNanos < keyCountsMaxAgeNanos;
+                if (fresh || (keyCounts != null && countingKeys)) {
+                    return keyCounts;
+                }
+                if (!countingKeys) {
+                    countingKeys = true;
+                    break;
+                }
+                try {
+                    keyCountLock.wait(); // nothing to report yet: wait for the first count
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return new int[] {0, 0};
+                }
             }
-            return keyCounts;
+        }
+        int[] counted = null;
+        long started = System.nanoTime();
+        try {
+            int raw = store.rawSize();
+            int live = store.size();
+            // Writes land between the two counts; never report more live keys than entries
+            counted = new int[] {live, Math.max(raw, live)};
+            return counted;
+        } finally {
+            long finished = System.nanoTime();
+            synchronized (keyCountLock) {
+                if (counted != null) {
+                    keyCounts = counted;
+                    keyCountsAtNanos = finished;
+                    keyCountsMaxAgeNanos = Math.max(TimeUnit.MILLISECONDS.toNanos(KEY_COUNT_REFRESH_MS),
+                            KEY_COUNT_COST_FACTOR * (finished - started));
+                }
+                countingKeys = false;
+                keyCountLock.notifyAll();
+            }
         }
     }
 
@@ -229,6 +275,8 @@ final class DashboardData {
                 .name("served_by").value(clusterManager.getLocalNode().getId())
                 .name("time_ms").value(System.currentTimeMillis())
                 .name("replication_factor").value(replicationFactor)
+                .name("copies").value(copies())
+                .name("quorum").value(copies() / 2 + 1)
                 .name("nodes").beginArray();
         for (Node member : members) {
             json.beginObject();
@@ -313,23 +361,54 @@ final class DashboardData {
 
     private void ask(Node member, Peer peer) {
         String json = null;
+        int answeredOn = 0;
         try {
-            json = fetchNodeJson(member);
-        } catch (IOException | RuntimeException e) {
-            logger.debug("No answer from {} for the dashboard: {}", member.getId(), e.toString());
-        }
-        synchronized (peer) {
-            peer.json = json;
-            peer.answeredAtNanos = System.nanoTime();
-            peer.inFlight = null;
+            int known;
+            synchronized (peer) {
+                known = peer.httpPort;
+            }
+            for (int port : candidatePorts(known, member.getPort(), httpPortOffset, httpPort)) {
+                try {
+                    json = fetchNodeJson(member, port);
+                } catch (IOException | RuntimeException e) {
+                    logger.debug("No answer from {} on port {} for the dashboard: {}", member.getId(), port,
+                            e.toString());
+                }
+                if (json != null) {
+                    answeredOn = port;
+                    break;
+                }
+            }
+        } finally {
+            // In a finally: if this were skipped (an Error, say), the peer would count as being
+            // asked for ever and never be asked again
+            synchronized (peer) {
+                peer.json = json;
+                peer.httpPort = answeredOn;
+                peer.answeredAtNanos = System.nanoTime();
+                peer.inFlight = null;
+            }
         }
     }
 
-    private String fetchNodeJson(Node member) throws IOException {
+    /**
+     * The ports a member may serve HTTP on, most likely first: the one it last answered on, the
+     * one at this node's distance from the client port, and this node's own HTTP port.
+     */
+    static List<Integer> candidatePorts(int lastAnsweredOn, int memberPort, int httpPortOffset, int httpPort) {
+        List<Integer> ports = new ArrayList<>(3);
+        for (int port : new int[] {lastAnsweredOn, memberPort + httpPortOffset, httpPort}) {
+            if (port > 0 && port <= 65535 && !ports.contains(port)) {
+                ports.add(port);
+            }
+        }
+        return ports;
+    }
+
+    private String fetchNodeJson(Node member, int port) throws IOException {
         HttpURLConnection connection;
         try {
-            URI uri = new URI("http", null, member.getHost(), member.getPort() + httpPortOffset,
-                    "/api/node", null, null);
+            URI uri = new URI("http", null, member.getHost(), port, "/api/node", null, null);
             connection = (HttpURLConnection) uri.toURL().openConnection(Proxy.NO_PROXY);
         } catch (URISyntaxException e) {
             throw new IOException(e);
@@ -349,10 +428,14 @@ final class DashboardData {
             if (body.length > MAX_PEER_RESPONSE_BYTES) {
                 return null;
             }
-            // The answer is passed on inside this node's own JSON, so make sure it is the object
-            // another TitanKV node writes and not whatever else may listen on that port
+            // The answer is passed on inside this node's own JSON. It must be one whole JSON
+            // object, or it could end this node's structure early or leave it unparsable. What
+            // the fields hold is the page's to check.
             String json = new String(body, StandardCharsets.UTF_8).trim();
-            return json.startsWith(NODE_JSON_PREFIX) && json.endsWith("}") ? json : null;
+            // Its own id first: the answer must come from this member. A guessed port can
+            // belong to another node on the same machine, this one included.
+            String expected = NODE_JSON_PREFIX + JsonWriter.escape(member.getId()) + "\"";
+            return json.startsWith(expected) && JsonCheck.isObject(json) ? json : null;
         } finally {
             connection.disconnect();
         }
@@ -426,6 +509,9 @@ final class DashboardData {
             replicas = List.of(); // an empty ring
         }
         long hash = MurmurHash3.hash64(key);
+        // What QUORUM and ALL are counted against: a cluster smaller than the replication
+        // factor keeps fewer copies and needs fewer acknowledgements
+        int copies = copies();
         int up = 0;
         for (Node replica : replicas) {
             if (replica.isAvailable()) {
@@ -439,7 +525,8 @@ final class DashboardData {
                 .name("hash").value(Long.toString(hash)) // a string: JavaScript numbers hold only 53 bits
                 .name("position").value(ConsistentHash.positionOf(hash), 6)
                 .name("replication_factor").value(replicationFactor)
-                .name("quorum").value(replicationFactor / 2 + 1)
+                .name("copies").value(copies)
+                .name("quorum").value(copies / 2 + 1)
                 .name("replicas_up").value(up)
                 .name("replicas").beginArray();
         for (Node replica : replicas) {
