@@ -7,6 +7,7 @@ import com.titankv.network.protocol.BinaryProtocol;
 import com.titankv.network.protocol.Command;
 import com.titankv.network.protocol.ProtocolException;
 import com.titankv.network.protocol.Response;
+import com.titankv.network.protocol.WriteBatch;
 import com.titankv.util.Env;
 import com.titankv.util.HybridLogicalClock;
 import com.titankv.util.MetricsCollector;
@@ -223,7 +224,8 @@ public class ConnectionHandler {
                 || type == Command.MERKLE_LEAF
                 || type == Command.GET_INTERNAL
                 || type == Command.PUT_INTERNAL
-                || type == Command.DELETE_INTERNAL;
+                || type == Command.DELETE_INTERNAL
+                || type == Command.PUT_BATCH_INTERNAL;
     }
 
     private Response authorizeCommand(Command command) {
@@ -484,9 +486,11 @@ public class ConnectionHandler {
             case Command.GET_INTERNAL:
                 return done(handleGetInternal(command));
             case Command.PUT_INTERNAL:
-                return done(handlePutInternal(command));
+                return handlePutInternal(command);
             case Command.DELETE_INTERNAL:
-                return done(handleDeleteInternal(command));
+                return handleDeleteInternal(command);
+            case Command.PUT_BATCH_INTERNAL:
+                return handlePutBatchInternal(command);
             case Command.MERKLE_TREE:
             case Command.MERKLE_LEAF:
                 return done(handleMerkle(command));
@@ -722,8 +726,8 @@ public class ConnectionHandler {
                     expiresAt, level(command, writeConsistency)), "Write", command.getKey(),
                     newer -> acknowledge(written, newer));
         }
-        return done(acknowledge(written,
-                store.putOrSuperseded(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt)));
+        return store.putOrSupersededAsync(command.getKey(), command.getValueUnsafe(), timestamp, expiresAt)
+                .thenApply(newer -> acknowledge(written, newer));
     }
 
     /**
@@ -768,22 +772,19 @@ public class ConnectionHandler {
      * Uses timestamp-aware putIfNewer to maintain conflict resolution semantics.
      * SECURITY: Only authorized cluster nodes can use this command.
      */
-    private Response handlePutInternal(Command command) {
+    private CompletableFuture<Response> handlePutInternal(Command command) {
         if (command.getKey() == null) {
-            return Response.error("Key required for PUT");
+            return done(Response.error("Key required for PUT"));
         }
         if (command.getTimestamp() == 0) {
-            return Response.error("Timestamp required for internal PUT");
+            return done(Response.error("Timestamp required for internal PUT"));
         }
         clock().observe(command.getTimestamp());
-        long newer = store.putOrSuperseded(
-                command.getKey(),
-                command.getValueUnsafe(),
-                command.getTimestamp(),
-                command.getExpiresAt());
-        logger.trace("PUT_INTERNAL {}: key={}, timestamp={}",
-                newer == 0 ? "accepted" : "superseded", command.getKey(), command.getTimestamp());
-        return acknowledge(Response.ok(), newer);
+        // Applied and logged on this thread; the reply waits for the disk, the thread does not.
+        // A replica's workers would otherwise each hold one write through an fsync, and one
+        // fsync could never cover more writes than there are workers.
+        return store.putOrSupersededAsync(command.getKey(), command.getValueUnsafe(), command.getTimestamp(),
+                command.getExpiresAt()).thenApply(newer -> acknowledge(Response.ok(), newer));
     }
 
     private CompletableFuture<Response> handleDelete(Command command) {
@@ -801,7 +802,8 @@ public class ConnectionHandler {
             return replicated(replicationManager.delete(command.getKey(), timestamp, 0, level(command, deleteConsistency)),
                     "Delete", command.getKey(), newer -> acknowledge(deleted, newer));
         }
-        return done(acknowledge(deleted, store.putOrSuperseded(command.getKey(), null, timestamp, 0)));
+        return store.putOrSupersededAsync(command.getKey(), null, timestamp, 0)
+                .thenApply(newer -> acknowledge(deleted, newer));
     }
 
     /**
@@ -809,23 +811,53 @@ public class ConnectionHandler {
      * Uses tombstone with timestamp to prevent resurrection of deleted values.
      * SECURITY: Only authorized cluster nodes can use this command.
      */
-    private Response handleDeleteInternal(Command command) {
+    /**
+     * Several replica writes in one request. Each is applied and logged here; the reply goes out
+     * once all of them are durable, which one fsync does for the whole batch. A write the store
+     * refuses is reported in its place and does not fail the others.
+     */
+    private CompletableFuture<Response> handlePutBatchInternal(Command command) {
+        java.util.List<WriteBatch.Entry> writes;
+        try {
+            writes = WriteBatch.decode(command.getValueUnsafe());
+        } catch (IllegalArgumentException e) {
+            return done(Response.error(e.getMessage()));
+        }
+        long[] results = new long[writes.size()];
+        CompletableFuture<?>[] pending = new CompletableFuture<?>[results.length];
+        for (int i = 0; i < results.length; i++) {
+            WriteBatch.Entry write = writes.get(i);
+            int index = i;
+            if (write.getTimestamp() == 0) {
+                results[i] = WriteBatch.REFUSED;
+                pending[i] = CompletableFuture.completedFuture(null);
+                continue;
+            }
+            clock().observe(write.getTimestamp());
+            metrics.recordReplicaWrite();
+            pending[i] = store.putOrSupersededAsync(write.getKey(), write.getValue(), write.getTimestamp(),
+                    write.getExpiresAt()).handle((newer, error) -> {
+                        if (error != null) {
+                            logger.warn("Replica write of {} refused: {}", write.getKey(), unwrap(error).getMessage());
+                        }
+                        results[index] = error != null ? WriteBatch.REFUSED : newer;
+                        return null;
+                    });
+        }
+        return CompletableFuture.allOf(pending).thenApply(done -> Response.ok(WriteBatch.encodeResults(results)));
+    }
+
+    private CompletableFuture<Response> handleDeleteInternal(Command command) {
         if (command.getKey() == null) {
-            return Response.error("Key required for DELETE");
+            return done(Response.error("Key required for DELETE"));
         }
         if (command.getTimestamp() == 0) {
-            return Response.error("Timestamp required for internal DELETE");
+            return done(Response.error("Timestamp required for internal DELETE"));
         }
         clock().observe(command.getTimestamp());
         // null value = tombstone, so stale replicas cannot resurrect the deleted value
-        long newer = store.putOrSuperseded(
-                command.getKey(),
-                null,
-                command.getTimestamp(),
-                command.getExpiresAt());
-        logger.trace("DELETE_INTERNAL tombstone {}: key={}, timestamp={}",
-                newer == 0 ? "written" : "superseded", command.getKey(), command.getTimestamp());
-        return acknowledge(Response.ok(), newer);
+        return store.putOrSupersededAsync(command.getKey(), null, command.getTimestamp(), command.getExpiresAt())
+                .thenApply(newer -> acknowledge(Response.ok(), newer));
     }
 
     /**

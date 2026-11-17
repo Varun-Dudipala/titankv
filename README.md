@@ -44,7 +44,8 @@ integration tests that run real multi-node clusters and benchmarks you can repro
 - **Metrics** over HTTP (`/metrics` in Prometheus text format, `/health`, `/ready`, `/status`)
 
 **Storage and networking**
-- **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync
+- **Write-ahead log** with CRC-checked records, snapshots, and **group-commit** fsync: one sync
+  covers every write that arrived during the one before, on the coordinator and on each replica
 - **Non-blocking NIO server**; worker threads never wait on replicas
 - **Binary protocol** over TCP with 29-byte request and 25-byte response headers
 - **TTL** per key, **client circuit breaker**, connection pooling
@@ -216,8 +217,10 @@ expiry times.
 | PING | 0x04 | GET/PUT/DELETE_INTERNAL | 0x11–0x13 | PONG | 0x03 |
 | EXISTS | 0x05 | MERKLE_TREE / MERKLE_LEAF | 0x14–0x15 | EXISTS_TRUE / _FALSE | 0x04 / 0x05 |
 | AUTH | 0x07 | NODE_ID | 0x0B | STALE | 0x06 |
+| | | PUT_BATCH_INTERNAL | 0x16 | | |
 
-NODE_ID returns the answering node's id, which is what places it on the ring. STALE answers a PUT
+PUT_BATCH_INTERNAL carries several replica writes in one request, used when writes to a peer
+queue up. NODE_ID returns the answering node's id, which is what places it on the ring. STALE answers a PUT
 or DELETE that was replicated but is already superseded: a replica holds a
 newer version of the key, returned in `TIMESTAMP`. The client library retries with a later version.
 
@@ -246,26 +249,34 @@ clocks, the three convergence mechanisms, WAL recovery and the design trade-offs
 Medians of 5 runs on an Apple M3 laptop (8 CPUs) running all nodes and the load generator together
 ([method, spreads and all scenarios](benchmark/results/benchmark_results.md)):
 
-| Setup | 16 clients, 80% reads | 16 clients, writes only |
-|---|---|---|
-| 1 node, in-memory | 153,818 ops/sec | 153,601 ops/sec |
-| 3 nodes, QUORUM, in-memory | 61,800 ops/sec | 45,582 ops/sec |
-| 3 nodes, QUORUM, auth + fsynced WAL | 3,271 ops/sec | 672 ops/sec |
+| Setup | 16 clients, 80% reads | 16 clients, writes only | 64 clients, writes only |
+|---|---|---|---|
+| 1 node, in-memory | 152,672 ops/sec | 152,737 ops/sec | |
+| 3 nodes, QUORUM, in-memory | 61,091 ops/sec | 55,415 ops/sec | 84,325 ops/sec |
+| 3 nodes, QUORUM, auth + fsynced WAL | 8,627 ops/sec | 1,062 ops/sec | 2,616 ops/sec |
 
-Every read in the benchmark is checked against the client's last acknowledged write: across 80
-runs and 37.9M operations there were 0 errors and 0 stale reads. With a node killed mid-run
-(`scripts/benchmark-failover.sh`), a production cluster served 131K operations in 40 seconds with
+With the WAL, every acknowledged write has been fsynced on at least two of the three nodes, which
+share one drive here. Durable writes share fsyncs, so their throughput follows the number of
+clients: 6,836 a second with 256, at a p99 of 91 ms.
+
+Every read in the benchmark is checked against the client's last acknowledged write: across 90
+runs and 40.2M operations there were 0 errors and 0 stale reads. With a node killed mid-run
+(`scripts/benchmark-failover.sh`), a production cluster served 159K operations in 40 seconds with
 0 errors, and the node recovered from its WAL plus hints and Merkle repair.
 
 How to read these:
 
 - **Three nodes do 40% of one node's throughput** because replication triples the work and all
   nodes share one machine. They are a floor, not a measure of scaling.
-- **The durable rows are bound by the disk.** A sync takes about 3 ms on this laptop, three nodes
-  share one drive, and every write waits for two of them. On a cloud VM with sub-millisecond
-  syncs the same scenario ran at 4,400 writes a second.
+- **The disk sets the latency of a durable write, not its throughput.** A sync takes about 3 ms
+  on this laptop, three nodes share one drive, and every write waits for two of them, so a write
+  takes 15 to 35 ms. An earlier version did 672 of them a second and got slower with more
+  clients: each waiting write held a thread, so one sync covered at most about 8. Now a sync
+  covers every write that arrived during the one before
+  ([what was limiting them](benchmark/results/benchmark_results.md#durable-writes-what-was-limiting-them)).
 - **Throughput at saturation hides latency.** Sent at a fixed rate instead of as fast as possible,
-  the 3-node cluster holds a p99 of 0.33 ms at half its maximum throughput and 3.1 ms at 90% of it
+  the 3-node cluster holds a p99 of 0.35 ms at half its maximum throughput and about 2 ms at 90%
+  of it, with occasional runs far worse
   ([latency versus load](benchmark/results/benchmark_results.md#latency-versus-load-open-loop)).
 - **The changes since the first version cost nothing measurable.** The build from before them and
   the current one, run alternately on this machine, are within 2% of each other. That comparison
@@ -282,8 +293,8 @@ How to read these:
 ## Testing
 
 ```bash
-./mvnw test       # 229 unit tests
-./mvnw verify     # + 86 integration tests on real in-JVM clusters, and a 75% line-coverage gate
+./mvnw test       # 249 unit tests
+./mvnw verify     # + 89 integration tests on real in-JVM clusters, and a 75% line-coverage gate
 ```
 
 The integration suite includes:

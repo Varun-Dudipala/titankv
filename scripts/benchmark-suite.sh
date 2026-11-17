@@ -95,7 +95,10 @@ done
 echo "== 6. Production mode (auth + fsynced WAL, 3 nodes, QUORUM)"
 cluster_up 3 TITANKV_CLUSTER_SECRET=benchmark-secret
 measure production "3 nodes prod" 3 16 mixed
-measure production "3 nodes prod" 3 16 writes
+# Durable writes share fsyncs, so their throughput is a question of how many arrive together
+for clients in 16 64 256; do
+    measure production "3 nodes prod" 3 "$clients" writes
+done
 cluster_down
 
 # Summary: median / min / max throughput and median latencies per configuration

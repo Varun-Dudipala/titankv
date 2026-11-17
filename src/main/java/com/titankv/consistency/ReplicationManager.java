@@ -7,6 +7,7 @@ import com.titankv.cluster.Node;
 import com.titankv.core.InMemoryStore;
 import com.titankv.core.KVStore;
 import com.titankv.network.protocol.Command;
+import com.titankv.network.protocol.WriteBatch;
 import com.titankv.core.KeyValuePair;
 import com.titankv.util.Env;
 import org.slf4j.Logger;
@@ -39,6 +40,11 @@ public final class ReplicationManager implements ReplicaIO {
     // Calls to each other node, by address. One pool per node: calls stuck on a slow or
     // unreachable node fill only that node's pool, and calls to healthy nodes are unaffected.
     private final Map<String, ThreadPoolExecutor> peerExecutors = new ConcurrentHashMap<>();
+    private final Map<String, ReplicaWriteBatcher> peerWriters = new ConcurrentHashMap<>();
+    // Per request to a peer. Large enough that a sender rarely leaves writes behind, small
+    // enough that one request stays far below the protocol's 16 MB value limit.
+    private static final int MAX_WRITES_PER_BATCH = 512;
+    private static final int MAX_BATCH_BYTES = 1024 * 1024;
     private static final int PEER_QUEUE_LENGTH = 1024;
     private volatile boolean shutdown;
     private final Map<String, TitanKVClient> nodeClients;
@@ -133,6 +139,7 @@ public final class ReplicationManager implements ReplicaIO {
                 (ReplicaExecutor) this::executeFor);
         clusterManager.addEventListener(event -> {
             if (event.getType() == ClusterManager.ClusterEvent.Type.NODE_LEFT) {
+                peerWriters.remove(event.getNode().getAddress());
                 ThreadPoolExecutor removed = peerExecutors.remove(event.getNode().getAddress());
                 if (removed != null) {
                     removed.shutdown();
@@ -251,35 +258,98 @@ public final class ReplicationManager implements ReplicaIO {
                             "Cannot meet consistency level", consistency, required, successes.get()));
                 }
             };
-            Runnable task = () -> {
-                try {
-                    long newer = write(replica, key, value, timestamp, expiresAt, false);
-                    superseded.accumulateAndGet(newer, Math::max);
-                    if (successes.incrementAndGet() >= required) {
-                        result.complete(superseded.get());
-                    }
-                } catch (IOException | RuntimeException e) {
-                    failed.accept(e);
+            java.util.function.LongConsumer acknowledged = newer -> {
+                superseded.accumulateAndGet(newer, Math::max);
+                if (successes.incrementAndGet() >= required) {
+                    result.complete(superseded.get());
                 }
             };
-            if (isLocal(replica) && !localWritesWait()) {
-                localWrite = task;
+            if (isLocal(replica)) {
+                // Applied and logged on the calling thread; counted once the disk has it. No
+                // thread waits for the fsync, so one fsync can cover any number of writes.
+                localWrite = () -> localStore.putOrSupersededAsync(key, value, timestamp, expiresAt)
+                        .whenComplete((newer, error) -> {
+                            if (error == null) {
+                                acknowledged.accept(newer);
+                            } else {
+                                Throwable cause = error instanceof java.util.concurrent.CompletionException
+                                        && error.getCause() != null ? error.getCause() : error;
+                                failed.accept(cause instanceof Exception ? (Exception) cause
+                                        : new RuntimeException(cause));
+                            }
+                        });
             } else {
                 try {
-                    executeFor(replica, task);
+                    writerFor(replica).submit(new ReplicaWriteBatcher.Write(
+                            new WriteBatch.Entry(key, value, timestamp, expiresAt), acknowledged, failed));
                 } catch (RejectedExecutionException e) {
-                    failed.accept(e); // too many calls already waiting on this replica
+                    failed.accept(e); // too many writes already waiting on this replica
                 }
             }
         }
         // The local replica is written on this thread, after the remote writes are on their way:
-        // an in-memory update is cheaper than handing it to another thread.
+        // applying and logging it here is cheaper than handing it to another thread.
         if (localWrite != null) {
             localWrite.run();
         }
         // No timer here: every replica call ends within the socket timeout, and the caller bounds
         // the whole request.
         return result;
+    }
+
+    /**
+     * The queue of writes for a peer. Its sends run on the peer's own pool, at most half of it,
+     * so reads to that peer always find a thread.
+     */
+    private ReplicaWriteBatcher writerFor(Node replica) {
+        return peerWriters.computeIfAbsent(replica.getAddress(), address -> {
+            ReplicaWriteBatcher[] writer = new ReplicaWriteBatcher[1];
+            writer[0] = new ReplicaWriteBatcher(task -> executeFor(replica, task),
+                    writes -> sendWrites(replica, writes, writer[0]), Math.max(1, poolSize / 2),
+                    PEER_QUEUE_LENGTH, MAX_WRITES_PER_BATCH, MAX_BATCH_BYTES);
+            return writer[0];
+        });
+    }
+
+    /** @return replica writes this node has sent to its peers, as coordinator */
+    public long getReplicaWritesSent() {
+        return peerWriters.values().stream().mapToLong(ReplicaWriteBatcher::getWriteCount).sum();
+    }
+
+    /** @return the requests those writes were sent in; fewer than the writes when they were batched */
+    public long getReplicaWriteRequests() {
+        return peerWriters.values().stream().mapToLong(ReplicaWriteBatcher::getRequestCount).sum();
+    }
+
+    /**
+     * One request to a replica carrying the given writes: the plain PUT or DELETE for a single
+     * write, a batch for several.
+     */
+    private long[] sendWrites(Node replica, List<ReplicaWriteBatcher.Write> writes, ReplicaWriteBatcher writer)
+            throws IOException {
+        if (writes.size() == 1) {
+            WriteBatch.Entry only = writes.get(0).entry;
+            return new long[] {write(replica, only.getKey(), only.getValue(), only.getTimestamp(),
+                    only.getExpiresAt(), false)};
+        }
+        List<WriteBatch.Entry> entries = new ArrayList<>(writes.size());
+        for (ReplicaWriteBatcher.Write write : writes) {
+            entries.add(write.entry);
+        }
+        long[] results;
+        try {
+            results = client(replica, false).putBatchInternal(entries);
+        } catch (IOException e) {
+            if (String.valueOf(e.getMessage()).contains("Unknown command")) {
+                // A node running a version from before batches. These writes become hints; later
+                // ones go to it one per request.
+                logger.info("{} does not accept write batches; sending it single writes", replica.getId());
+                writer.disableBatching();
+            }
+            throw e;
+        }
+        clusterManager.getLinkFilter().afterRequest(clusterManager.getLocalNode(), replica);
+        return results;
     }
 
     /**
@@ -317,14 +387,6 @@ public final class ReplicationManager implements ReplicaIO {
                 });
         pool.allowCoreThreadTimeOut(true); // a node that is down or idle holds no threads
         return pool;
-    }
-
-    /**
-     * Whether a local write can block (it waits for a WAL fsync), in which case it goes to the
-     * replication pool rather than running on the caller's thread.
-     */
-    private boolean localWritesWait() {
-        return localStore instanceof InMemoryStore && ((InMemoryStore) localStore).isWalEnabled();
     }
 
     /**
