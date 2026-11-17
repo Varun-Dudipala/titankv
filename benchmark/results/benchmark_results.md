@@ -6,15 +6,17 @@
 - All nodes **and** the load generator run on the same machine and share its CPUs, over loopback.
   A real deployment gives each node its own machine, so these numbers are a floor for CPU-bound
   workloads, while network latency is not included.
-- An fsync here (`FileChannel.force`) takes about 3 ms when nothing else is syncing. That bounds
-  the production-mode numbers; see the notes under the table.
-- Date: 2026-11-15, on the code that sends each request to a replica of its key
-  (`2ad99ea`). Sections under [earlier measurements](#earlier-measurements) are older, from another
-  machine, and say so.
+- An fsync here (`FileChannel.force`) takes about 3 ms when nothing else is syncing, and the
+  three nodes share one drive. That sets the latency of a durable write, not its throughput;
+  see the notes under the table.
+- Date: 2026-11-16, on the code that lets one fsync cover any number of writes and sends queued
+  replica writes together (`d18a803`). Sections under [earlier measurements](#earlier-measurements)
+  are older, from another machine, and say so.
 
-A first attempt at this run was thrown away: the laptop was on battery and reached 7% halfway
-through, and from that point throughput halved with spreads of ±40 to 60%. Everything below was
-measured again on AC power; no row has a spread above ±3% except the two fsync-bound ones.
+Runs on battery are not used. One earlier attempt reached 7% battery halfway through, and from
+that point throughput halved with spreads of ±40 to 60%; another, at 40%, came out 2 to 8% lower
+than on AC power. The closed-loop table below was measured on AC power. The latency and failover
+runs, and the old-against-new comparisons, were made on battery at about 40% and say so.
 
 ## Method
 
@@ -67,24 +69,26 @@ cluster, then runs open loop at 25%, 50%, 75% and 90% of it. Its results are in
 
 | Scenario | Setup | Clients | Workload | Median ops/sec | Min – max | Spread | p50 ms | p99 ms | Errors | Stale reads |
 |---|---|---|---|---|---|---|---|---|---|---|
-| single | 1 node | 16 | mixed | 153,818 | 151,759 – 154,861 | ±1% | 0.10 | 0.20 | 0 | 0 |
-| single | 1 node | 16 | writes | 153,601 | 152,285 – 154,478 | ±1% | 0.10 | 0.20 | 0 | 0 |
-| scaling | 3 nodes | 16 | mixed | 61,800 | 61,431 – 62,383 | ±1% | 0.24 | 0.54 | 0 | 0 |
-| scaling | 5 nodes | 16 | mixed | 56,053 | 55,328 – 56,241 | ±1% | 0.26 | 0.73 | 0 | 0 |
-| consistency | ONE | 16 | mixed | 96,427 | 94,655 – 96,961 | ±1% | 0.12 | 0.64 | 0 | 0 |
-| consistency | QUORUM | 16 | mixed | 60,631 | 60,112 – 61,124 | ±1% | 0.25 | 0.55 | 0 | 0 |
-| consistency | ALL | 16 | mixed | 45,303 | 45,171 – 45,641 | ±1% | 0.34 | 0.61 | 0 | 0 |
-| value-size | 100 B | 16 | mixed | 61,028 | 60,138 – 61,265 | ±1% | 0.25 | 0.55 | 0 | 0 |
-| value-size | 1000 B | 16 | mixed | 58,454 | 55,970 – 59,512 | ±3% | 0.25 | 0.61 | 0 | 0 |
-| value-size | 10000 B | 16 | mixed | 47,251 | 45,846 – 48,609 | ±3% | 0.30 | 0.81 | 0 | 0 |
-| concurrency | 3 nodes | 1 | writes | 18,236 | 17,896 – 18,292 | ±1% | 0.05 | 0.07 | 0 | 0 |
-| concurrency | 3 nodes | 4 | writes | 34,829 | 34,387 – 35,239 | ±1% | 0.11 | 0.17 | 0 | 0 |
-| concurrency | 3 nodes | 16 | writes | 45,582 | 45,219 – 46,712 | ±2% | 0.32 | 0.96 | 0 | 0 |
-| concurrency | 3 nodes | 64 | writes | 51,663 | 50,993 – 52,180 | ±1% | 1.00 | 4.44 | 0 | 0 |
-| production | 3 nodes prod | 16 | mixed | 3,271 | 2,826 – 3,757 | ±14% | 1.85 | 23.69 | 0 | 0 |
-| production | 3 nodes prod | 16 | writes | 672 | 452 – 709 | ±19% | 22.79 | 45.45 | 0 | 0 |
+| single | 1 node | 16 | mixed | 152,672 | 151,361 – 153,409 | ±1% | 0.10 | 0.22 | 0 | 0 |
+| single | 1 node | 16 | writes | 152,737 | 152,382 – 153,672 | ±0% | 0.10 | 0.22 | 0 | 0 |
+| scaling | 3 nodes | 16 | mixed | 61,091 | 60,765 – 61,513 | ±1% | 0.24 | 0.65 | 0 | 0 |
+| scaling | 5 nodes | 16 | mixed | 54,914 | 54,475 – 55,520 | ±1% | 0.22 | 0.98 | 0 | 0 |
+| consistency | ONE | 16 | mixed | 97,127 | 94,796 – 97,600 | ±1% | 0.10 | 0.85 | 0 | 0 |
+| consistency | QUORUM | 16 | mixed | 60,796 | 60,010 – 61,053 | ±1% | 0.24 | 0.60 | 0 | 0 |
+| consistency | ALL | 16 | mixed | 44,945 | 44,914 – 45,106 | ±0% | 0.34 | 0.64 | 0 | 0 |
+| value-size | 100 B | 16 | mixed | 60,413 | 59,701 – 60,914 | ±1% | 0.24 | 0.61 | 0 | 0 |
+| value-size | 1000 B | 16 | mixed | 58,971 | 58,244 – 59,180 | ±1% | 0.24 | 0.67 | 0 | 0 |
+| value-size | 10000 B | 16 | mixed | 46,740 | 45,827 – 47,058 | ±1% | 0.28 | 1.29 | 0 | 0 |
+| concurrency | 3 nodes | 1 | writes | 18,044 | 17,906 – 18,090 | ±1% | 0.06 | 0.07 | 0 | 0 |
+| concurrency | 3 nodes | 4 | writes | 37,191 | 36,528 – 37,735 | ±2% | 0.11 | 0.16 | 0 | 0 |
+| concurrency | 3 nodes | 16 | writes | 55,415 | 51,724 – 56,145 | ±4% | 0.25 | 0.92 | 0 | 0 |
+| concurrency | 3 nodes | 64 | writes | 84,325 | 80,175 – 91,853 | ±7% | 0.62 | 3.02 | 0 | 0 |
+| production | 3 nodes prod | 16 | mixed | 8,627 | 8,128 – 9,031 | ±5% | 0.17 | 13.40 | 0 | 0 |
+| production | 3 nodes prod | 16 | writes | 1,062 | 976 – 1,492 | ±24% | 14.66 | 29.09 | 0 | 0 |
+| production | 3 nodes prod | 64 | writes | 2,616 | 2,452 – 2,689 | ±5% | 23.14 | 51.99 | 0 | 0 |
+| production | 3 nodes prod | 256 | writes | 6,836 | 6,812 – 7,094 | ±2% | 33.81 | 90.91 | 0 | 0 |
 
-**Correctness:** across all 80 runs (37.9 million operations) there were **0 errors, 0 stale reads
+**Correctness:** across all 90 runs (40.2 million operations) there were **0 errors, 0 stale reads
 and 0 read misses**.
 
 How to read it:
@@ -92,28 +96,69 @@ How to read it:
 - **Consistency levels** cost what theory predicts: ONE > QUORUM > ALL (96K, 61K, 45K). ONE is
   faster because a read is answered by the coordinator's own replica in-process, with no hop.
 - **Larger values** cost more, but less than their size: 10 KB values run at 77% of the 100 B rate.
-- **Concurrency**: write throughput grows from 18K with 1 client to 46K with 16 and 52K with 64,
-  where p50 latency rises from 0.05 ms to 1.0 ms instead. The CPUs are saturated.
+- **Concurrency**: write throughput grows from 18K with 1 client to 55K with 16 and 84K with 64.
+  Past 16 clients the gain comes from batching: writes for a peer that arrive while its senders
+  are busy go out in one request (see below).
 - **1 node vs 3 nodes**: one node does 2.5 times what three do. Replication triples the work, and
   all three share this machine. See [earlier measurements](#earlier-measurements) for a profile.
-- **Cluster size**: 5 nodes run at 91% of 3 nodes here, because every node and the load generator
+- **Cluster size**: 5 nodes run at 90% of 3 nodes here, because every node and the load generator
   share the same 8 CPUs. Horizontal scaling needs one machine per node; on one box this only shows
   that adding nodes costs little.
 - **Production mode** adds authentication and an fsync on every replica before acknowledging.
-  Writes fall to about 670 a second, and the mixed workload to about 3,300. These are bounded by
-  the disk, not the code: three nodes share one drive, and each write waits for a sync on two of
-  them. On the cloud VM used for the earlier measurements, where a sync returned in under a
-  millisecond, the same scenario ran at 4,400 writes a second. These two rows also vary most from
-  run to run (±14% and ±19%).
+  A write then takes 15 to 35 ms, because it waits for a sync on two of three nodes that share
+  one drive. Throughput depends on how many writes share each sync: 1,062 a second with 16
+  clients, 2,616 with 64 and 6,836 with 256, at a p99 of 29, 52 and 91 ms. The mixed workload
+  runs at 8,627 a second.
+
+### Durable writes: what was limiting them
+
+Until this version the production rows read 672 writes a second with 16 clients, and this file
+said they were "bounded by the disk, not the code". That was wrong, and measuring with more
+clients showed it: the old build did *fewer* writes a second with 64 clients than with 16.
+
+A write waiting for the log to be synced held a thread: a worker on the replica, a pool thread
+on the coordinator, and one of 8 blocking calls per peer. So one fsync could cover at most about
+8 writes, whatever the load. Thread dumps under load showed every worker parked on the sync lock.
+
+Two changes removed the limit. A write is now applied and logged by the thread handling it,
+which moves on; one thread fsyncs the log and each fsync releases every write logged before it
+started. And writes for a peer that queue up while its senders are busy are sent as one request,
+which the replica makes durable with one fsync.
+
+Old and new builds, run one after the other on this machine (3 nodes, QUORUM, auth, fsynced WAL,
+writes only, 8-second runs, median of 3; 2 runs for the old build at 256 clients):
+
+| Clients | Before | After | p50 before | p50 after |
+|---|---|---|---|---|
+| 16 | 654 writes/sec | 967 | 23 ms | 16 ms |
+| 64 | 292 | 2,642 | 180 ms | 23 ms |
+| 256 | 295 | 9,208 | 804 ms | 25 ms |
+
+The same change helps without a WAL, where a peer's senders are busy for CPU reasons instead:
+
+| Scenario (in-memory, QUORUM) | Before | After | Change |
+|---|---|---|---|
+| 3 nodes, 16 clients, writes only | 46,944 ops/sec | 57,666 | +23% |
+| 3 nodes, 64 clients, writes only | 51,751 | 96,796 | +87% |
+| 3 nodes, 16 clients, 80% reads | 60,549 | 61,717 | +2% |
+| 5 nodes, 16 clients, 80% reads | 52,627 | 52,988 | +1% |
+| 1 node, 16 clients, writes only | 147,039 | 148,729 | +1% |
+
+Both comparisons were run on battery at about 45% charge, which costs a few percent against the
+table above; the two builds were measured under the same conditions. All runs had 0 errors.
+
+On the cloud VM used for the earlier measurements, where a sync returned in under a millisecond,
+the old build ran at 4,400 writes a second with 16 clients. That figure has not been re-measured.
 
 ### Against the earlier build, on this machine
 
 The numbers above cannot be compared with the older tables further down, which come from a
 4-vCPU cloud VM. To see what the changes since then cost, the build from before them (`cc7a36a`)
-and the current one were run alternately on this machine, 16 clients unless stated, 3 runs of 8
-seconds each, two rounds for the first row:
+and the build of 2026-11-15 were run alternately on this machine, 16 clients unless stated, 3
+runs of 8 seconds each, two rounds for the first row. (This was before the write batching
+described above, which is why the last row differs from today's table.)
 
-| Scenario | Earlier build | Current | Change |
+| Scenario | Earlier build | Build of 2026-11-15 | Change |
 |---|---|---|---|
 | 5 nodes, 80% reads | 56,585 ops/sec | 55,515 ops/sec | −2% |
 | 3 nodes, 80% reads | 60,395 | 60,049 | −1% |
@@ -140,27 +185,33 @@ over 64 clients. 3 runs of 15 seconds per row, medians:
 
 | Load | Achieved ops/sec | p50 ms | p99 ms | p99 ms, min – max of 3 runs | p99.9 ms | Service p99 ms |
 |---|---|---|---|---|---|---|
-| 25% (open) | 15,544 | 0.08 | 0.13 | 0.12 – 1.81 | 0.57 | 0.09 |
-| 50% (open) | 31,087 | 0.10 | 0.33 | 0.19 – 0.38 | 1.85 | 0.28 |
-| 75% (open) | 46,627 | 0.26 | 1.25 | 0.88 – 6.54 | 2.87 | 0.96 |
-| 90% (open) | 55,950 | 0.58 | 3.07 | 2.65 – 143.69 | 27.50 | 1.95 |
-| max (closed) | 62,176 | 0.24 | 0.56 | 0.54 – 0.60 | 1.10 | 0.56 |
+| 25% (open) | 14,221 | 0.08 | 0.19 | 0.18 – 1.68 | 0.71 | 0.15 |
+| 50% (open) | 28,440 | 0.15 | 0.35 | 0.28 – 0.59 | 2.03 | 0.30 |
+| 75% (open) | 42,657 | 0.24 | 0.84 | 0.80 – 1.01 | 2.28 | 0.74 |
+| 90% (open) | 51,189 | 0.42 | 1.74 | 1.30 – 2.13 | 5.23 | 1.38 |
+| max (closed) | 56,885 | 0.25 | 0.82 | 0.73 – 0.83 | 2.98 | 0.82 |
 
 Every open-loop run reached its target rate and had 0 errors, 0 stale reads and 0 read misses; so
-did the closed-loop runs (all 15 runs: 9.5 million operations). Full table:
-[`suite/latency.md`](suite/latency.md).
+did the closed-loop runs (all 15 runs: 8.7 million operations). Full table:
+[`suite/latency.md`](suite/latency.md). Measured on battery, which is why the maximum is below
+the 61,091 in the closed-loop table.
 
 - **The closed-loop p99 is not the latency at that throughput.** At full speed, closed loop
-  reports a p99 of 0.56 ms. Sending 90% of that rate on a fixed schedule gives a median p99 of
-  3.07 ms, and one of the three runs reached 144 ms. In the closed loop, a stalled client simply
-  stopped sending, so the requests that would have waited behind each stall were never measured.
-- **Latency stays flat to about half of maximum throughput** (p99 0.33 ms at 50%), then rises:
-  p50 goes from 0.10 ms at 50% to 0.58 ms at 90%.
+  reports a p99 of 0.82 ms. Sending 90% of that rate on a fixed schedule gives a median p99 of
+  1.74 ms and a worst request of 106 ms. In the closed loop, a stalled client simply stopped
+  sending, so the requests that would have waited behind each stall were never measured.
+- **Latency stays flat to about half of maximum throughput** (p99 0.35 ms at 50%), then rises:
+  p50 goes from 0.15 ms at 50% to 0.42 ms at 90%.
 - **Service time hides the queueing.** At 90% load the time from actual send to response has a
-  p99 of 1.95 ms, while the latency from intended send time is 3.07 ms: requests spend the
+  p99 of 1.38 ms, while the latency from intended send time is 1.74 ms: requests spend the
   difference waiting for their client to finish an earlier slow request.
-- **Single runs vary a lot at the tail.** One stall (GC, the OS scheduling a node's threads away
-  on a shared laptop) dominates a 15-second run's p99 and p99.9, which is why the range is shown.
+- **Single runs vary a lot at the tail, and so do whole sessions.** One stall (GC, the OS
+  scheduling a node's threads away on a shared laptop) dominates a 15-second run's p99 and
+  p99.9, which is why the range is shown. The same script on the same code half an hour
+  earlier gave a p99 at 90% load of 28 ms (9 to 78 ms across its three runs), while the
+  machine's power source was being changed; the build before this one, run just before the
+  table above, gave 5.70 ms (3.19 to 24.21). Treat the 90% row as "a few milliseconds, with
+  occasional runs far worse", not as a number.
 - Each of the 64 client threads keeps one request in flight, like a client with 64 connections;
   a stall on one connection delays the requests queued for that connection.
 
@@ -171,16 +222,17 @@ production-mode cluster for 40 seconds. Node 2 is killed with SIGKILL at 10s and
 
 | Phase | Avg ops/sec | Errors |
 |---|---|---|
-| All 3 nodes up (0–10s) | 3,407 | 0 |
-| Node 2 down (11–25s) | 4,434 | 0 |
-| Node 2 back (30s–end) | 2,280 | 0 |
+| All 3 nodes up (0–10s) | 4,488 | 0 |
+| Node 2 down (11–25s) | 4,983 | 0 |
+| Node 2 back (30s–end) | 2,826 | 0 |
 
-**130,958 operations with 0 errors, 0 stale reads and 0 read misses** (the run before it: 115,368
-operations, also 0 errors).
+**158,712 operations with 0 errors, 0 stale reads and 0 read misses.**
 Node 2 recovered its keys from its WAL; hints and Merkle anti-entropy sent it the writes it missed.
 
 - **During the outage** QUORUM keeps working on the other two replicas. Throughput even rises,
   because two nodes share the disk instead of three.
+- Throughput in every phase is about a third higher than before writes stopped holding threads
+  through an fsync (3,407, 4,434 and 2,280 on the previous build).
 - **After the restart** throughput dips. The restarted JVM starts with a cold JIT and immediately
   takes a third of the traffic, while also receiving hints and Merkle repair.
 - **This run found a startup bug.** An earlier run on this code had 1 error in 94,027 operations:
@@ -188,7 +240,7 @@ Node 2 recovered its keys from its WAL; hints and Merkle anti-entropy sent it th
   log showed the refusal 30 ms *before* its cluster manager had finished starting. The server
   accepts connections first, and for as long as resolving the seeds' host names took, a starting
   node counted as having no seeds and so as ready. The node now cannot report ready at any point
-  while it starts, and the two runs above are from after that fix.
+  while it starts, and the run above is from after that fix.
 - **An earlier version of this run found a client bug.** Throughput originally fell sharply
   during the outage. The client slept its retry delay before failing over away from the dead
   node, and kept the node's circuit breaker open for 30 seconds. The client now fails over

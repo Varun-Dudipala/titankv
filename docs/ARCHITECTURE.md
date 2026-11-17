@@ -235,7 +235,8 @@ selector thread ──► worker pool (max(4, CPUs)) ──► one replica pool 
   1 MB) and sends it as one request (`PUT_BATCH_INTERNAL`), which the replica makes durable with
   one fsync and answers write by write. Nothing waits to fill a batch. Without this a
   coordinator could have at most 8 writes in flight to a peer, and durable throughput fell from
-  2,100 to 1,000 writes a second when clients went from 64 to 256; with it, it rises to 6,900.
+  2,100 to 1,000 writes a second when clients went from 64 to 256; with it, it rises from 2,600
+  to about 7,000. In-memory writes gained too: 52,000 to 84,000 a second with 64 clients.
   A peer that answers "Unknown command" (an older version) is sent single writes from then on.
 - **Replica I/O** runs on separate pools because it uses blocking client sockets, one pool per
   peer. Calls stuck on a slow or unreachable peer fill only that peer's threads and its queue of
